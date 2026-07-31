@@ -1,0 +1,26 @@
+{
+  "name": "phase0_toxacute_3task",
+  "dataset": "toxacute",
+  "raw_csv_path": "data/toxacute.csv",
+  "tasks": [
+    "man_oral_TDLo",
+    "women_oral_TDLo",
+    "human_oral_TDLo"
+  ],
+  "task_aliases": {
+    "man": "man_oral_TDLo",
+    "woman": "women_oral_TDLo",
+    "human": "human_oral_TDLo"
+  },
+  "mode": "train",
+  "architecture": "Graphormer_prompt",
+  "weighting": "EW",
+  "splitting": "scaffold",
+  "validation_ratio": 0.1,
+  "test_ratio": 0.1,
+  "batch_size": 64,
+  "epochs": 100,
+  "preprocessed_data_dir": "artifacts/processed/toxacute_phase0",
+  "run_dir": "artifacts/runs/toxacute_phase0_3task",
+  "checkpoint_name": "toxacute_phase0_graphormer_prompt"
+}

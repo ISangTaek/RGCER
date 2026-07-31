@@ -1,0 +1,30 @@
+# Raw datasets and local data artifacts
+/data/
+*.csv
+*.tsv
+*.parquet
+
+# Generated preprocessing, checkpoints, results, and visualizations
+/artifacts/
+/processed_graph_data/
+/case_study/processed_data/
+*.pt
+*.pth
+*.ckpt
+*.log
+*.png
+*.svg
+
+# Local compiled extensions and archives
+*.pyd
+*.so
+*.dll
+*.zip
+
+# Python caches and local tooling files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.idea/
+.vscode/
