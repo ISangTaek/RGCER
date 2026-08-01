@@ -70,10 +70,10 @@ class Graphormer(AbsArchitecture):
             device=device,
         )
 
-    def forward(self, inputs, task_name=None, mode=None):
+    def forward(self, inputs, task_name=None, return_all_tasks=False, mode=None):
         del mode
         representation = self.encoder(inputs)
-        if task_name is None:
+        if return_all_tasks or task_name is None:
             return {task: self.decoders[task](representation) for task in self.task_name}
         if task_name not in self.decoders:
             raise KeyError(f"Unknown task: {task_name}")

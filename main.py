@@ -279,9 +279,7 @@ def main(params):
         # 3. run inference
         model_trainer.model.eval()
         with torch.no_grad():
-            predictions = {}
-            for task in task_name:
-                predictions.update(model_trainer.model(collated_batch, task_name=task, mode='test'))
+            predictions = model_trainer.model(collated_batch, return_all_tasks=True)
         # reverse transform
 
 
@@ -316,10 +314,7 @@ def main(params):
                     continue
 
                 # Process results for each item in the batch
-                task_predictions = {
-                    task: model_trainer.model(batch, task_name=task, mode='test')[task]
-                    for task in task_name
-                }
+                task_predictions = model_trainer.model(batch, return_all_tasks=True)
                 batch_smiles = batch.smiles
                 num_items_in_batch = len(batch_smiles)
                 for i in range(num_items_in_batch):
@@ -372,6 +367,12 @@ if __name__ == "__main__":
     args.add_argument('--t_heads', type=int, default=8, help='Number of attention heads in Transformer part (example)')
     args.add_argument('--hidden_dim', type=int, default=96, help='Hidden dimension for the model')
     args.add_argument('--mid_dim', type=int, default=128, help='Intermediate dimension (e.g., in FFNs)')
+    args.add_argument('--prompt_layers', type=int, default=1, help='Number of task-prompt relation layers')
+    args.add_argument('--prompt_heads', type=int, default=4, help='Attention heads in task-prompt relation encoder')
+    args.add_argument('--prompt_ffn_dim', type=int, default=192, help='FFN width in task-prompt relation encoder')
+    args.add_argument('--prompt_dropout', type=float, default=0.1, help='Dropout in prompt relation and adapter')
+    args.add_argument('--adapter_ratio', type=float, default=0.25, help='Shared adapter bottleneck / hidden dimension')
+    args.add_argument('--prompt_gate_init', type=float, default=-2.0, help='Initial residual adapter gate bias')
 
     ## MTL weighting
     args.add_argument('--weighting', type=str, default='EW', choices=['EW', 'UW', 'DWA'], help='MTL Weighting method')
@@ -392,6 +393,13 @@ if __name__ == "__main__":
     args.add_argument('--grad_clip', default=1.0, type=float, help='Maximum gradient norm')
 
     params = args.parse_args()
+
+    if params.hidden_dim % params.prompt_heads != 0:
+        raise ValueError('--hidden_dim must be divisible by --prompt_heads')
+    if params.prompt_layers < 0:
+        raise ValueError('--prompt_layers must be non-negative')
+    if not 0.0 < params.adapter_ratio <= 1.0:
+        raise ValueError('--adapter_ratio must be in (0, 1]')
 
     # Create save_path if it doesn't exist
     if params.save_path and not os.path.exists(params.save_path):

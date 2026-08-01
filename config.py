@@ -27,6 +27,16 @@ def prepare_args(params):
         kwargs['arch_args']['hidden_dim'] = params.hidden_dim
     if hasattr(params, 'mid_dim'):
         kwargs['arch_args']['mid_dim'] = params.mid_dim
+    for name in [
+        'prompt_layers',
+        'prompt_heads',
+        'prompt_ffn_dim',
+        'prompt_dropout',
+        'adapter_ratio',
+        'prompt_gate_init',
+    ]:
+        if hasattr(params, name):
+            kwargs['arch_args'][name] = getattr(params, name)
     # Add any other architecture-specific parameters from params here
     # e.g., dropout_rate, attention_dropout_rate if they are in params
 

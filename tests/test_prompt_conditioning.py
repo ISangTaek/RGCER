@@ -26,5 +26,6 @@ def test_prompt_forward_is_stateless_and_task_conditioned():
     model.train()
     output = model(batch, task_name="human", mode="train")["human"].sum()
     output.backward()
-    assert model.encoder.task_conditioner.prompts.grad is not None
-    assert model.encoder.task_conditioner.prompts.grad.abs().sum() > 0
+    prompt_grad = model.encoder.task_conditioner.relation_encoder.prompt_bank.grad
+    assert prompt_grad is not None
+    assert prompt_grad.abs().sum() > 0

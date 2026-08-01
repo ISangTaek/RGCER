@@ -17,15 +17,21 @@ class DWA(AbsWeighting):
     def __init__(self):
         super(DWA, self).__init__()
         
-    def backward(self, losses, **kwargs):
+    def backward(self, losses, active_mask=None, **kwargs):
+        if active_mask is None:
+            active_mask = torch.ones_like(losses, dtype=torch.bool)
+        active_mask = active_mask.to(device=losses.device, dtype=torch.bool)
+        mask = active_mask.to(losses.dtype)
+        active_count = mask.sum().clamp_min(1.0)
         T = 2.0
-        if self.epoch > 1:
+        if getattr(self, 'epoch', 0) > 1 and hasattr(self, 'train_loss_buffer'):
             w_i = torch.Tensor(
                 self.train_loss_buffer[:, self.epoch-1] / self.train_loss_buffer[:,self.epoch-2]
-                ).to(self.device)
-            batch_weight = self.task_num * F.softmax(w_i / T, dim=-1)
+            ).to(self.device)
+            w_i = w_i.masked_fill(~active_mask, float('-inf'))
+            batch_weight = active_count * F.softmax(w_i / T, dim=-1)
         else:
-            batch_weight = torch.ones_like(losses).to(self.device)
+            batch_weight = mask / active_count * active_count
 
         loss = torch.mul(losses, batch_weight).sum()
         loss.backward()

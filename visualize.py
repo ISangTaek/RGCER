@@ -21,6 +21,12 @@ import matplotlib.colors as colors
 from sklearn.metrics.pairwise import cosine_similarity
 
 
+def _get_contextual_prompt_array(model):
+    """Return contextual task prompts for optional, lazy visualization."""
+    diagnostics = model.encoder.task_conditioner.get_prompt_diagnostics()
+    return diagnostics.contextual_prompts.cpu().numpy()
+
+
 class ModelWrapperForLIG(torch.nn.Module):
     def __init__(self, model, collated_batch_template):
         super().__init__()
@@ -33,7 +39,7 @@ class ModelWrapperForLIG(torch.nn.Module):
         # 将 Captum 传入的张量放回模板
         batch_copy.x = atom_indices_tensor
         # 1. 正常调用模型，得到包含所有任务预测的字典
-        predictions_dict = self.model(batch_copy, task_name, mode)
+        predictions_dict = self.model(batch_copy, task_name=task_name, mode=mode)
 
         # 2. 从字典中，根据传入的 task_name，抽取出我们当前关心的那一个任务的预测张量
         target_prediction_tensor = predictions_dict[task_name]
@@ -50,7 +56,7 @@ def visualize_task_prompt_similarity(model, save_dir):
 
     # 1. 提取数据 (代码不变)
     try:
-        prompts_tensor = model.encoder.ema_prompts.squeeze(0).detach().cpu().numpy()
+        prompts_tensor = _get_contextual_prompt_array(model)
         task_names = model.task_name
     except AttributeError:
         print("Error: Could not retrieve prompts from model.")
@@ -366,7 +372,7 @@ def visualize_cross_task_attribution(
 #     # 1. 从模型中提取 prompts 和任务名称
 #     # 这个路径是根据您提供的 Graphormer_prompt.py 文件确定的
 #     try:
-#         prompts_tensor = model.encoder.ema_prompts.squeeze(0).detach().cpu().numpy()
+#         prompts_tensor = _get_contextual_prompt_array(model)
 #         task_names = model.task_name
 #     except AttributeError:
 #         print("Error: Could not find 'encoder.prompts' or 'task_name' in the model. Aborting similarity visualization.")
@@ -462,7 +468,7 @@ def visualize_species_similarity_aggregated(model, save_dir, args):
 
     # 1. 提取所需数据
     try:
-        prompts = model.encoder.ema_prompts.squeeze(0).detach().cpu().numpy()
+        prompts = _get_contextual_prompt_array(model)
         task_names = np.array(model.task_name)
         species_list = args.species_list
     except AttributeError:
@@ -575,7 +581,7 @@ def visualize_prompt_polar_map(model, save_dir, args):
 
     # 1. 提取数据
     try:
-        all_data = model.encoder.ema_prompts.squeeze(0).detach().cpu().numpy()
+        all_data = _get_contextual_prompt_array(model)
         task_names = model.task_name
         species_list = args.species_list
     except AttributeError:
@@ -817,7 +823,7 @@ class Visualizer(object):
     def visualize_prompt(self, perplexity = 40):
         # 1. 提取 EMA prompts
         # shape [1, num_tasks, hidden_dim]
-        prompts = self.trainer.model.encoder.ema_prompts.squeeze(0).cpu().numpy()
+        prompts = _get_contextual_prompt_array(self.trainer.model)
 
         # 2. 将任务映射到物种
         species_list = self.trainer.args.species_list
@@ -897,13 +903,13 @@ class Visualizer(object):
         plt.close()
 
         # 绘制相似度热图
-        if hasattr(self.trainer.model.encoder, 'ema_prompts'):
+        if hasattr(self.trainer.model.encoder, 'task_conditioner'):
             visualize_task_prompt_similarity(self.trainer.model, self.trainer.save_path or '.')
         else:
             print("Model does not have prompts, skipping similarity visualization.")
 
         # 另一种极坐标可视化图
-        # if hasattr(self.trainer.model.encoder, 'ema_prompts'):
+        # if hasattr(self.trainer.model.encoder, 'task_conditioner'):
         #     visualize_prompt_polar_map(self.trainer.model, self.trainer.save_path or '.', self.trainer.args)
         # else:
         #     print("Model does not have prompts, skipping polar map visualization.")

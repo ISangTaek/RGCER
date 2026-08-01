@@ -13,7 +13,12 @@ class EW(AbsWeighting):
     def __init__(self):
         super(EW, self).__init__()
         
-    def backward(self, losses, **kwargs):
-        loss = torch.mul(losses, torch.ones_like(losses).to(self.device)).sum()
+    def backward(self, losses, active_mask=None, **kwargs):
+        if active_mask is None:
+            active_mask = torch.ones_like(losses, dtype=torch.bool)
+        active_mask = active_mask.to(device=losses.device, dtype=torch.bool)
+        active_count = active_mask.sum().clamp_min(1)
+        weights = active_mask.to(losses.dtype) / active_count.to(losses.dtype)
+        loss = torch.mul(losses, weights).sum()
         loss.backward()
-        return np.ones(self.task_num)
+        return weights.detach().cpu().numpy()

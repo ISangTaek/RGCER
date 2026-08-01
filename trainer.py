@@ -59,6 +59,12 @@ class Trainer:
             args,
             **kwargs.get("arch_args", {}),
         ).to(self.device)
+        self.loss_balancer = weighting()
+        self.loss_balancer.task_num = self.task_num
+        self.loss_balancer.task_name = self.task_name
+        self.loss_balancer.device = self.device
+        self.loss_balancer.init_param()
+        self.loss_balancer = self.loss_balancer.to(self.device)
         self.optimizer = self._make_optimizer(optim_param)
         self.task_scalers = {}
         self.best_val_score = -float("inf")
@@ -88,8 +94,9 @@ class Trainer:
             optimizer_class = torch.optim.AdamW
         else:
             raise ValueError(f"Unsupported optimizer: {optim_name}")
+        parameters = list(self.model.parameters()) + list(self.loss_balancer.parameters())
         return optimizer_class(
-            self.model.parameters(),
+            parameters,
             **{key: value for key, value in optim_param.items() if key != "optim"},
         )
 
@@ -148,34 +155,69 @@ class Trainer:
 
     def _train_epoch(self, train_dataloaders_dict, epoch):
         self.model.train()
+        self.loss_balancer.train()
         iterators = {
             task: iter(loader)
             for task, loader in train_dataloaders_dict.items()
             if loader is not None and len(loader) > 0
         }
+        active_tasks = list(iterators)
+        max_steps = max((len(train_dataloaders_dict[task]) for task in active_tasks), default=0)
         buffers = {task: {"pred": [], "label": []} for task in self.task_name}
         losses = {task: [] for task in self.task_name}
         updates = 0
+        self.loss_balancer.epoch = epoch
+        self.loss_balancer.train_loss_buffer = getattr(
+            self, "train_loss_buffer", np.ones((self.task_num, max(epoch, 2)))
+        )
 
-        for task in self._task_schedule(train_dataloaders_dict, epoch):
-            batch = next(iterators[task], None)
-            if not self._valid_batch(batch):
+        for _ in range(max_steps):
+            task_losses = []
+            active_mask = torch.zeros(self.task_num, dtype=torch.bool, device=self.device)
+            step_outputs = []
+            for task_index, task in enumerate(self.task_name):
+                if task not in iterators:
+                    task_losses.append(torch.zeros((), device=self.device))
+                    step_outputs.append(None)
+                    continue
+                batch = next(iterators[task], None)
+                if batch is None:
+                    iterators[task] = iter(train_dataloaders_dict[task])
+                    batch = next(iterators[task], None)
+                if not self._valid_batch(batch):
+                    task_losses.append(torch.zeros((), device=self.device))
+                    step_outputs.append(None)
+                    continue
+                batch = batch.to(self.device)
+                labels = batch.y.reshape(-1, 1).float()
+                normalized_labels = self._normalize_target(task, labels)
+                output = self.model(batch, task_name=task, mode="train")
+                prediction = output[task]
+                loss = self._loss(task, prediction, normalized_labels)
+                active_mask[task_index] = True
+                task_losses.append(loss)
+                step_outputs.append((task, prediction, labels, loss.detach()))
+
+            if not bool(active_mask.any()):
                 continue
-            batch = batch.to(self.device)
-            labels = batch.y.reshape(-1, 1).float()
-            normalized_labels = self._normalize_target(task, labels)
-            output = self.model(batch, task_name=task, mode="train")
-            prediction = output[task]
-            loss = self._loss(task, prediction, normalized_labels)
             self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            clip_grad_norm_(self.model.parameters(), float(getattr(self.args, "grad_clip", 1.0)))
+            losses_tensor = torch.stack(task_losses)
+            self.loss_balancer.backward(losses_tensor, active_mask=active_mask)
+            clip_value = getattr(self.args, "grad_clip", 1.0)
+            if clip_value is not None and float(clip_value) > 0:
+                clip_grad_norm_(
+                    list(self.model.parameters()) + list(self.loss_balancer.parameters()),
+                    float(clip_value),
+                )
             self.optimizer.step()
-
-            raw_prediction = self._denormalize_prediction(task, prediction.detach())
-            buffers[task]["pred"].append(raw_prediction.cpu())
-            buffers[task]["label"].append(labels.detach().cpu())
-            losses[task].append(float(loss.detach().cpu()))
+            for item in step_outputs:
+                if item is None:
+                    continue
+                task, prediction, labels, detached_loss = item
+                raw_prediction = self._denormalize_prediction(task, prediction.detach())
+                buffers[task]["pred"].append(raw_prediction.cpu())
+                buffers[task]["label"].append(labels.detach().cpu())
+                losses[task].append(float(detached_loss.cpu()))
             updates += 1
 
         metrics = self._score_buffers(buffers)
@@ -249,6 +291,7 @@ class Trainer:
             "checkpoint_version": 1,
             "model_state": self.model.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
+            "weighting_state": self.loss_balancer.state_dict(),
             "epoch": int(epoch),
             "configuration": vars(self.args) if hasattr(self.args, "__dict__") else {},
             "task_names": list(self.task_name),
@@ -275,6 +318,7 @@ class Trainer:
         required = {
             "model_state",
             "optimizer_state",
+            "weighting_state",
             "epoch",
             "configuration",
             "task_names",
@@ -290,6 +334,7 @@ class Trainer:
         if checkpoint["feature_schema_version"] != FEATURE_SCHEMA_VERSION:
             raise ValueError("Checkpoint feature schema does not match the current code")
         self.model.load_state_dict(checkpoint["model_state"], strict=True)
+        self.loss_balancer.load_state_dict(checkpoint["weighting_state"], strict=True)
         if "optimizer_state" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer_state"])
         self.task_scalers = checkpoint["task_scalers"]
@@ -304,8 +349,13 @@ class Trainer:
             self._fit_task_scalers(train_dataloaders_dict)
 
         history = []
+        self.train_loss_buffer = np.ones((self.task_num, max(int(epochs), 2)), dtype=float)
         for epoch in range(int(epochs)):
+            self.loss_balancer.train_loss_buffer = self.train_loss_buffer
             train_result = self._train_epoch(train_dataloaders_dict, epoch)
+            for task_index, task in enumerate(self.task_name):
+                if np.isfinite(train_result["loss"][task]):
+                    self.train_loss_buffer[task_index, epoch] = train_result["loss"][task]
             self._print_metrics("train", epoch, train_result)
             val_result = self._evaluate(val_dataloaders_dict, mode="validation", epoch=epoch)
             history.append({"epoch": epoch, "train": train_result, "validation": val_result})

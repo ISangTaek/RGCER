@@ -1,9 +1,4 @@
-"""Stateless task-conditioned Graphormer architecture.
-
-Task relations are modelled only in the prompt bank.  Molecular examples from
-different tasks are never paired or stacked, so a forward call is independent
-of the order and history of previous calls.
-"""
+"""Relation-aware, stateless Prompt Graphormer."""
 
 from __future__ import annotations
 
@@ -12,41 +7,12 @@ from torch import nn
 
 from architecture.abstract_arch import AbsArchitecture
 from architecture.graphormer_backbone import MolecularGraphormerBackbone
-
-
-class TaskPromptConditioner(nn.Module):
-    """Prompt self-attention followed by FiLM and a small low-rank adapter."""
-
-    def __init__(self, num_tasks, hidden_dim, num_heads=2, dropout=0.1):
-        super().__init__()
-        if hidden_dim % num_heads != 0:
-            raise ValueError("hidden_dim must be divisible by prompt attention heads")
-        self.prompts = nn.Parameter(torch.empty(num_tasks, hidden_dim))
-        nn.init.normal_(self.prompts, std=0.02)
-        self.relation_attention = nn.MultiheadAttention(
-            hidden_dim, num_heads, dropout=dropout, batch_first=True
-        )
-        self.relation_norm = nn.LayerNorm(hidden_dim)
-        self.film = nn.Linear(hidden_dim, hidden_dim * 3)
-        bottleneck = max(hidden_dim // 4, 1)
-        self.adapter_down = nn.Linear(hidden_dim, bottleneck)
-        self.adapter_up = nn.Linear(bottleneck, hidden_dim)
-        self.output_norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, representation, task_index):
-        prompt_tokens = self.prompts.unsqueeze(0)
-        related, _ = self.relation_attention(prompt_tokens, prompt_tokens, prompt_tokens)
-        related = self.relation_norm(prompt_tokens + self.dropout(related))
-        prompt = related[:, task_index, :].expand(representation.size(0), -1)
-        gamma, beta, gate = self.film(prompt).chunk(3, dim=-1)
-        conditioned = (1.0 + torch.tanh(gamma)) * representation + beta
-        conditioned = self.output_norm(conditioned)
-        adapter = self.adapter_up(torch.nn.functional.gelu(self.adapter_down(conditioned)))
-        return conditioned + torch.sigmoid(gate) * adapter
+from architecture.task_prompt import RelationAwareTaskConditioner
 
 
 class Encoder(nn.Module):
+    """Shared chemical backbone plus task-space prompt conditioning."""
+
     def __init__(
         self,
         atoms_num_heads,
@@ -64,10 +30,16 @@ class Encoder(nn.Module):
         device,
         task_num_heads,
         task_dropout_rate,
+        prompt_layers=1,
+        prompt_ffn_dim=None,
+        adapter_ratio=0.25,
+        prompt_gate_init=-2.0,
     ):
         super().__init__()
         del atoms_input_dropout_rate, atoms_reshape_dim, task_layers, device
-        self.task_name = tuple(task_name)
+        if atoms_readout_dim != moles_hidden_dim:
+            raise ValueError("atoms_readout_dim must equal moles_hidden_dim for prompt conditioning")
+        self.task_name = list(task_name)
         self.backbone = MolecularGraphormerBackbone(
             hidden_dim=atoms_hidden_dim,
             num_heads=atoms_num_heads,
@@ -76,31 +48,35 @@ class Encoder(nn.Module):
             dropout=max(float(atoms_dropout_rate), float(atoms_attention_dropout_rate)),
             spatial_pos_max_clip=20,
         )
-        self.backbone_readout = (
-            nn.Identity()
-            if atoms_readout_dim == moles_hidden_dim
-            else nn.Linear(atoms_readout_dim, moles_hidden_dim)
-        )
-        self.task_conditioner = TaskPromptConditioner(
-            len(self.task_name), moles_hidden_dim, num_heads=task_num_heads, dropout=task_dropout_rate
+        self.task_conditioner = RelationAwareTaskConditioner(
+            self.task_name,
+            hidden_dim=moles_hidden_dim,
+            prompt_heads=task_num_heads,
+            prompt_layers=prompt_layers,
+            prompt_ffn_dim=prompt_ffn_dim,
+            prompt_dropout=task_dropout_rate,
+            adapter_ratio=adapter_ratio,
+            gate_init=prompt_gate_init,
         )
 
-    def forward(self, batch, task_name=None, mode=None):
+    def encode_backbone(self, batch):
+        return self.backbone(batch)
+
+    def forward(self, batch, task_name=None, return_all_tasks=False, mode=None):
         del mode
-        if task_name not in self.task_name:
-            raise KeyError(f"Unknown task: {task_name}")
-        representation = self.backbone_readout(self.backbone(batch))
-        return self.task_conditioner(representation, self.task_name.index(task_name))
+        representation = self.encode_backbone(batch)
+        if return_all_tasks:
+            return self.task_conditioner.condition_all(representation)
+        if task_name is None:
+            raise ValueError("task_name is required unless return_all_tasks=True")
+        return self.task_conditioner(representation, task_name)
 
 
 class Graphormer_prompt(AbsArchitecture):
-    """Relation-aware prompt-conditioned Graphormer with task-specific heads."""
+    """Shared Graphormer with relation-aware task-specific decoders."""
 
     def __init__(self, task_name, encoder_class, decoders, device, args, **kwargs):
         super().__init__(task_name, encoder_class, decoders, device, **kwargs)
-        prompt_heads = getattr(args, "t_heads", 2)
-        # Multi-head attention is only over the task prompt bank.  The molecular
-        # batch remains a single-task batch throughout the complete forward pass.
         self.encoder = encoder_class(
             atoms_num_heads=args.a_heads,
             task_name=task_name,
@@ -113,14 +89,28 @@ class Graphormer_prompt(AbsArchitecture):
             atoms_attention_dropout_rate=0.1,
             atoms_readout_dim=args.hidden_dim,
             moles_hidden_dim=args.hidden_dim,
-            task_layers=1,
+            task_layers=getattr(args, "t_layers", 1),
             device=device,
-            task_num_heads=prompt_heads,
-            task_dropout_rate=0.1,
+            task_num_heads=getattr(args, "prompt_heads", getattr(args, "t_heads", 4)),
+            task_dropout_rate=getattr(args, "prompt_dropout", 0.1),
+            prompt_layers=getattr(args, "prompt_layers", 1),
+            prompt_ffn_dim=getattr(args, "prompt_ffn_dim", args.hidden_dim * 2),
+            adapter_ratio=getattr(args, "adapter_ratio", 0.25),
+            prompt_gate_init=getattr(args, "prompt_gate_init", -2.0),
         )
 
-    def forward(self, inputs, task_name=None, mode=None):
-        if task_name is None:
-            raise ValueError("task_name is required for task-conditioned forward")
-        representation = self.encoder(inputs, task_name=task_name, mode=mode)
-        return {task_name: self.decoders[task_name](representation)}
+    def forward(self, inputs, task_name=None, return_all_tasks=False, mode=None):
+        representations = self.encoder(
+            inputs,
+            task_name=task_name,
+            return_all_tasks=return_all_tasks,
+            mode=mode,
+        )
+        if return_all_tasks:
+            return {
+                task: self.decoders[task](representation)
+                for task, representation in representations.items()
+            }
+        if task_name not in self.decoders:
+            raise KeyError(f"Unknown task: {task_name}")
+        return {task_name: self.decoders[task_name](representations)}
