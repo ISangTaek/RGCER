@@ -1,221 +1,288 @@
-import os
-import csv
-import numpy as np
-import torch
-from torch_geometric.data import Data
-from rdkit import Chem
-from rdkit.Chem.Scaffolds.MurckoScaffold import MurckoScaffoldSmiles  # Import for scaffold
-import networkx as nx
+"""Preprocess toxacute molecules into versioned Graphormer inputs."""
+
+from __future__ import annotations
+
 import argparse
-import pandas as pd  # Added for robust CSV reading
+import json
+import os
+from pathlib import Path
+
+import algos
+import numpy as np
+import pandas as pd
+import torch
+from rdkit import Chem
+from torch_geometric.data import Data
 
 from experiment_config import (
     TOXACUTE_PHASE0_PREPROCESSED_DIR,
     TOXACUTE_PHASE0_RAW_CSV,
     TOXACUTE_PHASE0_TASKS,
 )
+from molecular_features import (
+    BOND_FEATURE_NAMES,
+    FEATURE_SCHEMA_VERSION,
+    atom_features,
+    bond_features,
+    canonicalize_smiles,
+    scaffold_from_mol,
+)
+from split_manifest import create_split_manifest, write_manifest
 
-# Assuming algos.py is in the same directory or accessible in PYTHONPATH
-try:
-    import algos
-except ImportError:
-    print("Error: The file named 'algos.pyd' for win or 'algos.so' for linux not found. Ensure it's in the same directory or PYTHONPATH.")
-    exit()
 
-
-# --- Feature Extraction Functions (Copied/adapted from your dataset.py) ---
 def one_of_k_encoding_unk(x, allowable_set):
+    """Retained for compatibility with older external callers."""
     if x not in allowable_set:
         x = allowable_set[-1]
-    return list(map(lambda s: x == s, allowable_set))
+    return [x == item for item in allowable_set]
 
 
-def atom_features(atom):
-    fea_Symbol = one_of_k_encoding_unk(atom.GetSymbol(),
-                                       ['C', 'N', 'O', 'S', 'F', 'Si', 'P', 'Cl', 'Br', 'Mg', 'Na', 'Ca', 'Fe', 'As',
-                                        'Al', 'I', 'B', 'V', 'K', 'Tl', 'Yb', 'Sb', 'Sn', 'Ag', 'Pd', 'Co', 'Se',
-                                        'Ti', 'Zn', 'H', 'Li', 'Ge', 'Cu', 'Au', 'Ni', 'Cd', 'In', 'Mn', 'Zr', 'Cr',
-                                        'Pt', 'Hg', 'Pb', 'Unknown'])
-    fea_Degree = one_of_k_encoding_unk(atom.GetDegree(), list(range(17)))
-    fea_TotalNumHs = one_of_k_encoding_unk(atom.GetTotalNumHs(), list(range(17)))
-    fea_ImplicitValence = one_of_k_encoding_unk(atom.GetImplicitValence(), list(range(17)))
-    fea_IsAromatic = [atom.GetIsAromatic()]
-    return np.array(fea_Symbol + fea_Degree + fea_TotalNumHs + fea_ImplicitValence + fea_IsAromatic, dtype = np.float32)
+def convert_to_single_emb_offline(x, offset=1):
+    """Compatibility shim; categorical fields are now encoded explicitly."""
+    del offset
+    return x.long()
 
 
-def _generate_scaffold(smiles, include_chirality = False):  # Copied from original dataset.py
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:  # Handle cases where MolFromSmiles returns None
-        return ''  # Return an empty string or a specific placeholder for invalid SMILES
+def _generate_scaffold(smiles, include_chirality=False):
+    del include_chirality
+    mol, _ = canonicalize_smiles(smiles)
+    return scaffold_from_mol(mol)
+
+
+def _is_valid_smiles(value) -> bool:
+    return value is not None and not pd.isna(value) and str(value).strip() != ""
+
+
+def _is_valid_label(value) -> bool:
+    if value is None or pd.isna(value):
+        return False
     try:
-        scaffold = MurckoScaffoldSmiles(mol = mol, includeChirality = include_chirality)
-    except:  # Catch potential errors in MurckoScaffoldSmiles
-        scaffold = ''
-    return scaffold
+        float(value)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
-def convert_to_single_emb_offline(x, offset = 1):
-    if x.ndim == 1:
-        x = x.unsqueeze(0)
-    if x.numel() == 0:
-        return x
-    feature_num = x.size(1)
-    feature_offset = 1 + torch.arange(0, feature_num * offset, offset, dtype = torch.float)
-    return x + feature_offset
+def _records_from_dataframe(df: pd.DataFrame) -> tuple[list[dict], list[dict]]:
+    records = []
+    errors = []
+    for row_index, row in df.iterrows():
+        raw_smiles = row.get("smiles")
+        if not _is_valid_smiles(raw_smiles):
+            errors.append({"row_index": int(row_index), "error": "missing_smiles"})
+            continue
+        try:
+            mol, canonical_smiles = canonicalize_smiles(str(raw_smiles))
+            scaffold = scaffold_from_mol(mol)
+        except Exception as exc:
+            errors.append(
+                {
+                    "row_index": int(row_index),
+                    "smiles": str(raw_smiles),
+                    "error": str(exc),
+                }
+            )
+            continue
+        records.append(
+            {
+                "sample_id": f"row_{int(row_index)}",
+                "row_index": int(row_index),
+                "raw_smiles": str(raw_smiles),
+                "canonical_smiles": canonical_smiles,
+                "scaffold": scaffold,
+            }
+        )
+    return records, errors
 
 
-def get_graph_data_from_smiles(smiles_string, label_val, convert_x_fn):
-    mol = Chem.MolFromSmiles(smiles_string)
-    if mol is None:
-        return None
+def _build_edge_tensors(mol: Chem.Mol):
+    num_atoms = mol.GetNumAtoms()
+    feature_dim = len(BOND_FEATURE_NAMES)
+    adjacency = np.zeros((num_atoms, num_atoms), dtype=np.int64)
+    edge_feature_matrix = np.zeros((num_atoms, num_atoms, feature_dim), dtype=np.int64)
+    attn_edge_type = torch.zeros((num_atoms, num_atoms, feature_dim), dtype=torch.long)
+    edge_index_values = []
+    edge_attr_values = []
 
-    # Generate scaffold
-    scaffold_smiles = _generate_scaffold(smiles_string)
-
-    atom_f_list = []
-    for atom in mol.GetAtoms():
-        feature = atom_features(atom)
-        atom_f_list.append(feature)
-
-    if not atom_f_list:
-        return None
-
-    x_np = np.array(atom_f_list)
-    x = torch.tensor(x_np, dtype = torch.float)
-
-    if convert_x_fn:
-        x = convert_x_fn(x)
-
-    edge_list_tuples = []
     for bond in mol.GetBonds():
-        edge_list_tuples.append((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()))
+        begin = bond.GetBeginAtomIdx()
+        end = bond.GetEndAtomIdx()
+        features = bond_features(bond)
+        # edge_attr/attn_edge_type use 1-based categories; zero is reserved
+        # for no edge and padding. gen_edge_input uses zero-based categories.
+        zero_based_features = np.asarray(features, dtype=np.int64) - 1
+        for source, target in ((begin, end), (end, begin)):
+            adjacency[source, target] = 1
+            edge_feature_matrix[source, target, :] = zero_based_features
+            attn_edge_type[source, target, :] = torch.tensor(features, dtype=torch.long)
+            edge_index_values.append((source, target))
+            edge_attr_values.append(features)
 
-    N = x.size(0)
-    adj = torch.zeros([N, N], dtype = torch.bool)
-
-    final_edges_for_index = []
-    if edge_list_tuples:
-        for u, v in edge_list_tuples:
-            final_edges_for_index.append([u, v])
-            final_edges_for_index.append([v, u])
-            adj[u, v] = True
-            adj[v, u] = True
-
-    if final_edges_for_index:
-        edge_index = torch.tensor(final_edges_for_index, dtype = torch.long).t().contiguous()
+    if edge_index_values:
+        edge_index = torch.tensor(edge_index_values, dtype=torch.long).t().contiguous()
+        edge_attr = torch.tensor(edge_attr_values, dtype=torch.long)
     else:
-        edge_index = torch.empty((2, 0), dtype = torch.long)
-
-    in_degree = adj.long().sum(dim = 1)
-    out_degree = in_degree.clone()
-
-    spatial_pos = torch.full((N, N), -1, dtype = torch.long)
-    if N > 0:
-        shortest_paths_matrix, _ = algos.floyd_warshall(adj.numpy())
-        # Replace np.inf with a value (e.g., -1 or a large int if your model expects that for disconnected parts)
-        # Ensure that your model's embedding layers or attention mechanisms correctly handle this value.
-        # Using a large positive number can sometimes be problematic if your model uses these distances directly
-        # without appropriate clipping or transformation in embedding layers.
-        # Using -1 is a common choice if 0 is a valid distance for self-loops (if any) or very close nodes.
-        # Check your model's spatial_pos embedding logic.
-
-        # shortest_paths_matrix[shortest_paths_matrix == np.inf] = -1
-        spatial_pos = torch.from_numpy(shortest_paths_matrix).long()
-
-    y_tensor = torch.tensor([float(label_val)], dtype = torch.float)
-
-    data = Data(x = x, edge_index = edge_index, y = y_tensor,
-                in_degree = in_degree, out_degree = out_degree,
-                spatial_pos = spatial_pos, smiles = smiles_string,
-                scaffold_smiles = scaffold_smiles)  # Add scaffold here
-    return data
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+        edge_attr = torch.empty((0, feature_dim), dtype=torch.long)
+    return adjacency, edge_index, edge_attr, attn_edge_type, edge_feature_matrix
 
 
-def preprocess_and_save(raw_csv_path, task_list_str, output_dir_base):
-    if not os.path.exists(raw_csv_path):
-        print(f"Error: Raw CSV data file not found at {raw_csv_path}")
-        return
-    if task_list_str == 'all':
-        tasks = pd.read_csv(raw_csv_path).columns[6:].tolist()
-        print('-' *20 + f'Total tasks: {len(tasks)}')
-    else:
-        tasks = [t.strip() for t in task_list_str.split(',')]
-    if not tasks:
-        print("Error: No tasks provided.")
-        return
+def get_graph_data_from_smiles(
+    smiles_string,
+    label_val,
+    convert_x_fn=None,
+    *,
+    sample_id="inference_sample",
+    task_name=None,
+    max_path_distance=8,
+):
+    """Create one graph with atom, direct-bond, and multi-hop bond features."""
+    del convert_x_fn
+    mol, canonical_smiles = canonicalize_smiles(str(smiles_string))
+    if mol.GetNumAtoms() == 0:
+        raise ValueError("SMILES produced an empty molecule")
 
-    os.makedirs(output_dir_base, exist_ok = True)
-    print(f"Preprocessing for tasks: {tasks}")
-    print(f"Reading raw data from: {raw_csv_path}")
-    print(f"Saving preprocessed data to: {os.path.abspath(output_dir_base)}")
+    atom_matrix = torch.tensor([atom_features(atom) for atom in mol.GetAtoms()], dtype=torch.long)
+    adjacency, edge_index, edge_attr, attn_edge_type, edge_feature_matrix = _build_edge_tensors(mol)
+    spatial_pos_np, path_np = algos.floyd_warshall(np.ascontiguousarray(adjacency))
+    # The bundled Cython implementation assumes max_dist is at least the
+    # longest finite path and writes without a bounds check.  Call it with a
+    # safe per-molecule capacity, then keep the configured compact prefix.
+    finite_distances = spatial_pos_np[spatial_pos_np < 510]
+    required_path_distance = int(finite_distances.max()) if finite_distances.size else 0
+    cython_path_distance = max(int(max_path_distance), required_path_distance)
+    edge_input_full = algos.gen_edge_input(
+        cython_path_distance,
+        np.ascontiguousarray(path_np),
+        np.ascontiguousarray(edge_feature_matrix),
+    )
+    edge_input_np = edge_input_full[:, :, : int(max_path_distance), :]
+
+    degree = torch.from_numpy(adjacency.sum(axis=1).astype(np.int64))
+    return Data(
+        x=atom_matrix,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        in_degree=degree,
+        out_degree=degree.clone(),
+        spatial_pos=torch.from_numpy(spatial_pos_np.astype(np.int64)),
+        attn_edge_type=attn_edge_type,
+        edge_input=torch.from_numpy(edge_input_np.astype(np.int64)),
+        y=torch.tensor([float(label_val)], dtype=torch.float),
+        label=float(label_val),
+        smiles=str(smiles_string),
+        raw_smiles=str(smiles_string),
+        canonical_smiles=canonical_smiles,
+        scaffold_smiles=scaffold_from_mol(mol),
+        scaffold=scaffold_from_mol(mol),
+        sample_id=str(sample_id),
+        task_name=task_name,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+    )
+
+
+def preprocess_and_save(
+    raw_csv_path,
+    task_list_str,
+    output_dir_base,
+    *,
+    splitting="scaffold",
+    valid_size=0.1,
+    calibration_size=0.1,
+    test_size=0.1,
+    seed=42,
+    max_path_distance=8,
+):
+    raw_csv_path = Path(raw_csv_path)
+    output_dir_base = Path(output_dir_base)
+    if not raw_csv_path.exists():
+        raise FileNotFoundError(f"Raw CSV data file not found: {raw_csv_path}")
 
     df = pd.read_csv(raw_csv_path)
+    if task_list_str == "all":
+        tasks = [column for column in df.columns[6:]]
+    else:
+        tasks = [task.strip() for task in task_list_str.split(",") if task.strip()]
+    if not tasks:
+        raise ValueError("No tasks provided")
+    missing_tasks = [task for task in tasks if task not in df.columns]
+    if missing_tasks:
+        raise KeyError(f"Tasks not found in CSV: {missing_tasks}")
+
+    records, errors = _records_from_dataframe(df)
+    if not records:
+        raise ValueError("No valid SMILES records found")
+    manifest = create_split_manifest(
+        records,
+        splitting=splitting,
+        ratios={
+            "train": 1.0 - valid_size - calibration_size - test_size,
+            "validation": valid_size,
+            "calibration": calibration_size,
+            "test": test_size,
+        },
+        seed=seed,
+    )
+    output_dir_base.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_dir_base / "split_manifest.json"
+    write_manifest(manifest, manifest_path)
+    if errors:
+        (output_dir_base / "preprocess_errors.json").write_text(
+            json.dumps(errors, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    record_by_index = {record["row_index"]: record for record in records}
+    print(f"Reading raw data from: {raw_csv_path}")
+    print(f"Saving preprocessed data to: {output_dir_base.resolve()}")
+    print(f"Global split manifest: {manifest_path}")
+    print(f"Tasks: {tasks}")
 
     for task_name in tasks:
-        print(f"\nProcessing task: {task_name}")
-        if task_name not in df.columns:
-            print(f"Warning: Task '{task_name}' not found as a column in {raw_csv_path}. Skipping.")
-            continue
-
-        task_output_dir = os.path.join(output_dir_base, task_name)
-        os.makedirs(task_output_dir, exist_ok = True)
-
-        num_processed = 0
-        num_skipped = 0
-
-        for index, row in df.iterrows():
-            smiles = row.get('smiles')
-            label_str = str(row.get(task_name))
-
-            if not smiles or not label_str or label_str.lower() == 'nan' or label_str == '':
-                num_skipped += 1
-                if index % 500 == 0 and index > 0: print(
-                    f"  Skipped invalid entry at original index {index} for task {task_name}.")
+        task_output_dir = output_dir_base / task_name
+        task_output_dir.mkdir(parents=True, exist_ok=True)
+        processed = 0
+        skipped = 0
+        for row_index, record in record_by_index.items():
+            label_value = df.at[row_index, task_name]
+            if not _is_valid_label(label_value):
+                skipped += 1
                 continue
-
             try:
-                label_val = float(label_str)
-            except ValueError:
-                num_skipped += 1
-                if index % 500 == 0 and index > 0: print(
-                    f"  Skipped entry with non-float label '{label_str}' at original index {index} for task {task_name}.")
-                continue
-
-            if index % 100 == 0 and index > 0:
-                print(f"  Processing molecule {index}/{len(df)} for task {task_name}...")
-
-            try:
-                graph_data = get_graph_data_from_smiles(smiles, label_val, convert_to_single_emb_offline)
-                if graph_data is not None and graph_data.x.size(0) > 0:
-                    output_path = os.path.join(task_output_dir, f"data_{index}.pt")
-                    torch.save(graph_data, output_path)
-                    num_processed += 1
-                else:
-                    if graph_data is None or (hasattr(graph_data, 'x') and graph_data.x.size(0) == 0):
-                        print(
-                            f"  Skipping molecule (original index {index}, SMILES: {smiles}) for task {task_name} due to processing error or empty graph.")
-                    num_skipped += 1
-            except Exception as e:
-                print(
-                    f"  Error processing molecule (original index {index}, SMILES: {smiles}) for task {task_name}: {e}")
-                num_skipped += 1
-
-        print(f"Finished processing task {task_name}. Successfully processed: {num_processed}, Skipped: {num_skipped}")
+                graph_data = get_graph_data_from_smiles(
+                    record["raw_smiles"],
+                    float(label_value),
+                    sample_id=record["sample_id"],
+                    task_name=task_name,
+                    max_path_distance=max_path_distance,
+                )
+                torch.save(graph_data, task_output_dir / f"data_{row_index}.pt")
+                processed += 1
+            except Exception as exc:
+                skipped += 1
+                print(f"Error processing row {row_index} for {task_name}: {exc}")
+        print(f"{task_name}: processed={processed}, skipped={skipped}")
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description = "Offline Data Preprocessing for Graph Neural Networks")
-    parser.add_argument('--raw_csv_path', type = str,
-                        default = TOXACUTE_PHASE0_RAW_CSV
-                        ,help = "Path to the raw CSV data file.")
-    parser.add_argument('--task_list', type = str,
-                        default = ','.join(TOXACUTE_PHASE0_TASKS),
-                        help = "Comma-separated task names. Phase 0 defaults to the fixed toxacute three-task set.")
-    parser.add_argument('--output_dir', type = str, default = TOXACUTE_PHASE0_PREPROCESSED_DIR,
-                        help = "Directory to save preprocessed graph data.")
-
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Offline molecular Graphormer preprocessing")
+    parser.add_argument("--raw_csv_path", type=str, default=TOXACUTE_PHASE0_RAW_CSV)
+    parser.add_argument("--task_list", type=str, default=",".join(TOXACUTE_PHASE0_TASKS))
+    parser.add_argument("--output_dir", type=str, default=TOXACUTE_PHASE0_PREPROCESSED_DIR)
+    parser.add_argument("--splitting", choices=["random", "scaffold"], default="scaffold")
+    parser.add_argument("--valid_size", type=float, default=0.1)
+    parser.add_argument("--calibration_size", type=float, default=0.1)
+    parser.add_argument("--test_size", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max_path_distance", type=int, default=8)
     args = parser.parse_args()
-
-    print("Starting offline data preprocessing...")
-    preprocess_and_save(args.raw_csv_path, args.task_list, args.output_dir)
-    print("Offline data preprocessing complete.")
+    preprocess_and_save(
+        args.raw_csv_path,
+        args.task_list,
+        args.output_dir,
+        splitting=args.splitting,
+        valid_size=args.valid_size,
+        calibration_size=args.calibration_size,
+        test_size=args.test_size,
+        seed=args.seed,
+        max_path_distance=args.max_path_distance,
+    )

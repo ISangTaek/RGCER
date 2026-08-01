@@ -27,8 +27,6 @@ from experiment_config import (
 from utils import *
 from tqdm import tqdm
 
-import warnings
-warnings.filterwarnings('ignore')
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 
@@ -281,8 +279,9 @@ def main(params):
         # 3. run inference
         model_trainer.model.eval()
         with torch.no_grad():
-            # use any task name to trigger the logic
-            predictions = model_trainer.model(collated_batch, task_name = task_name[0], mode = 'test')
+            predictions = {}
+            for task in task_name:
+                predictions.update(model_trainer.model(collated_batch, task_name=task, mode='test'))
         # reverse transform
 
 
@@ -316,16 +315,17 @@ def main(params):
                 if batch.get('is_empty', False):
                     continue
 
-                # use any task name to trigger the test mode
-                predictions = model_trainer.model(batch, task_name = task_name[0], mode = 'test')
-
                 # Process results for each item in the batch
+                task_predictions = {
+                    task: model_trainer.model(batch, task_name=task, mode='test')[task]
+                    for task in task_name
+                }
                 batch_smiles = batch.smiles
                 num_items_in_batch = len(batch_smiles)
                 for i in range(num_items_in_batch):
                     result_row = {'smiles' : batch_smiles[i]}
                     for task in task_name:
-                        result_row[task] = calculate_mgkg(batch_smiles[i],predictions[task][i].item())
+                        result_row[task] = calculate_mgkg(batch_smiles[i], task_predictions[task][i].item())
                     all_results.append(result_row)
 
         # 3. Save results to CSV
@@ -388,6 +388,8 @@ if __name__ == "__main__":
     args.add_argument('--ts', default=0.1, type=float, help='Test set size ratio')
     args.add_argument('--bs', default=64, type=int, help='Training batch size')
     args.add_argument('--epochs', default=100, type=int, help='Number of training epochs')
+    args.add_argument('--seed', default=42, type=int, help='Random seed for split-independent training reproducibility')
+    args.add_argument('--grad_clip', default=1.0, type=float, help='Maximum gradient norm')
 
     params = args.parse_args()
 
