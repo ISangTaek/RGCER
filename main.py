@@ -264,10 +264,7 @@ def main(params):
         if not test_dataloaders or all(not dl for dl in test_dataloaders.values()):
             print("No test data loaded. Skipping test mode.")
         else:
-            model_trainer.test(dataloaders_dict=test_dataloaders, visualize_prompts = params.visualize_prompts,
-                               visualize_predictions = params.visualize_predictions,
-                               visualize_histograms=params.visualize_histograms,
-                               args_for_viz = params) # Pass the dict of test loaders
+            model_trainer.test(dataloaders_dict=test_dataloaders)
     elif params.mode == 'single_inference':
         if not params.smiles:
             raise ValueError("SMILES required for single_inference Mode.")
@@ -366,28 +363,6 @@ if __name__ == "__main__":
                       help = 'Task folder name under preprocessed_data_dir for batch_inference')
     args.add_argument('--inference_output_path', type = str, default = r'./artifacts/results/toxacute_phase0_predictions.csv',
                       help = 'Output CSV file path for batch_inference mode')
-
-    ## Visualize
-    args.add_argument('--visualize_prompts', action='store_true', default = False,
-                      help='(For test mode only) Visualize task prompts using t-SNE after testing.')
-    args.add_argument('--visualize_predictions', action='store_true', default = False,
-                      help='(For test mode only) Visualize prediction vs. ground truth distribution after testing.')
-    args.add_argument('--visualize_histograms', action = 'store_true', default = False,
-                      help = '(For test mode only) Visualize prediction vs. ground truth distribution histograms after testing.')
-
-    ### Visualize--Molecule--Atom--contribution
-    args.add_argument('--visualize_atom_contributions', action='store_true', default = False,
-                      help='(For test mode only) Visualize atom contribution for a specific molecule.')
-    args.add_argument('--task_for_viz', type = str, default = 'human_oral_TDLo',
-                      help= 'The specific task name to use for atom contribution visualization.')
-    args.add_argument('--mol_index_for_viz', type = int, default = 7,
-                      help = r'The index of the molecule in the specified task\'s test set to visualize.')
-    args.add_argument('--query_atom_idx', type = int, default = 0,
-                      help = r'The index of the query atom\'s test set to visualize.')
-
-
-
-
 
     ## MTL Arch
     args.add_argument('--arch', type=str, default='Graphormer_prompt', help='Model architecture name')

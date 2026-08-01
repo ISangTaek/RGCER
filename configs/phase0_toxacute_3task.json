@@ -20,7 +20,7 @@
   "test_ratio": 0.1,
   "batch_size": 64,
   "epochs": 100,
-  "preprocessed_data_dir": "artifacts/processed/toxacute_phase0",
+  "preprocessed_data_dir": "D:\\PROJECT\\MTL\\MultiTask Toxic Prediction Reborn\\processed_graph_data",
   "run_dir": "artifacts/runs/toxacute_phase0_3task",
   "checkpoint_name": "toxacute_phase0_graphormer_prompt"
 }

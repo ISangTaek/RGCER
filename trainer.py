@@ -6,11 +6,6 @@ import os
 from record import PerformanceMeter
 from utils import count_parameters
 
-from visualize import Visualizer
-
-
-
-
 class Trainer(nn.Module):
     r'''A Multi-Task Learning Trainer.
     Assumes data from DataLoader is already collated (by DataCollator as collate_fn)
@@ -287,8 +282,7 @@ class Trainer(nn.Module):
 
         self.meter.display_best_result()
 
-    def test(self, dataloaders_dict, epoch = None, mode = 'test', visualize_prompts = False, visualize_predictions = False,
-             visualize_histograms=False, args_for_viz = None):
+    def test(self, dataloaders_dict, epoch = None, mode = 'test'):
         test_iterators, test_batch_counts = self._prepare_iterators_and_counts(dataloaders_dict)
         if not any(test_batch_counts.values()):
             print(f"No data for {mode} mode. Skipping.")
@@ -351,42 +345,6 @@ class Trainer(nn.Module):
         self.meter.record_time('end')
         self.meter.get_score()
         self.meter.display(mode = mode, epoch = epoch)
-
-
-        # ===============visualize========================
-        model_visualizer = Visualizer(trainer = self)
-        if visualize_prompts:
-            print("\n--- Starting Task Prompt Visualization ---")
-            if not (hasattr(self.model,'encoder')) and hasattr(self.model.encoder, 'ema_prompts'):
-                print("Warning: Model dose not have 'encoder.ema_prompts' attribute. Skipping. visualize")
-                return
-            model_visualizer.visualize_prompt(perplexity = 30) # tsne
-
-        if visualize_predictions or visualize_histograms:
-            print("\n--- Starting Prediction vs. Ground Truth Visualization ---")
-            model_visualizer.visualize_predictions_histograms()
-
-        if args_for_viz and args_for_viz.visualize_atom_contributions:
-            print("\n--- Starting Atom Contribution Visualization ---")
-
-
-
-            # 给出具体的想分析的任务下的分子原子归因
-            source_task_for_mol = args_for_viz.task_for_viz
-            mol_idx = args_for_viz.mol_index_for_viz
-            tasks_to_analyze = [
-                'mouse_intravenous_LD50',
-                'mouse_oral_LD50',
-                'rat_intravenous_LD50',
-                'rat_oral_LD50',
-             # 'mammal (species unspecified)_oral_LD50',
-                'rabbit_intravenous_LD50',
-                'rabbit_oral_LD50',
-                'human_oral_TDLo'
-            ]  #
-            model_visualizer.visualize_atom_contribution(args_for_viz, source_task_for_mol, mol_idx, tasks_to_analyze)
-
-
         self.meter.reinit()
             # # 1. 提取 EMA prompts
             # # shape [1, num_tasks, hidden_dim]
@@ -395,7 +353,6 @@ class Trainer(nn.Module):
             # # 2. 将任务映射到物种
             # species_list = self.args.species_list
             # if not species_list:
-            #     print("Warning: --visualize_prompts is set, but no species list is defined for this dataset. Skipping.")
             #     return
             #
             # def get_species_from_task(task_name, species_list):
@@ -461,7 +418,6 @@ class Trainer(nn.Module):
             #             expand_points = (1.2, 1.2),
             #             arrowprops = dict(arrowstyle = "-", color = 'gray', lw = 0.5))
             #
-            # plt.title('t-SNE Visualization of Task Prompts by Species')
             # plt.xlabel('t-SNE Dimension 1')
             # plt.ylabel('t-SNE Dimension 2')
             #
@@ -471,5 +427,4 @@ class Trainer(nn.Module):
             #     output_filename = os.path.join(self.save_path, output_filename)
             #
             # plt.savefig(output_filename)
-            # print(f"--- Visualization saved to {output_filename} ---")
             # plt.close()
