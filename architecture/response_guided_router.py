@@ -149,6 +149,7 @@ class ResponseGuidedEndpointRouter(nn.Module):
         logits = logits / self.temperature
         null_key = self.null_key_projection(self.null_token).expand(batch_size, -1)
         null_logits = (query * null_key).sum(dim=-1, keepdim=True) / (self.router_dim**0.5)
+        null_logits = null_logits / self.temperature
         allowed = _expand_source_mask(source_mask, batch_size, task_count, logits.device)
         if self.exclude_target:
             allowed[:, target_index] = False

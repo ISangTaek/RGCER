@@ -1,7 +1,11 @@
 import torch
 
 from analysis.interval_analysis import coverage_width, risk_coverage_curve
-from analysis.negative_transfer import intervention_masks, shuffled_endpoint_name
+from analysis.negative_transfer import (
+    intervention_masks,
+    shuffled_endpoint_batches,
+    shuffled_endpoint_name,
+)
 
 
 def test_source_interventions_delete_one_real_source_per_sample():
@@ -27,3 +31,20 @@ def test_interval_and_risk_coverage_helpers():
     )
     assert curve["coverage"].is_monotonic_increasing
     assert shuffled_endpoint_name("task") == "shuffled_task"
+
+
+def test_shuffled_endpoint_uses_one_split_global_permutation():
+    class Batch:
+        def __init__(self, ids, values):
+            self.sample_id = ids
+            self.y = torch.tensor(values, dtype=torch.float32).reshape(-1, 1)
+
+        def __deepcopy__(self, memo):
+            return Batch(list(self.sample_id), self.y.clone().reshape(-1).tolist())
+
+    batches = [Batch(["a", "b"], [1.0, 2.0]), Batch(["c", "d"], [3.0, 4.0])]
+    shuffled = list(shuffled_endpoint_batches(batches, seed=7))
+    assert [value for batch in shuffled for value in batch.y.reshape(-1).tolist()] != [1.0, 2.0, 3.0, 4.0]
+    repeated = list(shuffled_endpoint_batches(batches, seed=7))
+    assert torch.equal(shuffled[0].y, repeated[0].y)
+    assert torch.equal(shuffled[1].y, repeated[1].y)

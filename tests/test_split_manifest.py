@@ -36,3 +36,24 @@ def test_empty_subset_is_really_empty():
     loader = DataloaderWrapper._loader([], [], "validation", 4, 0, lambda x: x)
     assert len(loader) == 0
     assert len(loader.dataset) == 0
+
+
+def test_random_manifest_does_not_require_scaffold_isolation():
+    records = [
+        {
+            "sample_id": f"sample_{index}",
+            "canonical_smiles": "CCO" if index < 2 else f"CC{index}",
+            "scaffold": "shared_scaffold",
+        }
+        for index in range(8)
+    ]
+    manifest = create_split_manifest(
+        records,
+        splitting="random",
+        ratios={"train": 0.5, "validation": 0.2, "calibration": 0.2, "test": 0.1},
+    )
+    locations = {}
+    for record in manifest["records"]:
+        key = record["canonical_smiles"]
+        locations.setdefault(key, record["split"])
+        assert locations[key] == record["split"]

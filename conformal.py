@@ -32,7 +32,9 @@ class ConformalCalibrator:
         lower = torch.as_tensor(lower)
         upper = torch.as_tensor(upper)
         target = torch.as_tensor(target)
-        return torch.maximum(lower - target, target - upper).clamp_min(0.0)
+        # CQR uses the signed conformity score.  Negative scores are valid:
+        # they allow an over-wide base interval to contract after calibration.
+        return torch.maximum(lower - target, target - upper)
 
     def fit_task(self, task, lower, upper, target):
         scores = self.conformity_scores(lower, upper, target).reshape(-1)

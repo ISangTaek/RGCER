@@ -7,10 +7,12 @@ model depend on the old ``transfer_gate`` implementation.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import pandas as pd
 import torch
+
+from architecture.prediction_heads import decode_prediction
 
 
 def _unpack(result):
@@ -39,6 +41,24 @@ def _prediction_column(predictions, task_name):
     return raw[..., 0]
 
 
+def _decode_output(raw, task_name, prediction_mode, trainer=None, decode_fn: Optional[Callable] = None, apply_conformal=False):
+    """Decode one raw output into the same units as the labels.
+
+    ``Trainer.decode_task_output`` is preferred because it applies the task
+    scaler and optional CQR state.  ``decode_fn`` keeps the analysis helpers
+    usable by external evaluation pipelines without importing Trainer.
+    """
+
+    if trainer is not None:
+        return trainer.decode_task_output(task_name, raw, apply_conformal=apply_conformal)
+    if decode_fn is not None:
+        try:
+            return decode_fn(task_name, raw, apply_conformal=apply_conformal)
+        except TypeError:
+            return decode_fn(task_name, raw)
+    return decode_prediction(raw, mode=prediction_mode).as_dict()
+
+
 def _as_batch_weights(diagnostics, batch_size, task_count, device):
     weights = _diag_value(diagnostics, "source_weights", "routing_weights")
     if weights is None:
@@ -63,6 +83,10 @@ def collect_routing_records(
     target_task: str,
     task_names: List[str],
     device=None,
+    trainer=None,
+    decode_fn: Optional[Callable] = None,
+    prediction_mode: str = "point",
+    apply_conformal: bool = False,
 ) -> pd.DataFrame:
     """Collect one CSV-ready row per sample for a target task.
 
@@ -82,19 +106,32 @@ def collect_routing_records(
         weights = _as_batch_weights(diagnostics, batch_size, len(task_names), predictions[target_task].device)
         weights = weights.detach().cpu()
         null = _as_null_weight(diagnostics, batch_size, weights.device, weights.dtype).detach().cpu()
-        final_prediction = _prediction_column(predictions, target_task).detach().cpu()
+        final_decoded = _decode_output(
+            predictions[target_task], target_task, prediction_mode, trainer, decode_fn, apply_conformal
+        )
+        final_prediction = final_decoded["median"].reshape(-1).detach().cpu()
         base_raw = _diag_value(diagnostics, "base_raw")
         route_raw = _diag_value(diagnostics, "route_raw")
-        base_prediction = (
-            _prediction_column({target_task: base_raw}, target_task).detach().cpu()
-            if base_raw is not None
-            else final_prediction
+        base_decoded = _decode_output(
+            base_raw if base_raw is not None else predictions[target_task],
+            target_task,
+            prediction_mode,
+            trainer,
+            decode_fn,
+            False,
         )
-        route_prediction = (
-            _prediction_column({target_task: route_raw}, target_task).detach().cpu()
-            if route_raw is not None
-            else final_prediction
+        route_decoded = _decode_output(
+            route_raw if route_raw is not None else predictions[target_task],
+            target_task,
+            prediction_mode,
+            trainer,
+            decode_fn,
+            False,
         )
+        base_prediction = base_decoded["median"].reshape(-1).detach().cpu()
+        route_prediction = route_decoded["median"].reshape(-1).detach().cpu()
+        interval_lower = final_decoded["lower"].reshape(-1).detach().cpu()
+        interval_upper = final_decoded["upper"].reshape(-1).detach().cpu()
         target = getattr(batch, "y", None)
         target = target.reshape(-1).detach().cpu() if target is not None else None
         for sample_index in range(batch_size):
@@ -107,6 +144,9 @@ def collect_routing_records(
                 "base_prediction": float(base_prediction[sample_index]),
                 "route_prediction": float(route_prediction[sample_index]),
                 "final_prediction": float(final_prediction[sample_index]),
+                "interval_lower": float(interval_lower[sample_index]),
+                "interval_upper": float(interval_upper[sample_index]),
+                "interval_width": float(interval_upper[sample_index] - interval_lower[sample_index]),
                 # Compatibility alias for existing downstream notebooks.
                 "prediction": float(final_prediction[sample_index]),
             }
@@ -121,6 +161,14 @@ def collect_routing_records(
                 row["smiles"] = batch.smiles[sample_index]
             for source_index, source_task in enumerate(task_names):
                 row[f"route::{source_task}"] = float(weights[sample_index, source_index])
+            active_sources = torch.where(weights[sample_index] > 0)[0]
+            if active_sources.numel():
+                top_source = active_sources[weights[sample_index, active_sources].argmax()]
+                row["top_source_1"] = task_names[int(top_source)]
+                row["top_source_weight_1"] = float(weights[sample_index, top_source])
+            else:
+                row["top_source_1"] = None
+                row["top_source_weight_1"] = 0.0
             records.append(row)
     return pd.DataFrame(records)
 

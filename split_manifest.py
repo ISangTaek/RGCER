@@ -89,6 +89,18 @@ def create_split_manifest(
 
 
 def validate_manifest(manifest: dict) -> None:
+    splitting = manifest.get("splitting")
+    if splitting not in {"random", "scaffold"}:
+        raise ValueError(f"Unsupported splitting method in manifest: {splitting!r}")
+    ratios = manifest.get("ratios")
+    if not isinstance(ratios, dict) or set(ratios) != set(SPLIT_NAMES):
+        raise ValueError(f"Manifest ratios must contain exactly {SPLIT_NAMES}")
+    if any(float(ratios[name]) < 0 for name in SPLIT_NAMES) or not np.isclose(
+        sum(float(ratios[name]) for name in SPLIT_NAMES), 1.0
+    ):
+        raise ValueError("Manifest split ratios must be non-negative and sum to 1")
+    if "seed" not in manifest:
+        raise ValueError("Split manifest must record its seed")
     records = manifest.get("records", [])
     if not records:
         raise ValueError("Split manifest has no records")
@@ -108,7 +120,14 @@ def validate_manifest(manifest: dict) -> None:
             if by_split[left] & by_split[right]:
                 raise AssertionError(f"Sample IDs overlap between {left} and {right}")
 
-    for field in ("canonical_smiles", "scaffold"):
+    # Canonical SMILES are always kept together.  Scaffold isolation is a
+    # property of scaffold splitting only; enforcing it for a random split
+    # rejects a valid random experiment when unrelated molecules share a
+    # scaffold by chance.
+    fields = ["canonical_smiles"]
+    if splitting == "scaffold":
+        fields.append("scaffold")
+    for field in fields:
         locations: dict[str, str] = {}
         for record in records:
             value = record.get(field)

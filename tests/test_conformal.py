@@ -19,3 +19,10 @@ def test_conformal_rank_apply_and_state_roundtrip():
 def test_conformal_without_calibration_samples_raises():
     with pytest.raises(ValueError):
         ConformalCalibrator().fit_task("empty", torch.tensor([]), torch.tensor([]), torch.tensor([]))
+
+
+def test_conformal_keeps_signed_negative_scores():
+    scores = ConformalCalibrator.conformity_scores(
+        torch.tensor([0.0]), torch.tensor([2.0]), torch.tensor([1.0])
+    )
+    assert scores.item() == -1.0

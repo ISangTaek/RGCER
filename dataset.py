@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 from torch_geometric.data import Data
@@ -234,6 +235,23 @@ class DataloaderWrapper:
         if manifest.get("splitting") != self.splitting:
             raise ValueError(
                 f"Manifest splitting={manifest.get('splitting')!r} does not match requested {self.splitting!r}"
+            )
+        expected_ratios = {
+            "train": 1.0 - self.valid_size - self.calibration_size - self.test_size,
+            "validation": self.valid_size,
+            "calibration": self.calibration_size,
+            "test": self.test_size,
+        }
+        actual_ratios = manifest.get("ratios", {})
+        for name, expected in expected_ratios.items():
+            if not np.isclose(float(actual_ratios.get(name, float("nan"))), expected):
+                raise ValueError(
+                    f"Manifest ratio for {name!r} does not match the requested split configuration: "
+                    f"manifest={actual_ratios.get(name)!r}, requested={expected!r}"
+                )
+        if int(manifest.get("seed")) != self.split_seed:
+            raise ValueError(
+                f"Manifest seed={manifest.get('seed')!r} does not match requested split_seed={self.split_seed}"
             )
         return {record["sample_id"]: record["split"] for record in manifest["records"]}
 

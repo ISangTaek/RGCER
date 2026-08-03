@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import warnings
 from pathlib import Path
 
 import pandas as pd
@@ -38,6 +39,22 @@ from utils import calculate_mgkg
 RDLogger.DisableLog("rdApp.*")
 
 
+CLASSIFICATION_DATASETS = {"hiv", "bace", "bbbp", "muv", "tox21", "sider", "clintox"}
+
+
+def effective_prediction_mode(params):
+    """Return a head mode compatible with the selected dataset.
+
+    The common regression default is quantile, but classification labels have
+    one logit per sample and therefore must use the point head.
+    """
+
+    requested = getattr(params, "prediction_mode", "point")
+    if getattr(params, "dataset", None) in CLASSIFICATION_DATASETS and requested == "quantile":
+        return "point"
+    return requested
+
+
 def task_names_for_params(params):
     if params.dataset == "toxacute":
         scopes = {"human3": HUMAN_TARGET_TASKS, "animal56": ANIMAL_SOURCE_TASKS, "all59": TOXACUTE_TASKS}
@@ -63,7 +80,7 @@ def task_names_for_params(params):
 
 
 def build_task_dict(params, task_names):
-    if params.dataset in {"hiv", "bace", "bbbp", "muv", "tox21", "sider", "clintox"}:
+    if params.dataset in CLASSIFICATION_DATASETS:
         return {
             task: {"metrics": ["AUROC", "AUPRC"], "metrics_fn": ClsMetric(), "loss_fn": BCELoss(), "weight": [1, 1]}
             for task in task_names
@@ -118,7 +135,7 @@ def _build_model_components(params, task_names, device):
         {
             task: TaskPredictionHead(
                 hidden_dim=params.hidden_dim,
-                mode=params.prediction_mode,
+                mode=effective_prediction_mode(params),
                 head_hidden_dim=params.head_hidden_dim,
                 dropout=params.head_dropout,
             )
@@ -156,6 +173,14 @@ def _prediction_records(params, trainer, batch, task_names):
 
 
 def main(params):
+    selected_mode = effective_prediction_mode(params)
+    if selected_mode != getattr(params, "prediction_mode", selected_mode):
+        warnings.warn(
+            "Classification datasets use the point prediction head; prediction_mode='quantile' was overridden.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        params.prediction_mode = selected_mode
     task_names = task_names_for_params(params)
     task_dict = build_task_dict(params, task_names)
     device = _device_from_params(params)
@@ -206,6 +231,7 @@ def main(params):
             task_name=None,
         )
         batch = collator([graph]).to(trainer.device)
+        trainer.model.eval()
         with torch.no_grad():
             predictions = trainer.model(batch, return_all_tasks=True)
         print("--- Predictions ---")
@@ -271,7 +297,12 @@ def build_parser():
     parser.add_argument("--head_hidden_dim", type=int, default=96)
     parser.add_argument("--head_dropout", type=float, default=0.1)
     parser.add_argument("--response_hidden_dim", type=int, default=96)
-    parser.add_argument("--use_factorized_prompt", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--use_factorized_prompt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use ToxAcute endpoint factors; auto-detect when omitted.",
+    )
     parser.add_argument("--task_residual_scale", type=float, default=0.1)
     parser.add_argument("--prompt_layers", type=int, default=0)
     parser.add_argument("--prompt_heads", type=int, default=4)
@@ -296,7 +327,6 @@ def build_parser():
     parser.add_argument("--calibration_size", type=float, default=0.10)
     parser.add_argument("--tasks_per_update", type=int, default=1)
     parser.add_argument("--routing_enabled", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--null_calibration_weight", type=float, default=0.0)
     parser.add_argument("--toxacute_task_scope", choices=["human3", "animal56", "all59"], default="all59")
 
     parser.add_argument("--weighting", choices=["EW", "UW", "DWA"], default="EW")

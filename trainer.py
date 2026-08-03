@@ -84,8 +84,11 @@ class Trainer:
         self.best_val_score = -float("inf")
         self.best_checkpoint_path = None
         self._best_state = None
+        self._best_training_state = None
+        self.best_epoch = None
         self.loaded_epoch = None
         self.schedule_usage = {}
+        self.optimizer_updates = 0
         self.training_cache = {}
         self._is_rgcer = hasattr(getattr(self.model, "encoder", None), "task_conditioner") and hasattr(
             getattr(getattr(self.model, "encoder", None), "task_conditioner", None), "router"
@@ -127,6 +130,22 @@ class Trainer:
     def _is_regression(self, task):
         return "RMSE" in self.task_dict[task].get("metrics", [])
 
+    def _prediction_mode(self, task=None):
+        """Return the mode that matches the task head and its loss.
+
+        Classification heads are always point heads.  Keeping this decision in
+        the trainer as well as in the CLI prevents a direct API caller from
+        accidentally decoding a one-channel classification output as a
+        quantile tensor.
+        """
+
+        if task is not None and not self._is_regression(task):
+            return "point"
+        requested = getattr(self.args, "prediction_mode", "point")
+        if task is None and self.task_name and all(not self._is_regression(name) for name in self.task_name):
+            return "point"
+        return requested
+
     def _fit_task_scalers(self, train_dataloaders_dict):
         for task in self.task_name:
             if not self._is_regression(task):
@@ -158,13 +177,14 @@ class Trainer:
         return values * scaler["std"] + scaler["mean"] if self._is_regression(task) else values
 
     def decode_task_output(self, task, raw, apply_conformal=True):
-        decoded = decode_prediction(raw, mode=getattr(self.args, "prediction_mode", "point"))
+        mode = self._prediction_mode(task)
+        decoded = decode_prediction(raw, mode=mode)
         result = {
             "median": self._denormalize_tensor(task, decoded.median),
             "lower": self._denormalize_tensor(task, decoded.lower),
             "upper": self._denormalize_tensor(task, decoded.upper),
         }
-        if apply_conformal and getattr(self.args, "prediction_mode", "point") == "quantile":
+        if apply_conformal and mode == "quantile":
             if task in self.conformal_calibrator.states:
                 result["lower"], result["upper"] = self.conformal_calibrator.apply(
                     task, result["lower"], result["upper"]
@@ -190,7 +210,7 @@ class Trainer:
     def _prediction_loss(self, task, raw, labels):
         if not self._is_regression(task):
             return self._loss(task, raw, labels)
-        if getattr(self.args, "prediction_mode", "point") == "quantile":
+        if self._prediction_mode(task) == "quantile":
             return self.quantile_loss.compute_loss(raw, labels)
         return self._loss(task, raw, labels)
 
@@ -323,9 +343,12 @@ class Trainer:
             self, "train_loss_buffer", np.ones((self.task_num, max_history))
         )
         tasks_per_update = int(getattr(self.args, "tasks_per_update", 1))
+        if tasks_per_update <= 0:
+            raise ValueError("tasks_per_update must be positive")
+        update_count = 0
         for start in range(0, len(schedule), tasks_per_update):
             group = schedule[start : start + tasks_per_update]
-            task_losses = []
+            task_loss_groups = {task: [] for task in self.task_name}
             active_mask = torch.zeros(self.task_num, dtype=torch.bool, device=self.device)
             bundles = []
             for task in group:
@@ -334,21 +357,27 @@ class Trainer:
                     continue
                 batch = batch.to(self.device)
                 loss, bundle = self._training_step(batch, task, epoch)
-                task_losses.append(loss)
+                # A shuffled schedule can place two batches of the same task
+                # in one optimizer group.  Preserve both forwards and
+                # aggregate their losses instead of overwriting one entry in
+                # the task loss vector.
+                task_loss_groups[task].append(loss)
                 bundles.append(bundle)
                 active_mask[self.task_name.index(task)] = True
                 self.schedule_usage[task] += 1
-            if not task_losses:
+            if not bundles:
                 continue
             self.optimizer.zero_grad(set_to_none=True)
             loss_vector = torch.zeros(self.task_num, device=self.device)
-            for task, loss in zip([bundle["task"] for bundle in bundles], task_losses):
-                loss_vector[self.task_name.index(task)] = loss
+            for task, task_losses in task_loss_groups.items():
+                if task_losses:
+                    loss_vector[self.task_name.index(task)] = torch.stack(task_losses).mean()
             self.loss_balancer.backward(loss_vector, active_mask=active_mask)
             clip_value = getattr(self.args, "grad_clip", 1.0)
             if clip_value is not None and float(clip_value) > 0:
                 clip_grad_norm_(list(self.model.parameters()) + list(self.loss_balancer.parameters()), float(clip_value))
             self.optimizer.step()
+            update_count += 1
             for bundle in bundles:
                 task = bundle["task"]
                 final_median = self.decode_task_output(task, bundle["final_raw"].detach(), apply_conformal=False)["median"]
@@ -358,7 +387,8 @@ class Trainer:
                 self._record_training_output(bundle)
         result = self._score_buffers(buffers)
         result["loss"] = {task: float(np.mean(losses[task])) if losses[task] else np.nan for task in self.task_name}
-        result["updates"] = int(sum(1 for task in self.schedule_usage.values() if task > 0))
+        self.optimizer_updates += update_count
+        result["updates"] = update_count
         result["schedule_usage"] = dict(self.schedule_usage)
         result["routing"] = self._routing_summary()
         return result
@@ -434,10 +464,10 @@ class Trainer:
     def _evaluate(self, dataloaders_dict, mode="validation", epoch=0):
         buffers, records, route_records = self._collect_predictions(dataloaders_dict, epoch=epoch, apply_conformal=mode == "test")
         result = self._score_buffers(buffers)
-        if getattr(self.args, "prediction_mode", "point") == "quantile":
+        if self._prediction_mode() == "quantile":
             interval_values = []
             for task in self.task_name:
-                if not records[task]["target"]:
+                if not self._is_regression(task) or not records[task]["target"]:
                     continue
                 lower = torch.cat(records[task]["lower"])
                 upper = torch.cat(records[task]["upper"])
@@ -473,10 +503,12 @@ class Trainer:
         return summary
 
     def _fit_conformal(self, calibration_dataloaders_dict):
-        if getattr(self.args, "prediction_mode", "point") != "quantile" or not getattr(self.args, "fit_conformal", True):
+        if self._prediction_mode() != "quantile" or not getattr(self.args, "fit_conformal", True):
             return
         _, records, _ = self._collect_predictions(calibration_dataloaders_dict, epoch=10**9, apply_conformal=False)
         for task in self.task_name:
+            if not self._is_regression(task):
+                continue
             if not records[task]["target"]:
                 raise ValueError(f"No calibration samples for {task}.")
             self.conformal_calibrator.fit_task(
@@ -494,16 +526,22 @@ class Trainer:
         return manifest_hash(load_manifest(path)) if path.exists() else None
 
     def _architecture_config(self):
+        prompt_bank = getattr(getattr(getattr(self.model, "encoder", None), "task_conditioner", None), "prompt_bank", None)
+        requested_factorized = getattr(self.args, "use_factorized_prompt", None)
+        factorized = bool(prompt_bank.use_factorized_prompt) if prompt_bank is not None else requested_factorized
         return {
             "architecture": self.model.__class__.__name__,
             "task_names": list(self.task_name),
-            "prediction_mode": getattr(self.args, "prediction_mode", "point"),
+            "prediction_mode": self._prediction_mode(),
             "edge_bias_mode": getattr(self.args, "edge_bias_mode", "path"),
             "router_top_k": getattr(self.args, "router_top_k", 0),
             "router_temperature": getattr(self.args, "router_temperature", 1.0),
             "exclude_target_from_sources": getattr(self.args, "exclude_target_from_sources", True),
-            "use_factorized_prompt": getattr(self.args, "use_factorized_prompt", True),
-            "task_metadata": [getattr(item, "__dict__", {}) for item in getattr(getattr(getattr(self.model.encoder, "task_conditioner", None), "prompt_bank", None), "metadata", [])],
+            "use_factorized_prompt": factorized,
+            "task_metadata": [
+                getattr(item, "__dict__", {})
+                for item in getattr(prompt_bank, "metadata", [])
+            ],
         }
 
     def _checkpoint_payload(self, epoch):
@@ -516,7 +554,7 @@ class Trainer:
             "configuration": vars(self.args) if hasattr(self.args, "__dict__") else {},
             "task_names": list(self.task_name),
             "architecture_config": self._architecture_config(),
-            "prediction_mode": getattr(self.args, "prediction_mode", "point"),
+            "prediction_mode": self._prediction_mode(),
             "quantile_config": {
                 "lower": getattr(self.args, "lower_quantile", 0.05),
                 "upper": getattr(self.args, "upper_quantile", 0.95),
@@ -525,12 +563,20 @@ class Trainer:
             "hps_warmup_epochs": getattr(self.args, "hps_warmup_epochs", 0),
             "rgcer_config": {
                 "lambda_base": getattr(self.args, "lambda_base", 0.0),
+                "lambda_quantile": getattr(self.args, "lambda_quantile", 1.0),
                 "router_top_k": getattr(self.args, "router_top_k", 0),
+                "router_temperature": getattr(self.args, "router_temperature", 1.0),
+                "routing_enabled": getattr(self.args, "routing_enabled", True),
             },
             "task_metadata": self._architecture_config().get("task_metadata", []),
             "task_scalers": self.task_scalers,
             "split_manifest_hash": self._manifest_hash(),
             "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            # These fields are optional when loading an older v3 checkpoint;
+            # new checkpoints retain enough optimizer history for a faithful
+            # resume.
+            "train_loss_buffer": getattr(self, "train_loss_buffer", None),
+            "optimizer_updates": int(getattr(self, "optimizer_updates", 0)),
         }
 
     def _save_checkpoint(self, epoch, filename):
@@ -559,12 +605,54 @@ class Trainer:
             raise ValueError(f"Checkpoint is not a strict v3 checkpoint; missing={sorted(missing)}")
         if list(checkpoint["task_names"]) != self.task_name:
             raise ValueError("Checkpoint task_names do not match the current experiment")
-        if checkpoint["prediction_mode"] != getattr(self.args, "prediction_mode", "point"):
+        if checkpoint["prediction_mode"] != self._prediction_mode():
             raise ValueError("Checkpoint prediction mode does not match current configuration")
+        stored_quantiles = checkpoint["quantile_config"]
+        if not isinstance(stored_quantiles, dict) or any(
+            name not in stored_quantiles for name in ("lower", "upper")
+        ):
+            raise ValueError("Checkpoint quantile_config is incomplete")
+        current_quantiles = {
+            "lower": getattr(self.args, "lower_quantile", 0.05),
+            "upper": getattr(self.args, "upper_quantile", 0.95),
+        }
+        for name in ("lower", "upper"):
+            if float(stored_quantiles.get(name)) != float(current_quantiles[name]):
+                raise ValueError(f"Checkpoint quantile setting {name!r} does not match current configuration")
+        stored_architecture = checkpoint["architecture_config"]
+        if not isinstance(stored_architecture, dict):
+            raise ValueError("Checkpoint architecture_config is invalid")
         current_config = self._architecture_config()
-        for name in ("edge_bias_mode", "router_top_k", "router_temperature", "exclude_target_from_sources"):
-            if checkpoint["architecture_config"].get(name) != current_config.get(name):
+        for name in (
+            "architecture",
+            "prediction_mode",
+            "edge_bias_mode",
+            "router_top_k",
+            "router_temperature",
+            "exclude_target_from_sources",
+            "use_factorized_prompt",
+            "task_metadata",
+        ):
+            if stored_architecture.get(name) != current_config.get(name):
                 raise ValueError(f"Checkpoint setting {name!r} does not match current configuration")
+        if int(checkpoint["hps_warmup_epochs"]) != int(getattr(self.args, "hps_warmup_epochs", 0)):
+            raise ValueError("Checkpoint hps_warmup_epochs does not match current configuration")
+        current_rgcer = {
+            "lambda_base": getattr(self.args, "lambda_base", 0.0),
+            "lambda_quantile": getattr(self.args, "lambda_quantile", 1.0),
+            "router_top_k": getattr(self.args, "router_top_k", 0),
+            "router_temperature": getattr(self.args, "router_temperature", 1.0),
+            "routing_enabled": getattr(self.args, "routing_enabled", True),
+        }
+        stored_rgcer = checkpoint["rgcer_config"]
+        if not isinstance(stored_rgcer, dict):
+            raise ValueError("Checkpoint rgcer_config is invalid")
+        for name, value in current_rgcer.items():
+            if stored_rgcer.get(name) != value:
+                raise ValueError(f"Checkpoint RGCER setting {name!r} does not match current configuration")
+        current_manifest_hash = self._manifest_hash()
+        if checkpoint["split_manifest_hash"] != current_manifest_hash:
+            raise ValueError("Checkpoint split manifest does not match the current experiment")
         if checkpoint["feature_schema_version"] != FEATURE_SCHEMA_VERSION:
             raise ValueError("Checkpoint feature schema does not match current code")
         self.model.load_state_dict(checkpoint["model_state"], strict=True)
@@ -573,6 +661,12 @@ class Trainer:
         self.task_scalers = checkpoint["task_scalers"]
         self.conformal_calibrator.load_state_dict(checkpoint["conformal_state"])
         self.loaded_epoch = checkpoint["epoch"]
+        if path.name.endswith("_best.pt"):
+            self.best_checkpoint_path = path
+            self.best_epoch = int(checkpoint["epoch"])
+        if checkpoint.get("train_loss_buffer") is not None:
+            self.train_loss_buffer = np.asarray(checkpoint["train_loss_buffer"], dtype=float)
+        self.optimizer_updates = int(checkpoint.get("optimizer_updates", 0))
         self.load_path = str(path)
         print(f"Loaded strict v3 checkpoint: {path}")
 
@@ -595,8 +689,19 @@ class Trainer:
             quantile_weight=1.0,
         )
         history = []
-        self.train_loss_buffer = np.ones((self.task_num, max(int(epochs), 2)), dtype=float)
-        for epoch in range(int(epochs)):
+        start_epoch = int(self.loaded_epoch) + 1 if self.loaded_epoch is not None else 0
+        total_epochs = int(epochs)
+        if total_epochs < 0:
+            raise ValueError("epochs must be non-negative")
+        buffer_size = max(total_epochs, start_epoch + 1, 2)
+        existing_buffer = getattr(self, "train_loss_buffer", None)
+        if existing_buffer is None or existing_buffer.shape[0] != self.task_num:
+            self.train_loss_buffer = np.ones((self.task_num, buffer_size), dtype=float)
+        elif existing_buffer.shape[1] < buffer_size:
+            expanded = np.ones((self.task_num, buffer_size), dtype=float)
+            expanded[:, : existing_buffer.shape[1]] = existing_buffer
+            self.train_loss_buffer = expanded
+        for epoch in range(start_epoch, total_epochs):
             self.loss_balancer.train_loss_buffer = self.train_loss_buffer
             train_result = self._train_epoch(train_dataloaders_dict, epoch)
             for index, task in enumerate(self.task_name):
@@ -608,16 +713,32 @@ class Trainer:
             if self._best_state is None or validation_result["score"] > self.best_val_score:
                 self.best_val_score = validation_result["score"]
                 self._best_state = copy.deepcopy(self.model.state_dict())
+                self.best_epoch = epoch
+                self._best_training_state = {
+                    "model_state": copy.deepcopy(self.model.state_dict()),
+                    "optimizer_state": copy.deepcopy(self.optimizer.state_dict()),
+                    "weighting_state": copy.deepcopy(self.loss_balancer.state_dict()),
+                    "train_loss_buffer": self.train_loss_buffer.copy(),
+                    "optimizer_updates": int(self.optimizer_updates),
+                    "epoch": epoch,
+                }
                 self.best_checkpoint_path = self._save_checkpoint(
                     epoch, f"{getattr(params_main or self.args, 'ckpt_name', 'model')}_best.pt"
                 )
             self._save_checkpoint(epoch, f"{getattr(params_main or self.args, 'ckpt_name', 'model')}_last.pt")
-        if self._best_state is not None:
-            self.model.load_state_dict(self._best_state, strict=True)
+        if self._best_training_state is not None:
+            self.model.load_state_dict(self._best_training_state["model_state"], strict=True)
+            self.optimizer.load_state_dict(self._best_training_state["optimizer_state"])
+            self.loss_balancer.load_state_dict(self._best_training_state["weighting_state"], strict=True)
+            self.train_loss_buffer = self._best_training_state["train_loss_buffer"].copy()
+            self.optimizer_updates = self._best_training_state["optimizer_updates"]
         if calibration_dataloaders_dict is not None:
             self._fit_conformal(calibration_dataloaders_dict)
             if self.best_checkpoint_path is not None:
-                self._save_checkpoint(self.loaded_epoch if self.loaded_epoch is not None else int(epochs) - 1, self.best_checkpoint_path.name)
+                checkpoint_epoch = self.best_epoch
+                if checkpoint_epoch is None:
+                    checkpoint_epoch = self.loaded_epoch if self.loaded_epoch is not None else max(total_epochs - 1, 0)
+                self._save_checkpoint(checkpoint_epoch, self.best_checkpoint_path.name)
                 self.load_checkpoint(self.best_checkpoint_path)
         if test_dataloaders_dict and any(loader is not None and len(loader) > 0 for loader in test_dataloaders_dict.values()):
             self._evaluate(test_dataloaders_dict, mode="test", epoch=None)
