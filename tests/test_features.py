@@ -20,7 +20,7 @@ def test_compact_atom_and_bond_schema():
     assert str(graph.x.dtype).endswith("int64")
     assert graph.edge_attr.shape[1] == 4
     assert graph.attn_edge_type.shape[-1] == 4
-    assert graph.feature_schema_version == "atom_v2_bond_v1"
+    assert graph.feature_schema_version == "atom_v2_bond_v1_pathavg_v1"
 
 
 def test_bond_order_and_stereo_are_encoded():

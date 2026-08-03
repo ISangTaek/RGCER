@@ -54,6 +54,54 @@ def compute_regression_metrics(pred, gt):
     return result
 
 
+def compute_interval_metrics(lower, upper, target, alpha):
+    lower = _flatten(lower)
+    upper = _flatten(upper)
+    target = _flatten(target)
+    if not (lower.size == upper.size == target.size):
+        raise ValueError("lower, upper, and target must have the same number of values")
+    covered = (target >= lower) & (target <= upper)
+    width = upper - lower
+    interval_score = (
+        width
+        + 2.0 / alpha * (lower - target) * (target < lower)
+        + 2.0 / alpha * (target - upper) * (target > upper)
+    )
+    coverage = float(covered.mean()) if covered.size else np.nan
+    return {
+        "Coverage": coverage,
+        "MeanWidth": float(width.mean()) if width.size else np.nan,
+        "IntervalScore": float(interval_score.mean()) if width.size else np.nan,
+        "CoverageError": abs(coverage - (1.0 - alpha)) if width.size else np.nan,
+    }
+
+
+def compute_transfer_metrics(base_prediction, route_prediction, target, null_weight):
+    base_error = np.abs(_flatten(base_prediction) - _flatten(target))
+    route_error = np.abs(_flatten(route_prediction) - _flatten(target))
+    null_weight = _flatten(null_weight)
+    regret = route_error - base_error
+    harmful = regret > 0
+    result = {
+        "RouteRegretMean": float(regret.mean()) if regret.size else np.nan,
+        "NegativeTransferRate": float(harmful.mean()) if regret.size else np.nan,
+        "route_regret": regret,
+    }
+    if regret.size and np.unique(harmful).size == 2:
+        from sklearn.metrics import roc_auc_score
+
+        result["NullHarmfulAUROC"] = float(roc_auc_score(harmful.astype(int), 1.0 - null_weight))
+    else:
+        result["NullHarmfulAUROC"] = np.nan
+    if regret.size >= 2 and np.std(null_weight) > 0 and np.std(regret) > 0:
+        from scipy.stats import spearmanr
+
+        result["NullRegretSpearman"] = float(spearmanr(null_weight, regret).statistic)
+    else:
+        result["NullRegretSpearman"] = np.nan
+    return result
+
+
 class ClsMetric:
     """Buffered AUROC and AUPRC for one task."""
 

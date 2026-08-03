@@ -5,7 +5,7 @@ from dataset import DataCollator
 def test_collator_pads_all_graphormer_fields_on_cpu():
     short = get_graph_data_from_smiles("C", 1.0, sample_id="short")
     long = get_graph_data_from_smiles("CCO", 2.0, sample_id="long")
-    batch = DataCollator(device="cuda")([short, long])
+    batch = DataCollator()([short, long])
 
     assert batch.x.device.type == "cpu"
     assert tuple(batch.x.shape) == (2, 3, 9)

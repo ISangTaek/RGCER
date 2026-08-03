@@ -15,10 +15,10 @@ from rdkit import Chem
 from torch_geometric.data import Data
 
 from experiment_config import (
-    TOXACUTE_PHASE0_PREPROCESSED_DIR,
-    TOXACUTE_PHASE0_RAW_CSV,
-    TOXACUTE_PHASE0_TASKS,
+    TOXACUTE_PREPROCESSED_DIR,
+    TOXACUTE_RAW_CSV,
 )
+from architecture.toxacute_tasks import TOXACUTE_TASKS
 from molecular_features import (
     BOND_FEATURE_NAMES,
     FEATURE_SCHEMA_VERSION,
@@ -265,9 +265,9 @@ def preprocess_and_save(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Offline molecular Graphormer preprocessing")
-    parser.add_argument("--raw_csv_path", type=str, default=TOXACUTE_PHASE0_RAW_CSV)
-    parser.add_argument("--task_list", type=str, default=",".join(TOXACUTE_PHASE0_TASKS))
-    parser.add_argument("--output_dir", type=str, default=TOXACUTE_PHASE0_PREPROCESSED_DIR)
+    parser.add_argument("--raw_csv_path", type=str, default=TOXACUTE_RAW_CSV)
+    parser.add_argument("--task_list", type=str, default=",".join(TOXACUTE_TASKS))
+    parser.add_argument("--output_dir", type=str, default=TOXACUTE_PREPROCESSED_DIR)
     parser.add_argument("--splitting", choices=["random", "scaffold"], default="scaffold")
     parser.add_argument("--valid_size", type=float, default=0.1)
     parser.add_argument("--calibration_size", type=float, default=0.1)

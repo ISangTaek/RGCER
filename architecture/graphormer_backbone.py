@@ -78,11 +78,15 @@ class MolecularGraphormerBackbone(nn.Module):
         ffn_dim,
         dropout=0.1,
         spatial_pos_max_clip=20,
+        edge_bias_mode="path",
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.spatial_pos_max_clip = int(spatial_pos_max_clip)
+        if edge_bias_mode not in {"path", "direct", "direct_plus_path"}:
+            raise ValueError("edge_bias_mode must be 'path', 'direct', or 'direct_plus_path'")
+        self.edge_bias_mode = edge_bias_mode
         self.atom_embeddings = nn.ModuleList(
             [nn.Embedding(cardinality + 1, hidden_dim, padding_idx=0) for cardinality in ATOM_CARDINALITIES]
         )
@@ -125,17 +129,23 @@ class MolecularGraphormerBackbone(nn.Module):
         spatial_bias = self.spatial_embedding(spatial).permute(0, 3, 1, 2)
         bias[:, :, 1:, 1:] = bias[:, :, 1:, 1:] + spatial_bias
 
-        direct_edge = batch.attn_edge_type
-        direct_bias = 0.0
-        for field_id, embedding in enumerate(self.direct_bond_embeddings):
-            direct_bias = direct_bias + embedding(direct_edge[..., field_id])
-        bias[:, :, 1:, 1:] = bias[:, :, 1:, 1:] + direct_bias.permute(0, 3, 1, 2)
+        if self.edge_bias_mode in {"direct", "direct_plus_path"}:
+            direct_edge = batch.attn_edge_type
+            direct_bias = 0.0
+            for field_id, embedding in enumerate(self.direct_bond_embeddings):
+                direct_bias = direct_bias + embedding(direct_edge[..., field_id])
+            bias[:, :, 1:, 1:] = bias[:, :, 1:, 1:] + direct_bias.permute(0, 3, 1, 2)
 
-        path_edge = batch.edge_input
-        path_bias = 0.0
-        for field_id, embedding in enumerate(self.path_bond_embeddings):
-            path_bias = path_bias + embedding(path_edge[..., field_id]).sum(dim=3)
-        bias[:, :, 1:, 1:] = bias[:, :, 1:, 1:] + path_bias.permute(0, 3, 1, 2)
+        if self.edge_bias_mode in {"path", "direct_plus_path"}:
+            path_edge = batch.edge_input
+            valid_hops = path_edge.ne(0).any(dim=-1)
+            path_length = valid_hops.sum(dim=3).clamp_min(1)
+            path_bias = 0.0
+            for field_id, embedding in enumerate(self.path_bond_embeddings):
+                path_bias = path_bias + embedding(path_edge[..., field_id]).sum(dim=3)
+            path_bias = path_bias / path_length.unsqueeze(-1)
+            path_bias = path_bias.masked_fill(~valid_hops.any(dim=3).unsqueeze(-1), 0.0)
+            bias[:, :, 1:, 1:] = bias[:, :, 1:, 1:] + path_bias.permute(0, 3, 1, 2)
 
         bias[:, :, 1:, 0:1] = bias[:, :, 1:, 0:1] + self.graph_token_distance.unsqueeze(2)
         bias[:, :, 0:1, :] = bias[:, :, 0:1, :] + self.graph_token_distance.unsqueeze(2)

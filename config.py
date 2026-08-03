@@ -28,12 +28,24 @@ def prepare_args(params):
     if hasattr(params, 'mid_dim'):
         kwargs['arch_args']['mid_dim'] = params.mid_dim
     for name in [
+        'use_factorized_prompt',
+        'task_residual_scale',
         'prompt_layers',
         'prompt_heads',
         'prompt_ffn_dim',
         'prompt_dropout',
+        'router_mode',
+        'router_dim',
+        'router_top_k',
+        'router_temperature',
+        'exclude_target_from_sources',
         'adapter_ratio',
         'prompt_gate_init',
+        'response_hidden_dim',
+        'edge_bias_mode',
+        'prediction_mode',
+        'head_hidden_dim',
+        'head_dropout',
     ]:
         if hasattr(params, name):
             kwargs['arch_args'][name] = getattr(params, name)
@@ -45,11 +57,10 @@ def prepare_args(params):
     else:
         raise ValueError('No support weighting method {}'.format(params.weighting))
 
-    if params.optim in ['adam']:
-        if params.optim == 'adam':
-            optim_param = {'optim': 'adam',
-                           'lr': params.lr,
-                           'weight_decay': params.weight_decay}
+    if params.optim in ['adam', 'adamw']:
+        optim_param = {'optim': params.optim,
+                       'lr': params.lr,
+                       'weight_decay': params.weight_decay}
     else:
         raise ValueError('No support optim method {}'.format(params.optim))
 

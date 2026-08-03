@@ -7,7 +7,7 @@ from typing import Any, Iterable
 from rdkit import Chem
 
 
-FEATURE_SCHEMA_VERSION = "atom_v2_bond_v1"
+FEATURE_SCHEMA_VERSION = "atom_v2_bond_v1_pathavg_v1"
 
 ATOM_FEATURE_NAMES = (
     "atomic_number",

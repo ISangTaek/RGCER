@@ -30,6 +30,7 @@ class Encoder(nn.Module):
         atoms_attention_dropout_rate,
         atoms_readout_dim,
         device,
+        edge_bias_mode="path",
     ):
         super().__init__()
         del task_name, atoms_input_dropout_rate, atoms_reshape_dim, device
@@ -40,6 +41,7 @@ class Encoder(nn.Module):
             ffn_dim=atoms_ffn_dim,
             dropout=max(float(atoms_dropout_rate), float(atoms_attention_dropout_rate)),
             spatial_pos_max_clip=20,
+            edge_bias_mode=edge_bias_mode,
         )
         if atoms_readout_dim != atoms_hidden_dim:
             self.readout = nn.Linear(atoms_hidden_dim, atoms_readout_dim)
@@ -68,13 +70,56 @@ class Graphormer(AbsArchitecture):
             atoms_attention_dropout_rate=0.1,
             atoms_readout_dim=args.hidden_dim,
             device=device,
+            edge_bias_mode=getattr(args, "edge_bias_mode", "path"),
         )
 
-    def forward(self, inputs, task_name=None, return_all_tasks=False, mode=None):
-        del mode
+    def forward(
+        self,
+        inputs,
+        task_name=None,
+        return_all_tasks=False,
+        return_aux=False,
+        source_mask=None,
+        routing_enabled=True,
+        mode=None,
+    ):
+        del source_mask, routing_enabled, mode
         representation = self.encoder(inputs)
+        ones = torch.ones(representation.size(0), 1, device=representation.device, dtype=representation.dtype)
         if return_all_tasks or task_name is None:
-            return {task: self.decoders[task](representation) for task in self.task_name}
+            predictions = {task: self.decoders[task](representation) for task in self.task_name}
+            if return_aux:
+                diagnostics = {
+                    task: {
+                        "target_task": task,
+                        "target_index": index,
+                        "base_representation": representation,
+                        "route_representation": representation,
+                        "final_representation": representation,
+                        "base_raw": predictions[task],
+                        "route_raw": predictions[task],
+                        "final_raw": predictions[task],
+                        "null_weight": ones,
+                    }
+                    for index, task in enumerate(self.task_name)
+                }
+                return predictions, diagnostics
+            return predictions
         if task_name not in self.decoders:
             raise KeyError(f"Unknown task: {task_name}")
-        return {task_name: self.decoders[task_name](representation)}
+        raw = self.decoders[task_name](representation)
+        predictions = {task_name: raw}
+        if return_aux:
+            index = self.task_name.index(task_name)
+            return predictions, {
+                "target_task": task_name,
+                "target_index": index,
+                "base_representation": representation,
+                "route_representation": representation,
+                "final_representation": representation,
+                "base_raw": raw,
+                "route_raw": raw,
+                "final_raw": raw,
+                "null_weight": ones,
+            }
+        return predictions

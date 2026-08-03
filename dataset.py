@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from torch_geometric.data import Data
 
 from split_manifest import load_manifest
+from molecular_features import BOND_FEATURE_NAMES
 
 
 class PreprocessedDatasetWrapper(Dataset):
@@ -22,6 +23,7 @@ class PreprocessedDatasetWrapper(Dataset):
         )
         if not self.processed_files:
             print(f"Warning: no preprocessed .pt files found in {self.task_data_dir}")
+        self._sample_ids = {}
 
     def __len__(self):
         return len(self.processed_files)
@@ -34,7 +36,9 @@ class PreprocessedDatasetWrapper(Dataset):
             raise RuntimeError(f"Error loading preprocessed file {file_path}: {exc}") from exc
 
     def get_sample_id(self, index):
-        return str(self[index].sample_id)
+        if index not in self._sample_ids:
+            self._sample_ids[index] = str(self[index].sample_id)
+        return self._sample_ids[index]
 
 
 class SubsetSequentialSampler(torch.utils.data.Sampler):
@@ -53,8 +57,7 @@ class SubsetSequentialSampler(torch.utils.data.Sampler):
 class DataCollator:
     """Pad graph tensors on CPU; device transfer belongs in Trainer."""
 
-    def __init__(self, spatial_pos_max_clip=20, device=None, max_node_filter=None):
-        del device
+    def __init__(self, spatial_pos_max_clip=20, max_node_filter=None):
         self.spatial_pos_max_clip = int(spatial_pos_max_clip)
         self.max_node_filter = max_node_filter
 
@@ -91,11 +94,22 @@ class DataCollator:
         return padded
 
     def _empty_batch(self):
+        bond_fields = len(BOND_FEATURE_NAMES)
         return Data(
             x=torch.empty((0, 0, 0), dtype=torch.long),
+            in_degree=torch.empty((0, 0), dtype=torch.long),
+            out_degree=torch.empty((0, 0), dtype=torch.long),
+            spatial_pos=torch.empty((0, 0, 0), dtype=torch.long),
+            attn_bias=torch.empty((0, 1, 1), dtype=torch.float),
+            attn_edge_type=torch.empty((0, 0, 0, bond_fields), dtype=torch.long),
+            edge_input=torch.empty((0, 0, 0, 1, bond_fields), dtype=torch.long),
             y=torch.empty((0, 1), dtype=torch.float),
             padding_mask=torch.empty((0, 0), dtype=torch.bool),
             node_mask=torch.empty((0, 0), dtype=torch.bool),
+            smiles=[],
+            sample_id=[],
+            canonical_smiles=[],
+            feature_schema_version=None,
             is_empty=True,
         )
 
@@ -201,6 +215,10 @@ class DataloaderWrapper:
         self.valid_size = float(valid_size)
         self.calibration_size = float(calibration_size)
         self.test_size = float(test_size)
+        if self.valid_size < 0 or self.calibration_size < 0 or self.test_size < 0:
+            raise ValueError("split sizes must be non-negative")
+        if self.valid_size + self.calibration_size + self.test_size >= 1.0:
+            raise ValueError("validation + calibration + test ratios must be less than 1")
         self.num_workers = int(num_workers)
         self.collate_fn_for_loader = collate_fn_for_loader
         self.split_seed = int(split_seed)
