@@ -1,0 +1,20 @@
+# Tested with Python 3.10.19 in the icl conda environment.
+# The repository includes a cp310 native algos extension; use Python 3.10
+# when reusing that binary, or rebuild it with setup.py for another Python ABI.
+
+# PyTorch CUDA 12.6 wheels
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.10.0+cu126
+torch-geometric==2.8.0.post1
+
+# Runtime dependencies
+numpy==2.2.6
+pandas==2.3.3
+scipy==1.15.3
+scikit-learn==1.7.2
+rdkit==2025.9.6
+tqdm==4.67.3
+
+# Build and test dependencies
+Cython==3.2.9
+pytest==9.0.3
