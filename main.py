@@ -283,15 +283,21 @@ def main(params):
                 params_main=params,
             )
             if params.save_path:
-                _write_json(Path(params.save_path) / "metrics.json", {"history": history})
-                if history:
+                metrics_payload = {"history": history}
+                if trainer.final_test_result is not None:
+                    metrics_payload["test"] = trainer.final_test_result
+                _write_json(Path(params.save_path) / "metrics.json", metrics_payload)
+                routing_result = trainer.final_test_result
+                if routing_result is None and history:
+                    routing_result = history[-1].get("validation", {})
+                if routing_result is not None:
                     _write_json(
                         Path(params.save_path) / "routing_summary.json",
                         {
                             **Trainer.aggregate_routing_summary(
-                                history[-1].get("validation", {}).get("routing", {})
+                                routing_result.get("routing", {})
                             ),
-                            "tasks": history[-1].get("validation", {}).get("routing", {}),
+                            "tasks": routing_result.get("routing", {}),
                         },
                     )
         else:

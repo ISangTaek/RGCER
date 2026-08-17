@@ -1,7 +1,7 @@
 import numpy as np
 from sklearn.metrics import mean_squared_error, roc_auc_score
 
-from metric import ClsMetric, RegMetric
+from metric import ClsMetric, RegMetric, compute_transfer_metrics
 
 
 def test_regression_metric_is_computed_over_the_full_epoch():
@@ -20,3 +20,13 @@ def test_classification_metric_handles_single_class_batches():
     metric.update_fun(np.array([0.8, 0.9]), np.array([1, 1]))
     auroc, _ = metric.score_fun()
     assert np.isclose(auroc, roc_auc_score([0, 0, 1, 1], [0.1, 0.2, 0.8, 0.9]))
+
+
+def test_null_weight_scores_harmful_routes_in_the_positive_direction():
+    result = compute_transfer_metrics(
+        base_prediction=np.zeros(4),
+        route_prediction=np.array([0.0, 1.0, 2.0, 0.0]),
+        target=np.zeros(4),
+        null_weight=np.array([0.1, 0.9, 0.8, 0.2]),
+    )
+    assert np.isclose(result["NullHarmfulAUROC"], 1.0)

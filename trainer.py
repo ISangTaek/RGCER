@@ -87,6 +87,9 @@ class Trainer:
         self._best_training_state = None
         self.best_epoch = None
         self.loaded_epoch = None
+        self.loaded_routing_enabled = None
+        self.best_routing_enabled = None
+        self.final_test_result = None
         self.schedule_usage = {}
         self.optimizer_updates = 0
         self.training_cache = {}
@@ -228,25 +231,29 @@ class Trainer:
             return diagnostics
         return vars(diagnostics)
 
-    def _routing_enabled(self, epoch):
+    def _routing_enabled(self, epoch, routing_enabled_override=None):
         if not self._is_rgcer:
             return True
         if not bool(getattr(self.args, "routing_enabled", True)):
             return False
+        if routing_enabled_override is not None:
+            return bool(routing_enabled_override)
         # Validation/test callers may pass ``None`` because they are not part
-        # of the epoch schedule.  A trained checkpoint should use the routed
-        # path in those phases.
+        # of the epoch schedule.  Prefer the state recorded by a loaded
+        # checkpoint; this also keeps warm-up checkpoints on the HPS path.
         if epoch is None:
+            if self.loaded_routing_enabled is not None:
+                return bool(self.loaded_routing_enabled)
             return True
         return epoch >= getattr(self.args, "hps_warmup_epochs", 0)
 
-    def _forward_task(self, batch, task, epoch, return_aux=True):
+    def _forward_task(self, batch, task, epoch, return_aux=True, routing_enabled_override=None):
         if self._is_rgcer:
             result = self.model(
                 batch,
                 task_name=task,
                 return_aux=return_aux,
-                routing_enabled=self._routing_enabled(epoch),
+                routing_enabled=self._routing_enabled(epoch, routing_enabled_override),
             )
         else:
             result = self.model(batch, task_name=task, return_aux=return_aux)
@@ -262,14 +269,13 @@ class Trainer:
         final_loss = self._prediction_loss(task, final_raw, normalized_labels)
         base_raw = diagnostics.get("base_raw", final_raw)
         routing_enabled = self._routing_enabled(epoch)
+        total_loss = getattr(self.args, "lambda_quantile", 1.0) * final_loss
         if routing_enabled and self._is_rgcer:
             base_loss = self._prediction_loss(task, base_raw, normalized_labels)
-            total_loss = getattr(self.args, "lambda_quantile", 1.0) * final_loss
             if getattr(self.args, "rgcer_use_base_aux_loss", True):
                 total_loss = total_loss + getattr(self.args, "lambda_base", 0.25) * base_loss
         else:
             base_loss = final_loss
-            total_loss = final_loss
         return total_loss, {
             "task": task,
             "labels": labels.detach(),
@@ -456,7 +462,13 @@ class Trainer:
         if result.get("routing"):
             print(f"routing: {result['routing']}")
 
-    def _collect_predictions(self, dataloaders_dict, epoch=0, apply_conformal=False):
+    def _collect_predictions(
+        self,
+        dataloaders_dict,
+        epoch=0,
+        apply_conformal=False,
+        routing_enabled_override=None,
+    ):
         self.model.eval()
         buffers = {task: {"pred": [], "label": []} for task in self.task_name}
         records = {task: {"lower": [], "upper": [], "target": []} for task in self.task_name}
@@ -483,7 +495,13 @@ class Trainer:
                     if not self._valid_batch(batch):
                         continue
                     batch = batch.to(self.device)
-                    output, diagnostics = self._forward_task(batch, task, epoch, return_aux=True)
+                    output, diagnostics = self._forward_task(
+                        batch,
+                        task,
+                        epoch,
+                        return_aux=True,
+                        routing_enabled_override=routing_enabled_override,
+                    )
                     final_raw = output[task]
                     final_decoded = self.decode_task_output(task, final_raw, apply_conformal=apply_conformal)
                     target = batch.y.reshape(-1, 1).float()
@@ -511,8 +529,13 @@ class Trainer:
                         route_records[task]["entropy"].append(diagnostics["routing_entropy"].cpu())
         return buffers, records, route_records
 
-    def _evaluate(self, dataloaders_dict, mode="validation", epoch=0):
-        buffers, records, route_records = self._collect_predictions(dataloaders_dict, epoch=epoch, apply_conformal=mode == "test")
+    def _evaluate(self, dataloaders_dict, mode="validation", epoch=0, routing_enabled_override=None):
+        buffers, records, route_records = self._collect_predictions(
+            dataloaders_dict,
+            epoch=epoch,
+            apply_conformal=mode == "test",
+            routing_enabled_override=routing_enabled_override,
+        )
         result = self._score_buffers(buffers)
         if self._prediction_mode() == "quantile":
             interval_values = []
@@ -641,10 +664,15 @@ class Trainer:
             aggregate[key] = float(np.nanmean(values)) if values else float("nan")
         return aggregate
 
-    def _fit_conformal(self, calibration_dataloaders_dict):
+    def _fit_conformal(self, calibration_dataloaders_dict, routing_enabled_override=None):
         if self._prediction_mode() != "quantile" or not getattr(self.args, "fit_conformal", True):
             return
-        _, records, _ = self._collect_predictions(calibration_dataloaders_dict, epoch=10**9, apply_conformal=False)
+        _, records, _ = self._collect_predictions(
+            calibration_dataloaders_dict,
+            epoch=10**9,
+            apply_conformal=False,
+            routing_enabled_override=routing_enabled_override,
+        )
         for task in self.task_name:
             if not self._is_regression(task):
                 continue
@@ -726,6 +754,7 @@ class Trainer:
             },
             "conformal_state": self.conformal_calibrator.state_dict(),
             "hps_warmup_epochs": getattr(self.args, "hps_warmup_epochs", 0),
+            "routing_enabled": self._routing_enabled(epoch),
             "rgcer_config": self._rgcer_config(),
             "task_metadata": self._architecture_config().get("task_metadata", []),
             "task_scalers": self.task_scalers,
@@ -814,9 +843,14 @@ class Trainer:
         self.task_scalers = checkpoint["task_scalers"]
         self.conformal_calibrator.load_state_dict(checkpoint["conformal_state"])
         self.loaded_epoch = checkpoint["epoch"]
+        stored_routing_enabled = checkpoint.get("routing_enabled")
+        if stored_routing_enabled is None:
+            stored_routing_enabled = self._routing_enabled(checkpoint["epoch"])
+        self.loaded_routing_enabled = bool(stored_routing_enabled)
         if path.name.endswith("_best.pt"):
             self.best_checkpoint_path = path
             self.best_epoch = int(checkpoint["epoch"])
+            self.best_routing_enabled = self.loaded_routing_enabled
         if checkpoint.get("train_loss_buffer") is not None:
             self.train_loss_buffer = np.asarray(checkpoint["train_loss_buffer"], dtype=float)
         self.optimizer_updates = int(checkpoint.get("optimizer_updates", 0))
@@ -832,6 +866,7 @@ class Trainer:
         epochs=1,
         params_main=None,
     ):
+        self.final_test_result = None
         if not any(loader is not None and len(loader) > 0 for loader in train_dataloaders_dict.values()):
             raise ValueError("All training dataloaders are empty")
         if not self.task_scalers:
@@ -867,6 +902,7 @@ class Trainer:
                 self.best_val_score = validation_result["score"]
                 self._best_state = copy.deepcopy(self.model.state_dict())
                 self.best_epoch = epoch
+                self.best_routing_enabled = self._routing_enabled(epoch)
                 self._best_training_state = {
                     "model_state": copy.deepcopy(self.model.state_dict()),
                     "optimizer_state": copy.deepcopy(self.optimizer.state_dict()),
@@ -885,8 +921,15 @@ class Trainer:
             self.loss_balancer.load_state_dict(self._best_training_state["weighting_state"], strict=True)
             self.train_loss_buffer = self._best_training_state["train_loss_buffer"].copy()
             self.optimizer_updates = self._best_training_state["optimizer_updates"]
+            self.loaded_routing_enabled = self.best_routing_enabled
+        routing_state = self.best_routing_enabled
+        if routing_state is None:
+            routing_state = self.loaded_routing_enabled
         if calibration_dataloaders_dict is not None:
-            self._fit_conformal(calibration_dataloaders_dict)
+            self._fit_conformal(
+                calibration_dataloaders_dict,
+                routing_enabled_override=routing_state,
+            )
             if self.best_checkpoint_path is not None:
                 checkpoint_epoch = self.best_epoch
                 if checkpoint_epoch is None:
@@ -894,7 +937,12 @@ class Trainer:
                 self._save_checkpoint(checkpoint_epoch, self.best_checkpoint_path.name)
                 self.load_checkpoint(self.best_checkpoint_path)
         if test_dataloaders_dict and any(loader is not None and len(loader) > 0 for loader in test_dataloaders_dict.values()):
-            self._evaluate(test_dataloaders_dict, mode="test", epoch=None)
+            self.final_test_result = self._evaluate(
+                test_dataloaders_dict,
+                mode="test",
+                epoch=None,
+                routing_enabled_override=routing_state,
+            )
         return history
 
     def test(self, dataloaders_dict, epoch=None, mode="test"):

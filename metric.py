@@ -90,7 +90,7 @@ def compute_transfer_metrics(base_prediction, route_prediction, target, null_wei
     if regret.size and np.unique(harmful).size == 2:
         from sklearn.metrics import roc_auc_score
 
-        result["NullHarmfulAUROC"] = float(roc_auc_score(harmful.astype(int), 1.0 - null_weight))
+        result["NullHarmfulAUROC"] = float(roc_auc_score(harmful.astype(int), null_weight))
     else:
         result["NullHarmfulAUROC"] = np.nan
     if regret.size >= 2 and np.std(null_weight) > 0 and np.std(regret) > 0:

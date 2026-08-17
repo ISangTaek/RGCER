@@ -240,6 +240,8 @@ def preprocess_and_save(
     for task_name in tasks:
         task_output_dir = output_dir_base / task_name
         task_output_dir.mkdir(parents=True, exist_ok=True)
+        for stale_file in task_output_dir.glob("data_*.pt"):
+            stale_file.unlink()
         processed = 0
         skipped = 0
         for row_index, record in record_by_index.items():
