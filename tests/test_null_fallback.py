@@ -22,5 +22,6 @@ def test_forced_null_is_exact_hps_fallback():
 
     with patch.object(router, "forward", side_effect=forced_null):
         _, diagnostics = model(batch, task_name="task_a", return_aux=True)
-    assert torch.equal(diagnostics["final_representation"], diagnostics["base_representation"])
+    assert diagnostics["final_representation"] is None
     assert torch.equal(diagnostics["final_raw"], diagnostics["base_raw"])
+    assert torch.equal(diagnostics["final_prediction"], diagnostics["base_prediction"])

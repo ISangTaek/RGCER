@@ -99,7 +99,7 @@ class Trainer:
         if load_path is not None:
             self.load_checkpoint(load_path)
         elif getattr(args, "mode", "train") in {"test", "batch_inference", "single_inference"}:
-            raise FileNotFoundError("test/inference mode requires --load_path to a strict v3 checkpoint")
+            raise FileNotFoundError("test/inference mode requires --load_path to a strict v4 checkpoint")
         count_parameters(self.model)
 
     @staticmethod
@@ -264,9 +264,9 @@ class Trainer:
         routing_enabled = self._routing_enabled(epoch)
         if routing_enabled and self._is_rgcer:
             base_loss = self._prediction_loss(task, base_raw, normalized_labels)
-            total_loss = getattr(self.args, "lambda_quantile", 1.0) * final_loss + getattr(
-                self.args, "lambda_base", 0.25
-            ) * base_loss
+            total_loss = getattr(self.args, "lambda_quantile", 1.0) * final_loss
+            if getattr(self.args, "rgcer_use_base_aux_loss", True):
+                total_loss = total_loss + getattr(self.args, "lambda_base", 0.25) * base_loss
         else:
             base_loss = final_loss
             total_loss = final_loss
@@ -287,19 +287,36 @@ class Trainer:
         base = self.decode_task_output(task, bundle["base_raw"].detach(), apply_conformal=False)["median"]
         route = self.decode_task_output(task, bundle["route_raw"].detach(), apply_conformal=False)["median"]
         diagnostics = bundle["diagnostics"]
-        self.training_cache.setdefault(task, {"base": [], "route": [], "final": [], "target": [], "route_regret": [], "null": [], "source_weights": []})
+        self.training_cache.setdefault(
+            task,
+            {
+                "base": [],
+                "route": [],
+                "final": [],
+                "target": [],
+                "route_regret": [],
+                "final_regret": [],
+                "null": [],
+                "source_weights": [],
+                "entropy": [],
+            },
+        )
         cache = self.training_cache[task]
         target = bundle["labels"].cpu()
         route_regret = (route - target).abs() - (base - target).abs()
+        final_regret = (final - target).abs() - (base - target).abs()
         cache["base"].append(base.cpu())
         cache["route"].append(route.cpu())
         cache["final"].append(final.cpu())
         cache["target"].append(target)
         cache["route_regret"].append(route_regret.cpu())
+        cache["final_regret"].append(final_regret.cpu())
         if "null_weight" in diagnostics:
             cache["null"].append(diagnostics["null_weight"].detach().cpu())
         if "source_weights" in diagnostics:
             cache["source_weights"].append(diagnostics["source_weights"].detach().cpu())
+        if "routing_entropy" in diagnostics:
+            cache["entropy"].append(diagnostics["routing_entropy"].detach().cpu())
 
     def _routing_summary(self):
         summary = {}
@@ -308,19 +325,35 @@ class Trainer:
                 continue
             result = {
                 "route_regret_mean": float(torch.cat(cache["route_regret"]).mean()),
-                "negative_transfer_rate": float((torch.cat(cache["route_regret"]) > 0).float().mean()),
+                "final_regret_mean": float(torch.cat(cache["final_regret"]).mean()),
+                "route_negative_transfer_rate": float(
+                    (torch.cat(cache["route_regret"]) > 0).float().mean()
+                ),
+                "final_negative_transfer_rate": float(
+                    (torch.cat(cache["final_regret"]) > 0).float().mean()
+                ),
             }
+            result["negative_transfer_rate"] = result["route_negative_transfer_rate"]
             if cache["null"]:
                 null = torch.cat(cache["null"])
-                result.update({"mean_null": float(null.mean()), "std_null": float(null.std(unbiased=False))})
+                result.update(
+                    {
+                        "mean_null_weight": float(null.mean()),
+                        "mean_null": float(null.mean()),
+                        "std_null": float(null.std(unbiased=False)),
+                    }
+                )
             if cache["source_weights"]:
                 weights = torch.cat(cache["source_weights"])
                 result.update(
                     {
+                        "mean_active_sources": float((weights > 0).sum(dim=-1).float().mean()),
                         "mean_active_routes": float((weights > 0).sum(dim=-1).float().mean()),
                         "routing_variance": float(weights.var(dim=0, unbiased=False).mean()),
                     }
                 )
+            if cache["entropy"]:
+                result["mean_routing_entropy"] = float(torch.cat(cache["entropy"]).mean())
             summary[task] = result
         return summary
 
@@ -427,7 +460,20 @@ class Trainer:
         self.model.eval()
         buffers = {task: {"pred": [], "label": []} for task in self.task_name}
         records = {task: {"lower": [], "upper": [], "target": []} for task in self.task_name}
-        route_records = {task: {"base": [], "route": [], "final": [], "target": [], "null": [], "source_weights": [], "route_regret": []} for task in self.task_name}
+        route_records = {
+            task: {
+                "base": [],
+                "route": [],
+                "final": [],
+                "target": [],
+                "null": [],
+                "source_weights": [],
+                "route_regret": [],
+                "final_regret": [],
+                "entropy": [],
+            }
+            for task in self.task_name
+        }
         with torch.no_grad():
             for task in self.task_name:
                 loader = dataloaders_dict.get(task)
@@ -450,15 +496,19 @@ class Trainer:
                     route = self.decode_task_output(task, diagnostics.get("route_raw", final_raw), apply_conformal=False)["median"].cpu()
                     final = final_decoded["median"].cpu()
                     rr = (route - target.cpu()).abs() - (base - target.cpu()).abs()
+                    fr = (final - target.cpu()).abs() - (base - target.cpu()).abs()
                     route_records[task]["base"].append(base)
                     route_records[task]["route"].append(route)
                     route_records[task]["final"].append(final)
                     route_records[task]["target"].append(target.cpu())
                     route_records[task]["route_regret"].append(rr)
+                    route_records[task]["final_regret"].append(fr)
                     if "null_weight" in diagnostics:
                         route_records[task]["null"].append(diagnostics["null_weight"].cpu())
                     if "source_weights" in diagnostics:
                         route_records[task]["source_weights"].append(diagnostics["source_weights"].cpu())
+                    if "routing_entropy" in diagnostics:
+                        route_records[task]["entropy"].append(diagnostics["routing_entropy"].cpu())
         return buffers, records, route_records
 
     def _evaluate(self, dataloaders_dict, mode="validation", epoch=0):
@@ -484,23 +534,112 @@ class Trainer:
         return result
 
     @staticmethod
-    def _evaluation_routing_summary(route_records):
+    def _rankdata(values):
+        values = np.asarray(values, dtype=float)
+        order = np.argsort(values, kind="mergesort")
+        ranks = np.empty(values.size, dtype=float)
+        start = 0
+        while start < values.size:
+            end = start + 1
+            while end < values.size and values[order[end]] == values[order[start]]:
+                end += 1
+            ranks[order[start:end]] = 0.5 * (start + end - 1) + 1.0
+            start = end
+        return ranks
+
+    @classmethod
+    def _safe_auroc(cls, scores, labels):
+        scores = np.asarray(scores, dtype=float).reshape(-1)
+        labels = np.asarray(labels, dtype=bool).reshape(-1)
+        positives = int(labels.sum())
+        negatives = int(labels.size - positives)
+        if positives == 0 or negatives == 0:
+            return float("nan")
+        ranks = cls._rankdata(scores)
+        positive_rank_sum = float(ranks[labels].sum())
+        return (positive_rank_sum - positives * (positives + 1) / 2.0) / (positives * negatives)
+
+    @staticmethod
+    def _safe_auprc(scores, labels):
+        scores = np.asarray(scores, dtype=float).reshape(-1)
+        labels = np.asarray(labels, dtype=bool).reshape(-1)
+        positives = int(labels.sum())
+        if positives == 0 or positives == labels.size:
+            return float("nan") if positives == 0 else 1.0
+        order = np.argsort(-scores, kind="mergesort")
+        ordered_labels = labels[order].astype(float)
+        precision = np.cumsum(ordered_labels) / np.arange(1, labels.size + 1)
+        return float((precision * ordered_labels).sum() / positives)
+
+    @classmethod
+    def _safe_spearman(cls, left, right):
+        left_rank = cls._rankdata(left)
+        right_rank = cls._rankdata(right)
+        if left_rank.size < 2:
+            return float("nan")
+        left_centered = left_rank - left_rank.mean()
+        right_centered = right_rank - right_rank.mean()
+        denominator = np.sqrt(np.sum(left_centered**2) * np.sum(right_centered**2))
+        if denominator == 0:
+            return float("nan")
+        return float(np.sum(left_centered * right_centered) / denominator)
+
+    @classmethod
+    def _evaluation_routing_summary(cls, route_records):
         summary = {}
         for task, record in route_records.items():
             if not record["target"]:
                 continue
             regret = torch.cat(record["route_regret"])
-            values = {"route_regret_mean": float(regret.mean()), "negative_transfer_rate": float((regret > 0).float().mean())}
+            final_regret = torch.cat(record.get("final_regret", record["route_regret"]))
+            values = {
+                "route_regret_mean": float(regret.mean()),
+                "final_regret_mean": float(final_regret.mean()),
+                "route_negative_transfer_rate": float((regret > 0).float().mean()),
+                "final_negative_transfer_rate": float((final_regret > 0).float().mean()),
+            }
+            values["negative_transfer_rate"] = values["route_negative_transfer_rate"]
             if record["null"]:
                 null = torch.cat(record["null"])
+                values["mean_null_weight"] = float(null.mean())
                 values["mean_null"] = float(null.mean())
                 values["std_null"] = float(null.std(unbiased=False))
+                null_values = null.detach().cpu().numpy().reshape(-1)
+                route_regret_values = regret.detach().cpu().numpy().reshape(-1)
+                harmful_route = route_regret_values > 0
+                values["null_harmful_route_auroc"] = cls._safe_auroc(null_values, harmful_route)
+                values["null_harmful_route_auprc"] = cls._safe_auprc(null_values, harmful_route)
+                values["null_weight_route_regret_spearman"] = cls._safe_spearman(
+                    null_values, route_regret_values
+                )
             if record["source_weights"]:
                 weights = torch.cat(record["source_weights"])
+                values["mean_active_sources"] = float((weights > 0).sum(dim=-1).float().mean())
                 values["mean_active_routes"] = float((weights > 0).sum(dim=-1).float().mean())
                 values["routing_variance"] = float(weights.var(dim=0, unbiased=False).mean())
+            if record.get("entropy"):
+                values["mean_routing_entropy"] = float(torch.cat(record["entropy"]).mean())
             summary[task] = values
         return summary
+
+    @staticmethod
+    def aggregate_routing_summary(summary):
+        """Aggregate per-task routing diagnostics for a compact run artifact."""
+
+        keys = (
+            "mean_null_weight",
+            "mean_routing_entropy",
+            "mean_active_sources",
+            "route_regret_mean",
+            "final_regret_mean",
+            "route_negative_transfer_rate",
+            "final_negative_transfer_rate",
+        )
+        aggregate = {}
+        for key in keys:
+            values = [float(record[key]) for record in summary.values() if key in record]
+            aggregate[key] = float(np.nanmean(values)) if values else float("nan")
+        return aggregate
 
     def _fit_conformal(self, calibration_dataloaders_dict):
         if self._prediction_mode() != "quantile" or not getattr(self.args, "fit_conformal", True):
@@ -544,9 +683,35 @@ class Trainer:
             ],
         }
 
+    def _rgcer_config(self):
+        architecture_config = self._architecture_config()
+        return {
+            "rgcer_use_source_response": getattr(self.args, "rgcer_use_source_response", True),
+            "rgcer_use_target_response": getattr(self.args, "rgcer_use_target_response", True),
+            "rgcer_use_molecule_query": getattr(self.args, "rgcer_use_molecule_query", True),
+            "rgcer_use_sparse_routing": getattr(self.args, "rgcer_use_sparse_routing", True),
+            "rgcer_use_null_route": getattr(self.args, "rgcer_use_null_route", True),
+            "rgcer_use_film": getattr(self.args, "rgcer_use_film", True),
+            "rgcer_use_adapter": getattr(self.args, "rgcer_use_adapter", True),
+            "rgcer_use_base_aux_loss": getattr(self.args, "rgcer_use_base_aux_loss", True),
+            "rgcer_fallback_space": getattr(self.args, "rgcer_fallback_space", "prediction"),
+            "rgcer_transfer_mechanism": getattr(
+                self.args, "rgcer_transfer_mechanism", "endpoint_router"
+            ),
+            "router_top_k": getattr(self.args, "router_top_k", 0),
+            "router_temperature": getattr(self.args, "router_temperature", 1.0),
+            "exclude_target_from_sources": getattr(self.args, "exclude_target_from_sources", True),
+            "use_factorized_prompt": architecture_config["use_factorized_prompt"],
+            "prediction_mode": self._prediction_mode(),
+            "fit_conformal": getattr(self.args, "fit_conformal", True),
+            "lambda_base": getattr(self.args, "lambda_base", 0.0),
+            "lambda_quantile": getattr(self.args, "lambda_quantile", 1.0),
+            "routing_enabled": getattr(self.args, "routing_enabled", True),
+        }
+
     def _checkpoint_payload(self, epoch):
         return {
-            "checkpoint_version": 3,
+            "checkpoint_version": 4,
             "model_state": self.model.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
             "weighting_state": self.loss_balancer.state_dict(),
@@ -561,13 +726,7 @@ class Trainer:
             },
             "conformal_state": self.conformal_calibrator.state_dict(),
             "hps_warmup_epochs": getattr(self.args, "hps_warmup_epochs", 0),
-            "rgcer_config": {
-                "lambda_base": getattr(self.args, "lambda_base", 0.0),
-                "lambda_quantile": getattr(self.args, "lambda_quantile", 1.0),
-                "router_top_k": getattr(self.args, "router_top_k", 0),
-                "router_temperature": getattr(self.args, "router_temperature", 1.0),
-                "routing_enabled": getattr(self.args, "routing_enabled", True),
-            },
+            "rgcer_config": self._rgcer_config(),
             "task_metadata": self._architecture_config().get("task_metadata", []),
             "task_scalers": self.task_scalers,
             "split_manifest_hash": self._manifest_hash(),
@@ -601,8 +760,8 @@ class Trainer:
             "split_manifest_hash", "feature_schema_version",
         }
         missing = required.difference(checkpoint)
-        if missing or checkpoint["checkpoint_version"] != 3:
-            raise ValueError(f"Checkpoint is not a strict v3 checkpoint; missing={sorted(missing)}")
+        if missing or checkpoint["checkpoint_version"] != 4:
+            raise ValueError(f"Checkpoint is not a strict v4 checkpoint; missing={sorted(missing)}")
         if list(checkpoint["task_names"]) != self.task_name:
             raise ValueError("Checkpoint task_names do not match the current experiment")
         if checkpoint["prediction_mode"] != self._prediction_mode():
@@ -637,13 +796,7 @@ class Trainer:
                 raise ValueError(f"Checkpoint setting {name!r} does not match current configuration")
         if int(checkpoint["hps_warmup_epochs"]) != int(getattr(self.args, "hps_warmup_epochs", 0)):
             raise ValueError("Checkpoint hps_warmup_epochs does not match current configuration")
-        current_rgcer = {
-            "lambda_base": getattr(self.args, "lambda_base", 0.0),
-            "lambda_quantile": getattr(self.args, "lambda_quantile", 1.0),
-            "router_top_k": getattr(self.args, "router_top_k", 0),
-            "router_temperature": getattr(self.args, "router_temperature", 1.0),
-            "routing_enabled": getattr(self.args, "routing_enabled", True),
-        }
+        current_rgcer = self._rgcer_config()
         stored_rgcer = checkpoint["rgcer_config"]
         if not isinstance(stored_rgcer, dict):
             raise ValueError("Checkpoint rgcer_config is invalid")
@@ -668,7 +821,7 @@ class Trainer:
             self.train_loss_buffer = np.asarray(checkpoint["train_loss_buffer"], dtype=float)
         self.optimizer_updates = int(checkpoint.get("optimizer_updates", 0))
         self.load_path = str(path)
-        print(f"Loaded strict v3 checkpoint: {path}")
+        print(f"Loaded strict v4 checkpoint: {path}")
 
     def train(
         self,

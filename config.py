@@ -46,6 +46,16 @@ def prepare_args(params):
         'prediction_mode',
         'head_hidden_dim',
         'head_dropout',
+        'rgcer_use_source_response',
+        'rgcer_use_target_response',
+        'rgcer_use_molecule_query',
+        'rgcer_use_sparse_routing',
+        'rgcer_use_null_route',
+        'rgcer_use_film',
+        'rgcer_use_adapter',
+        'rgcer_use_base_aux_loss',
+        'rgcer_fallback_space',
+        'rgcer_transfer_mechanism',
     ]:
         if hasattr(params, name):
             kwargs['arch_args'][name] = getattr(params, name)

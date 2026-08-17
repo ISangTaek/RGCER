@@ -9,7 +9,12 @@ from torch import nn
 
 from architecture.abstract_arch import AbsArchitecture
 from architecture.graphormer_backbone import MolecularGraphormerBackbone
-from architecture.prediction_heads import point_from_raw
+from architecture.prediction_heads import (
+    blend_decoded_predictions,
+    decode_prediction,
+    encode_decoded_prediction,
+    point_from_raw,
+)
 from architecture.response_guided_router import RGCERTaskConditioner
 from architecture.toxacute_tasks import parse_toxacute_task_name
 
@@ -57,6 +62,14 @@ class Encoder(nn.Module):
         exclude_target_from_sources=True,
         response_hidden_dim=None,
         edge_bias_mode="path",
+        use_source_response=True,
+        use_target_response=True,
+        use_molecule_query=True,
+        use_sparse_routing=True,
+        use_null_route=True,
+        use_film=True,
+        use_adapter=True,
+        transfer_mechanism="endpoint_router",
     ):
         super().__init__()
         del atoms_input_dropout_rate, atoms_reshape_dim, task_layers, device
@@ -85,6 +98,14 @@ class Encoder(nn.Module):
             adapter_ratio=adapter_ratio,
             dropout=task_dropout_rate,
             response_hidden_dim=response_hidden_dim,
+            use_source_response=use_source_response,
+            use_target_response=use_target_response,
+            use_molecule_query=use_molecule_query,
+            use_sparse_routing=use_sparse_routing,
+            use_null_route=use_null_route,
+            use_film=use_film,
+            use_adapter=use_adapter,
+            transfer_mechanism=transfer_mechanism,
         )
 
     def encode_backbone(self, batch):
@@ -92,11 +113,17 @@ class Encoder(nn.Module):
 
 
 class Graphormer_rgcer(AbsArchitecture):
-    """RGCER model with strict HPS fallback and shared task heads."""
+    """RGCER model with prediction-space HPS fallback and shared task heads."""
 
     def __init__(self, task_name, encoder_class, decoders, device, args, **kwargs):
         super().__init__(task_name, encoder_class, decoders, device, **kwargs)
         self.prediction_mode = getattr(args, "prediction_mode", "quantile")
+        self.rgcer_fallback_space = getattr(args, "rgcer_fallback_space", "prediction")
+        if self.rgcer_fallback_space not in {"prediction", "representation"}:
+            raise ValueError("rgcer_fallback_space must be 'prediction' or 'representation'")
+        self.rgcer_transfer_mechanism = getattr(args, "rgcer_transfer_mechanism", "endpoint_router")
+        if self.rgcer_transfer_mechanism not in {"endpoint_router", "response_stacking", "target_only"}:
+            raise ValueError("Unsupported RGCER transfer mechanism")
         self.encoder = encoder_class(
             atoms_num_heads=args.a_heads,
             task_name=task_name,
@@ -123,6 +150,14 @@ class Graphormer_rgcer(AbsArchitecture):
             exclude_target_from_sources=getattr(args, "exclude_target_from_sources", True),
             response_hidden_dim=getattr(args, "response_hidden_dim", None),
             edge_bias_mode=getattr(args, "edge_bias_mode", "path"),
+            use_source_response=getattr(args, "rgcer_use_source_response", True),
+            use_target_response=getattr(args, "rgcer_use_target_response", True),
+            use_molecule_query=getattr(args, "rgcer_use_molecule_query", True),
+            use_sparse_routing=getattr(args, "rgcer_use_sparse_routing", True),
+            use_null_route=getattr(args, "rgcer_use_null_route", True),
+            use_film=getattr(args, "rgcer_use_film", True),
+            use_adapter=getattr(args, "rgcer_use_adapter", True),
+            transfer_mechanism=self.rgcer_transfer_mechanism,
         )
 
     def _head_mode(self, task):
@@ -137,9 +172,23 @@ class Graphormer_rgcer(AbsArchitecture):
         return torch.stack(responses, dim=1)
 
     @staticmethod
-    def _base_diagnostics(task, index, h, base_raw, response_profile=None):
+    def _decoded_diagnostics(base_decoded, route_decoded, final_decoded):
+        return {
+            "base_prediction": base_decoded.median,
+            "route_prediction": route_decoded.median,
+            "final_prediction": final_decoded.median,
+            "base_lower": base_decoded.lower,
+            "base_upper": base_decoded.upper,
+            "route_lower": route_decoded.lower,
+            "route_upper": route_decoded.upper,
+            "final_lower": final_decoded.lower,
+            "final_upper": final_decoded.upper,
+        }
+
+    def _base_diagnostics(self, task, index, h, base_raw, response_profile=None):
         null = torch.ones(h.size(0), 1, device=h.device, dtype=h.dtype)
         task_count = response_profile.size(1) if response_profile is not None else 0
+        base_decoded = decode_prediction(base_raw, self._head_mode(task))
         return {
             "target_task": task,
             "target_index": index,
@@ -152,6 +201,7 @@ class Graphormer_rgcer(AbsArchitecture):
             "task_context": torch.zeros_like(h),
             "gamma": torch.zeros_like(h),
             "beta": torch.zeros_like(h),
+            "adapter_output": torch.zeros_like(h),
             "base_representation": h,
             "route_representation": h,
             "final_representation": h,
@@ -159,6 +209,7 @@ class Graphormer_rgcer(AbsArchitecture):
             "route_raw": base_raw,
             "final_raw": base_raw,
             "null_weight": null,
+            **self._decoded_diagnostics(base_decoded, base_decoded, base_decoded),
         }
 
     def _forward_task(self, h, task, response_profile, return_aux, source_mask, routing_enabled):
@@ -179,13 +230,29 @@ class Graphormer_rgcer(AbsArchitecture):
             source_mask=source_mask,
         )
         null_weight = router_diagnostics.null_weight
-        mixed_representation = null_weight * h + (1.0 - null_weight) * route_representation
-        # ``where`` preserves the exact HPS tensor for a hard NULL decision,
-        # including when the model is in train mode with dropout enabled.
-        final_representation = torch.where(null_weight.eq(1.0), h, mixed_representation)
         route_raw = self.decoders[task](route_representation)
-        mixed_raw = self.decoders[task](final_representation)
-        final_raw = torch.where(null_weight.eq(1.0), base_raw, mixed_raw)
+        mode = self._head_mode(task)
+        base_decoded = decode_prediction(base_raw, mode)
+        route_decoded = decode_prediction(route_raw, mode)
+
+        if self.rgcer_fallback_space == "prediction":
+            final_decoded = blend_decoded_predictions(base_decoded, route_decoded, null_weight)
+            blended_raw = encode_decoded_prediction(final_decoded, mode)
+            # Preserve exact endpoint outputs at the two interpretable
+            # extremes, including quantile raw tensors in train mode.
+            final_raw = torch.where(null_weight.eq(1.0), base_raw, blended_raw)
+            final_raw = torch.where(null_weight.eq(0.0), route_raw, final_raw)
+            # There is no single representation corresponding to a nonlinear
+            # prediction-space convex combination.
+            final_representation = None
+        else:
+            mixed_representation = null_weight * h + (1.0 - null_weight) * route_representation
+            # Legacy compatibility ablation only.  ``where`` preserves the
+            # exact HPS tensor for a hard NULL decision.
+            final_representation = torch.where(null_weight.eq(1.0), h, mixed_representation)
+            mixed_raw = self.decoders[task](final_representation)
+            final_raw = torch.where(null_weight.eq(1.0), base_raw, mixed_raw)
+            final_decoded = decode_prediction(final_raw, mode)
         predictions = {task: final_raw}
         if not return_aux:
             return predictions, None
@@ -198,6 +265,7 @@ class Graphormer_rgcer(AbsArchitecture):
                 "base_raw": base_raw,
                 "route_raw": route_raw,
                 "final_raw": final_raw,
+                **self._decoded_diagnostics(base_decoded, route_decoded, final_decoded),
             }
         )
         return predictions, diagnostics

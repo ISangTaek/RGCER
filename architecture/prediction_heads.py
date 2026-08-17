@@ -94,4 +94,77 @@ def decode_prediction(raw: torch.Tensor, mode: str) -> DecodedPrediction:
     )
 
 
-__all__ = ["DecodedPrediction", "TaskPredictionHead", "decode_prediction", "point_from_raw"]
+def blend_decoded_predictions(
+    base: DecodedPrediction,
+    route: DecodedPrediction,
+    null_weight: torch.Tensor,
+) -> DecodedPrediction:
+    """Blend HPS and routed predictions in prediction space.
+
+    ``null_weight`` is the probability assigned to the explicit no-transfer
+    route.  Blending the decoded values, rather than representations before a
+    nonlinear prediction head, makes the fallback probability directly
+    interpretable and preserves quantile ordering.
+    """
+
+    if null_weight.ndim != 2 or null_weight.size(-1) != 1:
+        raise ValueError("null_weight must have shape [B, 1]")
+    if base.median.shape != route.median.shape:
+        raise ValueError("base and route predictions must have matching shapes")
+    if base.lower.shape != base.median.shape or base.upper.shape != base.median.shape:
+        raise ValueError("base prediction tensors must have matching shapes")
+    if route.lower.shape != route.median.shape or route.upper.shape != route.median.shape:
+        raise ValueError("route prediction tensors must have matching shapes")
+    if null_weight.shape[0] != base.median.shape[0]:
+        raise ValueError("null_weight batch dimension must match predictions")
+
+    w = null_weight
+    return DecodedPrediction(
+        median=w * base.median + (1.0 - w) * route.median,
+        lower=w * base.lower + (1.0 - w) * route.lower,
+        upper=w * base.upper + (1.0 - w) * route.upper,
+    )
+
+
+def _inverse_softplus(x: torch.Tensor) -> torch.Tensor:
+    """Differentiable inverse of ``softplus`` for strictly positive values."""
+
+    if torch.any(x <= 0):
+        raise ValueError("softplus inverse requires positive input")
+    return x + torch.log(-torch.expm1(-x))
+
+
+def encode_decoded_prediction(decoded: DecodedPrediction, mode: str) -> torch.Tensor:
+    """Encode decoded predictions into the raw tensor used by the heads.
+
+    The helper lets the trainer and existing loss/calibration code continue to
+    consume the same raw parameterization after a prediction-space blend.
+    """
+
+    if mode == "point":
+        return decoded.median
+    if mode != "quantile":
+        raise ValueError("mode must be 'point' or 'quantile'")
+
+    lower_width = decoded.median - decoded.lower
+    upper_width = decoded.upper - decoded.median
+    if torch.any(lower_width <= 0) or torch.any(upper_width <= 0):
+        raise ValueError("Quantile widths must be positive")
+    return torch.cat(
+        [
+            decoded.median,
+            _inverse_softplus(lower_width),
+            _inverse_softplus(upper_width),
+        ],
+        dim=-1,
+    )
+
+
+__all__ = [
+    "DecodedPrediction",
+    "TaskPredictionHead",
+    "blend_decoded_predictions",
+    "decode_prediction",
+    "encode_decoded_prediction",
+    "point_from_raw",
+]

@@ -55,5 +55,6 @@ def test_rgcer_single_all_and_source_mask_contract():
     mask = torch.zeros(2, 3, dtype=torch.bool)
     _, masked = model(batch, task_name="task_a", return_aux=True, source_mask=mask)
     assert torch.allclose(masked["null_weight"], torch.ones(2, 1))
-    assert torch.allclose(masked["final_representation"], masked["base_representation"])
+    assert masked["final_representation"] is None
     assert torch.allclose(masked["final_raw"], masked["base_raw"])
+    assert torch.allclose(masked["final_prediction"], masked["base_prediction"])

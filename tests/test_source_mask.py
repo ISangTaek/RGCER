@@ -4,7 +4,13 @@ from architecture.response_guided_router import ResponseGuidedEndpointRouter
 
 
 def test_source_mask_is_per_sample():
-    router = ResponseGuidedEndpointRouter(8, router_dim=8, top_k=0, dropout=0.0).eval()
+    router = ResponseGuidedEndpointRouter(
+        8,
+        router_dim=8,
+        top_k=0,
+        use_sparse_routing=False,
+        dropout=0.0,
+    ).eval()
     h = torch.randn(2, 8)
     prompts = torch.randn(3, 8)
     response = torch.randn(2, 3, 1)

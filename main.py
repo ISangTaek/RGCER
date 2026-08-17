@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import warnings
 from pathlib import Path
@@ -40,6 +41,68 @@ RDLogger.DisableLog("rdApp.*")
 
 
 CLASSIFICATION_DATASETS = {"hiv", "bace", "bbbp", "muv", "tox21", "sider", "clintox"}
+
+
+RGCER_FLAG_NAMES = (
+    "rgcer_use_source_response",
+    "rgcer_use_target_response",
+    "rgcer_use_molecule_query",
+    "rgcer_use_sparse_routing",
+    "rgcer_use_null_route",
+    "rgcer_use_film",
+    "rgcer_use_adapter",
+    "rgcer_use_base_aux_loss",
+    "rgcer_fallback_space",
+    "rgcer_transfer_mechanism",
+)
+
+
+def _configure_run_identity(params):
+    """Give every experiment tag/seed its own reproducible output directory."""
+
+    if not getattr(params, "save_path", None):
+        return
+    tag = str(getattr(params, "experiment_tag", "full"))
+    seed = int(getattr(params, "seed", 42))
+    params.save_path = str(Path(params.save_path) / tag / f"seed_{seed}")
+    if getattr(params, "ckpt_name", "toxacute_rgcer") == "toxacute_rgcer":
+        prefix = "rgcer" if getattr(params, "arch", "Graphormer_rgcer") == "Graphormer_rgcer" else str(params.arch).lower()
+        params.ckpt_name = f"{prefix}_{tag}_seed{seed}"
+    Path(params.save_path).mkdir(parents=True, exist_ok=True)
+
+
+def _write_run_metadata(params, task_names, trainer):
+    if not getattr(params, "save_path", None):
+        return
+    run_path = Path(params.save_path)
+    run_path.mkdir(parents=True, exist_ok=True)
+    with (run_path / "args.json").open("w", encoding="utf-8") as handle:
+        json.dump(vars(params), handle, indent=2, sort_keys=True, default=str)
+
+    total_parameters = sum(parameter.numel() for parameter in trainer.model.parameters())
+    trainable_parameters = sum(
+        parameter.numel() for parameter in trainer.model.parameters() if parameter.requires_grad
+    )
+    lines = [
+        f"arch: {params.arch}",
+        f"task count: {len(task_names)}",
+        f"parameter count: {total_parameters}",
+        f"trainable parameter count: {trainable_parameters}",
+        f"prediction mode: {effective_prediction_mode(params)}",
+        f"split mode: {params.splitting}",
+        f"seed: {params.seed}",
+        f"experiment tag: {getattr(params, 'experiment_tag', 'full')}",
+    ]
+    lines.extend(f"{name}: {getattr(params, name, '<unset>')}" for name in RGCER_FLAG_NAMES)
+    with (run_path / "architecture_summary.txt").open("w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+def _write_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True, default=str, allow_nan=True)
 
 
 def effective_prediction_mode(params):
@@ -173,6 +236,7 @@ def _prediction_records(params, trainer, batch, task_names):
 
 
 def main(params):
+    _configure_run_identity(params)
     selected_mode = effective_prediction_mode(params)
     if selected_mode != getattr(params, "prediction_mode", selected_mode):
         warnings.warn(
@@ -202,6 +266,7 @@ def main(params):
         load_path=params.load_path,
         **kwargs,
     )
+    _write_run_metadata(params, task_names, trainer)
     print(f"Using device: {trainer.device}; tasks={len(task_names)}; architecture={params.arch}")
 
     if params.mode in {"train", "test"}:
@@ -209,7 +274,7 @@ def main(params):
             raise ValueError("--preprocessed_data_dir is required for train/test")
         loaders = _loaders(params, task_names, collator)
         if params.mode == "train":
-            trainer.train(
+            history = trainer.train(
                 train_dataloaders_dict=loaders["train"],
                 val_dataloaders_dict=loaders["val"],
                 calibration_dataloaders_dict=loaders["calibration"],
@@ -217,8 +282,29 @@ def main(params):
                 epochs=params.epochs,
                 params_main=params,
             )
+            if params.save_path:
+                _write_json(Path(params.save_path) / "metrics.json", {"history": history})
+                if history:
+                    _write_json(
+                        Path(params.save_path) / "routing_summary.json",
+                        {
+                            **Trainer.aggregate_routing_summary(
+                                history[-1].get("validation", {}).get("routing", {})
+                            ),
+                            "tasks": history[-1].get("validation", {}).get("routing", {}),
+                        },
+                    )
         else:
-            trainer.test(loaders["test"])
+            result = trainer.test(loaders["test"])
+            if params.save_path:
+                _write_json(Path(params.save_path) / "metrics.json", {"test": result})
+                _write_json(
+                    Path(params.save_path) / "routing_summary.json",
+                    {
+                        **Trainer.aggregate_routing_summary(result.get("routing", {})),
+                        "tasks": result.get("routing", {}),
+                    },
+                )
         return
 
     if params.mode == "single_inference":
@@ -315,6 +401,56 @@ def build_parser():
     parser.add_argument("--exclude_target_from_sources", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--adapter_ratio", type=float, default=0.25)
     parser.add_argument("--prompt_gate_init", type=float, default=-2.0)
+    parser.add_argument(
+        "--rgcer_use_source_response",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include each source endpoint's preliminary response in source tokens.",
+    )
+    parser.add_argument(
+        "--rgcer_use_target_response",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include the target endpoint preliminary response in the router query.",
+    )
+    parser.add_argument(
+        "--rgcer_use_molecule_query",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Condition endpoint routing weights on the current molecule representation.",
+    )
+    parser.add_argument(
+        "--rgcer_use_sparse_routing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply top-k sparsification to real source endpoints.",
+    )
+    parser.add_argument(
+        "--rgcer_use_null_route",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include the explicit no-transfer NULL option.",
+    )
+    parser.add_argument("--rgcer_use_film", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--rgcer_use_adapter", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--rgcer_use_base_aux_loss",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add the HPS/base auxiliary loss on the routed RGCER path.",
+    )
+    parser.add_argument(
+        "--rgcer_fallback_space",
+        choices=["prediction", "representation"],
+        default="prediction",
+        help="Space in which the NULL fallback blends HPS and routed outputs.",
+    )
+    parser.add_argument(
+        "--rgcer_transfer_mechanism",
+        choices=["endpoint_router", "response_stacking", "target_only"],
+        default="endpoint_router",
+        help="Mutually exclusive RGCER transfer mechanism or baseline.",
+    )
 
     parser.add_argument("--hps_warmup_epochs", type=int, default=10)
     parser.add_argument("--lambda_base", type=float, default=0.25)
@@ -328,6 +464,7 @@ def build_parser():
     parser.add_argument("--tasks_per_update", type=int, default=1)
     parser.add_argument("--routing_enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--toxacute_task_scope", choices=["human3", "animal56", "all59"], default="all59")
+    parser.add_argument("--experiment_tag", default="full")
 
     parser.add_argument("--weighting", choices=["EW", "UW", "DWA"], default="EW")
     parser.add_argument("--optim", choices=["adam", "adamw"], default="adamw")
@@ -351,6 +488,8 @@ def validate_params(params):
         raise ValueError("hidden_dim must be divisible by prompt_heads")
     if params.router_dim <= 0 or params.router_top_k < 0 or params.router_temperature <= 0:
         raise ValueError("Invalid router configuration")
+    if getattr(params, "rgcer_use_sparse_routing", True) and params.router_top_k <= 0:
+        raise ValueError("Sparse routing requires router_top_k > 0")
     if params.hps_warmup_epochs < 0 or params.tasks_per_update <= 0:
         raise ValueError("Invalid warmup or tasks_per_update")
     if params.weighting == "DWA" and params.tasks_per_update == 1:
@@ -359,6 +498,33 @@ def validate_params(params):
         raise ValueError("validation + calibration + test ratios must be less than 1")
     if not 0.0 < params.adapter_ratio <= 1.0:
         raise ValueError("adapter_ratio must be in (0, 1]")
+    if params.arch == "Graphormer_rgcer" and params.router_mode != "dynamic":
+        warnings.warn(
+            "--router_mode belongs to Graphormer_prompt and is ignored by Graphormer_rgcer; "
+            "use --rgcer_* switches instead.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if params.arch != "Graphormer_rgcer":
+        defaults = {
+            "rgcer_use_source_response": True,
+            "rgcer_use_target_response": True,
+            "rgcer_use_molecule_query": True,
+            "rgcer_use_sparse_routing": True,
+            "rgcer_use_null_route": True,
+            "rgcer_use_film": True,
+            "rgcer_use_adapter": True,
+            "rgcer_use_base_aux_loss": True,
+            "rgcer_fallback_space": "prediction",
+            "rgcer_transfer_mechanism": "endpoint_router",
+        }
+        changed = [name for name, default in defaults.items() if getattr(params, name, default) != default]
+        if changed:
+            warnings.warn(
+                f"RGCER flags {changed} are ignored by architecture {params.arch}.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
 
 if __name__ == "__main__":

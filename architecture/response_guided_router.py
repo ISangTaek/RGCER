@@ -24,6 +24,7 @@ class RGCERDiagnostics:
     task_context: torch.Tensor
     gamma: torch.Tensor
     beta: torch.Tensor
+    adapter_output: torch.Tensor | None = None
 
     def as_dict(self) -> Dict[str, object]:
         return {
@@ -37,6 +38,7 @@ class RGCERDiagnostics:
             "task_context": self.task_context,
             "gamma": self.gamma,
             "beta": self.beta,
+            "adapter_output": self.adapter_output,
         }
 
 
@@ -87,6 +89,11 @@ class ResponseGuidedEndpointRouter(nn.Module):
         exclude_target: bool = True,
         dropout: float = 0.1,
         response_hidden_dim: int | None = None,
+        use_source_response: bool = True,
+        use_target_response: bool = True,
+        use_molecule_query: bool = True,
+        use_sparse_routing: bool = True,
+        use_null_route: bool = True,
     ):
         super().__init__()
         if hidden_dim <= 0:
@@ -94,11 +101,18 @@ class ResponseGuidedEndpointRouter(nn.Module):
         router_dim = hidden_dim if router_dim is None else int(router_dim)
         if router_dim <= 0 or top_k < 0 or temperature <= 0:
             raise ValueError("router_dim must be positive, top_k non-negative, temperature positive")
+        if use_sparse_routing and top_k <= 0:
+            raise ValueError("Sparse routing requires top_k > 0")
         self.hidden_dim = int(hidden_dim)
         self.router_dim = router_dim
         self.top_k = int(top_k)
         self.temperature = float(temperature)
         self.exclude_target = bool(exclude_target)
+        self.use_source_response = bool(use_source_response)
+        self.use_target_response = bool(use_target_response)
+        self.use_molecule_query = bool(use_molecule_query)
+        self.use_sparse_routing = bool(use_sparse_routing)
+        self.use_null_route = bool(use_null_route)
         self.response_encoder = EndpointResponseEncoder(hidden_dim, response_hidden_dim)
         self.query_projection = nn.Sequential(
             nn.LayerNorm(hidden_dim * 3),
@@ -137,11 +151,22 @@ class ResponseGuidedEndpointRouter(nn.Module):
 
         response_embeddings = self.response_encoder(response_profile)
         prompt_batch = task_prompts.unsqueeze(0).expand(batch_size, -1, -1)
-        source_tokens = prompt_batch + response_embeddings
+        source_response_embeddings = (
+            response_embeddings if self.use_source_response else torch.zeros_like(response_embeddings)
+        )
+        source_tokens = prompt_batch + source_response_embeddings
         target_prompt = prompt_batch[:, target_index, :]
         target_response = response_embeddings[:, target_index, :]
+        target_response_term = (
+            target_response if self.use_target_response else torch.zeros_like(target_response)
+        )
+        molecule_term = (
+            molecular_representation
+            if self.use_molecule_query
+            else torch.zeros_like(molecular_representation)
+        )
         query = self.query_projection(
-            torch.cat((molecular_representation, target_prompt, target_response), dim=-1)
+            torch.cat((molecule_term, target_prompt, target_response_term), dim=-1)
         )
         keys = self.key_projection(source_tokens)
         values = self.value_projection(source_tokens)
@@ -156,7 +181,7 @@ class ResponseGuidedEndpointRouter(nn.Module):
 
         # Top-k is applied only to real source endpoints; NULL is never removed.
         masked_logits = logits.masked_fill(~allowed, float("-inf"))
-        if self.top_k and self.top_k < task_count:
+        if self.use_sparse_routing and self.top_k < task_count:
             top_indices = torch.topk(masked_logits, k=min(self.top_k, task_count), dim=-1).indices
             selected = torch.zeros_like(allowed)
             selected.scatter_(1, top_indices, True)
@@ -164,6 +189,8 @@ class ResponseGuidedEndpointRouter(nn.Module):
             masked_logits = logits.masked_fill(~allowed, float("-inf"))
 
         available = allowed.sum(dim=-1)
+        if not self.use_null_route and torch.any(available.eq(0)):
+            raise ValueError("No real source endpoints available while NULL route is disabled")
         safe_source_logits = torch.where(
             available.unsqueeze(-1) > 0,
             masked_logits,
@@ -171,30 +198,49 @@ class ResponseGuidedEndpointRouter(nn.Module):
         )
         conditional_weights = torch.softmax(safe_source_logits, dim=-1) * allowed.to(logits.dtype)
 
-        joint_logits = torch.cat(
-            (
-                null_logits,
-                torch.where(available.unsqueeze(-1) > 0, masked_logits, torch.full_like(masked_logits, float("-inf"))),
-            ),
-            dim=-1,
-        )
-        joint_weights = torch.softmax(joint_logits, dim=-1)
-        null_weight = joint_weights[:, :1]
-        joint_source_weights = joint_weights[:, 1:]
+        if self.use_null_route:
+            joint_logits = torch.cat(
+                (
+                    null_logits,
+                    torch.where(
+                        available.unsqueeze(-1) > 0,
+                        masked_logits,
+                        torch.full_like(masked_logits, float("-inf")),
+                    ),
+                ),
+                dim=-1,
+            )
+            joint_weights = torch.softmax(joint_logits, dim=-1)
+            null_weight = joint_weights[:, :1]
+            joint_source_weights = joint_weights[:, 1:]
+            entropy_weights = joint_weights
+        else:
+            null_weight = torch.zeros(batch_size, 1, device=logits.device, dtype=logits.dtype)
+            joint_source_weights = conditional_weights
+            entropy_weights = conditional_weights
         source_context = torch.bmm(conditional_weights.unsqueeze(1), values).squeeze(1)
         task_context = self.context_norm(target_prompt + source_context)
-        entropy = -(joint_weights * joint_weights.clamp_min(1e-12).log()).sum(dim=-1)
+        entropy = -(entropy_weights * entropy_weights.clamp_min(1e-12).log()).sum(dim=-1)
         return task_context, conditional_weights, joint_source_weights, null_weight, entropy
 
 
 class SharedFiLMAdapter(nn.Module):
     """One shared, ungated FiLM bottleneck adapter for all endpoints."""
 
-    def __init__(self, hidden_dim: int, adapter_ratio: float = 0.25, dropout: float = 0.1):
+    def __init__(
+        self,
+        hidden_dim: int,
+        adapter_ratio: float = 0.25,
+        dropout: float = 0.1,
+        use_film: bool = True,
+        use_adapter: bool = True,
+    ):
         super().__init__()
         if not 0.0 < adapter_ratio <= 1.0:
             raise ValueError("adapter_ratio must be in (0, 1]")
         self.hidden_dim = int(hidden_dim)
+        self.use_film = bool(use_film)
+        self.use_adapter = bool(use_adapter)
         self.bottleneck_dim = max(1, int(round(hidden_dim * adapter_ratio)))
         self.film_head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim * 2))
         self.condition_norm = nn.LayerNorm(hidden_dim)
@@ -209,11 +255,64 @@ class SharedFiLMAdapter(nn.Module):
         nn.init.zeros_(self.adapter_up.bias)
 
     def forward(self, h: torch.Tensor, task_context: torch.Tensor):
-        raw_gamma, beta = self.film_head(task_context).chunk(2, dim=-1)
-        gamma = torch.tanh(raw_gamma)
-        conditioned = self.condition_norm((1.0 + gamma) * h + beta)
-        adapter_output = self.adapter_up(self.dropout(F.gelu(self.adapter_down(conditioned))))
-        return h + adapter_output, {"gamma": gamma, "beta": beta, "adapter_output": adapter_output}
+        if self.use_film:
+            raw_gamma, beta = self.film_head(task_context).chunk(2, dim=-1)
+            gamma = torch.tanh(raw_gamma)
+            conditioned = self.condition_norm((1.0 + gamma) * h + beta)
+        else:
+            gamma = torch.zeros_like(h)
+            beta = torch.zeros_like(h)
+            conditioned = h
+
+        if self.use_adapter:
+            adapter_output = self.adapter_up(self.dropout(F.gelu(self.adapter_down(conditioned))))
+            route_representation = h + adapter_output
+        else:
+            adapter_output = torch.zeros_like(h)
+            route_representation = conditioned
+        return route_representation, {
+            "gamma": gamma,
+            "beta": beta,
+            "adapter_output": adapter_output,
+        }
+
+
+class ResponseStackingConditioner(nn.Module):
+    """Use the complete preliminary response vector without endpoint routing."""
+
+    def __init__(
+        self,
+        task_count: int,
+        hidden_dim: int,
+        adapter_ratio: float = 0.25,
+        dropout: float = 0.1,
+        use_film: bool = True,
+        use_adapter: bool = True,
+    ):
+        super().__init__()
+        if task_count <= 0 or hidden_dim <= 0:
+            raise ValueError("task_count and hidden_dim must be positive")
+        self.task_count = int(task_count)
+        self.hidden_dim = int(hidden_dim)
+        self.response_network = nn.Sequential(
+            nn.Linear(task_count, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.context_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        target_prompt: torch.Tensor,
+        response_profile: torch.Tensor,
+    ):
+        if response_profile.ndim != 3 or response_profile.shape[1:] != (self.task_count, 1):
+            raise ValueError("response_profile must have shape [B, T, 1]")
+        if target_prompt.shape != h.shape:
+            raise ValueError("target_prompt and h must have matching shapes")
+        response_context = self.response_network(response_profile.squeeze(-1))
+        return self.context_norm(target_prompt + response_context)
 
 
 class RGCERTaskConditioner(nn.Module):
@@ -232,12 +331,31 @@ class RGCERTaskConditioner(nn.Module):
         adapter_ratio: float = 0.25,
         dropout: float = 0.1,
         response_hidden_dim: int | None = None,
+        use_source_response: bool = True,
+        use_target_response: bool = True,
+        use_molecule_query: bool = True,
+        use_sparse_routing: bool = True,
+        use_null_route: bool = True,
+        use_film: bool = True,
+        use_adapter: bool = True,
+        transfer_mechanism: str = "endpoint_router",
     ):
         super().__init__()
         if not task_names or len(set(task_names)) != len(task_names):
             raise ValueError("task_names must be non-empty and unique")
         self.task_names = list(task_names)
         self.task_to_index = {name: index for index, name in enumerate(self.task_names)}
+        valid_mechanisms = {"endpoint_router", "response_stacking", "target_only"}
+        if transfer_mechanism not in valid_mechanisms:
+            raise ValueError(f"transfer_mechanism must be one of {sorted(valid_mechanisms)}")
+        self.transfer_mechanism = transfer_mechanism
+        self.use_source_response = bool(use_source_response)
+        self.use_target_response = bool(use_target_response)
+        self.use_molecule_query = bool(use_molecule_query)
+        self.use_sparse_routing = bool(use_sparse_routing)
+        self.use_null_route = bool(use_null_route)
+        self.use_film = bool(use_film)
+        self.use_adapter = bool(use_adapter)
         self.prompt_bank = FactorizedTaskPromptBank(
             self.task_names,
             hidden_dim,
@@ -252,8 +370,31 @@ class RGCERTaskConditioner(nn.Module):
             exclude_target=exclude_target_from_sources,
             dropout=dropout,
             response_hidden_dim=response_hidden_dim,
+            use_source_response=self.use_source_response,
+            use_target_response=self.use_target_response,
+            use_molecule_query=self.use_molecule_query,
+            use_sparse_routing=self.use_sparse_routing,
+            use_null_route=self.use_null_route,
         )
-        self.adapter = SharedFiLMAdapter(hidden_dim, adapter_ratio=adapter_ratio, dropout=dropout)
+        self.adapter = SharedFiLMAdapter(
+            hidden_dim,
+            adapter_ratio=adapter_ratio,
+            dropout=dropout,
+            use_film=self.use_film,
+            use_adapter=self.use_adapter,
+        )
+        self.response_stacking = (
+            ResponseStackingConditioner(
+                task_count=len(self.task_names),
+                hidden_dim=hidden_dim,
+                adapter_ratio=adapter_ratio,
+                dropout=dropout,
+                use_film=self.use_film,
+                use_adapter=self.use_adapter,
+            )
+            if transfer_mechanism == "response_stacking"
+            else None
+        )
 
     def _task_index(self, task_name):
         if task_name not in self.task_to_index:
@@ -263,14 +404,43 @@ class RGCERTaskConditioner(nn.Module):
     def forward(self, h, task_name, response_profile, return_aux=False, source_mask=None):
         target_index = self._task_index(task_name)
         prompts = self.prompt_bank()
-        task_context, source_weights, joint_source_weights, null_weight, entropy = self.router(
-            h,
-            prompts,
-            response_profile,
-            target_index,
-            source_mask=source_mask,
-        )
-        route_representation, adapter_aux = self.adapter(h, task_context)
+        batch_size = h.size(0)
+        if self.transfer_mechanism == "endpoint_router":
+            task_context, source_weights, joint_source_weights, null_weight, entropy = self.router(
+                h,
+                prompts,
+                response_profile,
+                target_index,
+                source_mask=source_mask,
+            )
+            route_representation, adapter_aux = self.adapter(h, task_context)
+        elif self.transfer_mechanism == "response_stacking":
+            if self.response_stacking is None:
+                raise RuntimeError("response_stacking conditioner is not initialized")
+            target_prompt = prompts[target_index].unsqueeze(0).expand(batch_size, -1)
+            task_context = self.response_stacking(
+                h,
+                target_prompt,
+                response_profile,
+            )
+            route_representation, adapter_aux = self.adapter(h, task_context)
+            source_weights = torch.zeros(
+                batch_size, len(self.task_names), device=h.device, dtype=h.dtype
+            )
+            joint_source_weights = torch.zeros_like(source_weights)
+            null_weight = torch.zeros(batch_size, 1, device=h.device, dtype=h.dtype)
+            entropy = torch.zeros(batch_size, device=h.device, dtype=h.dtype)
+        else:
+            target_prompt = prompts[target_index].unsqueeze(0).expand(batch_size, -1)
+            task_context = target_prompt
+            route_representation, adapter_aux = self.adapter(h, task_context)
+            source_weights = torch.zeros(
+                batch_size, len(self.task_names), device=h.device, dtype=h.dtype
+            )
+            joint_source_weights = torch.zeros_like(source_weights)
+            null_weight = torch.zeros(batch_size, 1, device=h.device, dtype=h.dtype)
+            entropy = torch.zeros(batch_size, device=h.device, dtype=h.dtype)
+            response_profile = torch.zeros_like(response_profile)
         diagnostics = RGCERDiagnostics(
             target_task=task_name,
             target_index=target_index,
@@ -282,6 +452,7 @@ class RGCERTaskConditioner(nn.Module):
             task_context=task_context,
             gamma=adapter_aux["gamma"],
             beta=adapter_aux["beta"],
+            adapter_output=adapter_aux["adapter_output"],
         )
         if return_aux:
             return route_representation, diagnostics
@@ -293,5 +464,6 @@ __all__ = [
     "RGCERDiagnostics",
     "RGCERTaskConditioner",
     "ResponseGuidedEndpointRouter",
+    "ResponseStackingConditioner",
     "SharedFiLMAdapter",
 ]
