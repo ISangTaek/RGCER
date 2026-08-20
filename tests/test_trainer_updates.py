@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -178,3 +179,36 @@ def test_train_retains_final_test_result():
     )
 
     assert trainer.final_test_result == test_result
+
+
+def test_record_training_output_mixed_device_bundle():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    device = torch.device("cuda:0")
+    trainer = Trainer.__new__(Trainer)
+    trainer.task_dict = {"task": {"metrics": ["RMSE"], "weight": [-1]}}
+    trainer.task_scalers = {"task": {"mean": 0.0, "std": 1.0}}
+    trainer.training_cache = {}
+    trainer.decode_task_output = lambda task, raw, apply_conformal=False: {
+        "median": raw,
+        "lower": raw,
+        "upper": raw,
+    }
+
+    raw = torch.tensor([[2.0]], device=device)
+    bundle = {
+        "task": "task",
+        "labels": torch.tensor([[1.0]], device=device),
+        "final_raw": raw,
+        "base_raw": raw,
+        "route_raw": raw,
+        "diagnostics": {},
+    }
+
+    trainer._record_training_output(bundle)
+
+    cache = trainer.training_cache["task"]
+    assert all(tensor.device.type == "cpu" for tensor in cache["target"])
+    assert all(tensor.device.type == "cpu" for tensor in cache["route_regret"])
+    assert all(tensor.device.type == "cpu" for tensor in cache["final_regret"])
+    assert torch.allclose(cache["route_regret"][0], torch.zeros(1, 1))

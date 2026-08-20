@@ -289,9 +289,9 @@ class Trainer:
 
     def _record_training_output(self, bundle):
         task = bundle["task"]
-        final = self.decode_task_output(task, bundle["final_raw"].detach(), apply_conformal=False)["median"]
-        base = self.decode_task_output(task, bundle["base_raw"].detach(), apply_conformal=False)["median"]
-        route = self.decode_task_output(task, bundle["route_raw"].detach(), apply_conformal=False)["median"]
+        final = self.decode_task_output(task, bundle["final_raw"].detach(), apply_conformal=False)["median"].cpu()
+        base = self.decode_task_output(task, bundle["base_raw"].detach(), apply_conformal=False)["median"].cpu()
+        route = self.decode_task_output(task, bundle["route_raw"].detach(), apply_conformal=False)["median"].cpu()
         diagnostics = bundle["diagnostics"]
         self.training_cache.setdefault(
             task,
