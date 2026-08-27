@@ -66,6 +66,34 @@ def _as_batch_weights(diagnostics, batch_size, task_count, device):
     return weights
 
 
+def _as_joint_weights(diagnostics, batch_size, task_count, device):
+    """Joint (unconditional-on-transfer) source mass when the model exposes it."""
+
+    joint = _diag_value(diagnostics, "joint_source_weights")
+    if joint is None:
+        return None
+    joint = torch.as_tensor(joint, device=device).reshape(batch_size, -1)
+    if joint.shape != (batch_size, task_count):
+        raise ValueError(
+            f"joint_source_weights shape {tuple(joint.shape)} does not match "
+            f"[{batch_size}, {task_count}]"
+        )
+    return joint
+
+
+def _check_joint_invariant(joint, null, tolerance: float = 1e-4) -> None:
+    """RGCER must satisfy sum(joint) + P(NULL) == 1 per sample."""
+
+    if joint is None or null is None:
+        return
+    total = joint.sum(dim=-1) + null.reshape(-1)
+    if not torch.allclose(total, torch.ones_like(total), atol=tolerance):
+        raise RuntimeError(
+            "routing invariant violated: sum(joint_source_weights) + null_weight "
+            f"deviates from 1 by up to {float((total - 1).abs().max()):.3e}"
+        )
+
+
 def _as_null_weight(diagnostics, batch_size, device, dtype=torch.float32):
     null = _diag_value(diagnostics, "null_weight")
     if null is not None:
@@ -111,6 +139,10 @@ def collect_routing_records(
         weights = _as_batch_weights(diagnostics, batch_size, len(task_names), predictions[target_task].device)
         weights = weights.detach().cpu()
         null = _as_null_weight(diagnostics, batch_size, weights.device, weights.dtype).detach().cpu()
+        joint = _as_joint_weights(diagnostics, batch_size, len(task_names), predictions[target_task].device)
+        if joint is not None:
+            joint = joint.detach().cpu()
+            _check_joint_invariant(joint, null)
         final_decoded = _decode_output(
             predictions[target_task], target_task, prediction_mode, trainer, decode_fn, apply_conformal
         )
@@ -168,6 +200,10 @@ def collect_routing_records(
                 row["smiles"] = batch.smiles[sample_index]
             for source_index, source_task in enumerate(task_names):
                 row[f"route::{source_task}"] = float(weights[sample_index, source_index])
+                # Explicit naming (P1-3): route:: stays as the conditional alias.
+                row[f"conditional_route::{source_task}"] = float(weights[sample_index, source_index])
+                if joint is not None:
+                    row[f"joint_route::{source_task}"] = float(joint[sample_index, source_index])
             active_sources = torch.where(weights[sample_index] > 0)[0]
             if active_sources.numel():
                 top_source = active_sources[weights[sample_index, active_sources].argmax()]
@@ -219,22 +255,62 @@ def routing_summary(records: pd.DataFrame, task_names: Optional[List[str]] = Non
     """Summarize NULL mass, entropy-compatible sparsity, and route variance."""
 
     if task_names is None:
-        task_names = [column.removeprefix("route::") for column in records.columns if column.startswith("route::")]
+        task_names = [
+            column.removeprefix("route::")
+            for column in records.columns
+            if column.startswith("route::")
+        ]
+        # ``route::`` prefix match never hits the explicit conditional_/joint_
+        # spellings, so legacy aliases stay unambiguous here.
     if records.empty:
         return {
             "mean_null": 1.0,
+            "mean_null_weight": 1.0,
             "mean_transfer_mass": 0.0,
             "mean_active_routes": 0.0,
             "routing_variance": 0.0,
         }
     weights = torch.tensor(records[[f"route::{task}" for task in task_names]].to_numpy(), dtype=torch.float32)
     null = torch.tensor(records.get("null_weight", pd.Series(1.0, index=records.index)).to_numpy(), dtype=torch.float32)
-    return {
+    summary = {
         "mean_null": float(null.mean()),
+        "mean_null_weight": float(null.mean()),
         "mean_transfer_mass": float((1.0 - null).mean()),
         "mean_active_routes": float((weights > 0).sum(dim=-1).float().mean()),
         "routing_variance": float(weights.var(dim=0, unbiased=False).mean()),
     }
+    joint_columns = [c for c in records.columns if c.startswith("joint_route::")]
+    if joint_columns:
+        joint = records[joint_columns].to_numpy(dtype=float)
+        summary["mean_joint_source_mass"] = float(joint.sum(axis=1).mean())
+    return summary
+
+
+def fake_endpoint_stress_summary(
+    records: pd.DataFrame,
+    auxiliary_tasks: List[str],
+) -> Dict[str, float]:
+    """Primary shuffled-fake-endpoint stress metrics (P1-3).
+
+    Conditional weights exaggerate reliance on a fake endpoint when the model
+    mostly routes to NULL; the *joint* mass is the honest dependency measure.
+    """
+
+    present = [task for task in auxiliary_tasks if f"joint_route::{task}" in records.columns]
+    if not present or records.empty:
+        return {}
+    conditional_columns = [f"route::{task}" for task in present]
+    joint_values = records[[f"joint_route::{task}" for task in present]].to_numpy(dtype=float)
+    summary: Dict[str, float] = {
+        "auxiliary_tasks": list(present),
+        "mean_joint_fake_mass": float(joint_values.sum(axis=1).mean()),
+        "mean_conditional_fake_mass": float(records[conditional_columns].to_numpy(dtype=float).mean()),
+        "mean_null_weight": float(records.get("null_weight", pd.Series(1.0, index=records.index)).mean()),
+        "transfer_mass": float((1.0 - records.get("null_weight", pd.Series(1.0, index=records.index))).mean()),
+    }
+    per_task = joint_values.sum(axis=0)
+    summary["per_auxiliary_joint_mass"] = {task: float(value) for task, value in zip(present, per_task)}
+    return summary
 
 
 def make_source_mask(task_names: List[str], excluded_tasks: List[str]) -> torch.Tensor:

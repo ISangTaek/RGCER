@@ -424,6 +424,7 @@ class Trainer:
                 "final_regret": [],
                 "null": [],
                 "source_weights": [],
+                "joint_source_weights": [],
                 "entropy": [],
             },
         )
@@ -441,6 +442,8 @@ class Trainer:
             cache["null"].append(diagnostics["null_weight"].detach().cpu())
         if "source_weights" in diagnostics:
             cache["source_weights"].append(diagnostics["source_weights"].detach().cpu())
+        if "joint_source_weights" in diagnostics:
+            cache["joint_source_weights"].append(diagnostics["joint_source_weights"].detach().cpu())
         if "routing_entropy" in diagnostics:
             cache["entropy"].append(diagnostics["routing_entropy"].detach().cpu())
 
@@ -467,6 +470,16 @@ class Trainer:
                         "mean_null_weight": float(null.mean()),
                         "mean_null": float(null.mean()),
                         "std_null": float(null.std(unbiased=False)),
+                        "mean_transfer_mass": float((1.0 - null).mean()),
+                    }
+                )
+            if cache.get("joint_source_weights"):
+                joint = torch.cat(cache["joint_source_weights"])
+                total_source_mass = joint.sum(dim=-1)
+                result.update(
+                    {
+                        "mean_joint_source_mass": float(total_source_mass.mean()),
+                        "routing_variance_joint": float(joint.var(dim=0, unbiased=False).mean()),
                     }
                 )
             if cache["source_weights"]:
@@ -641,6 +654,7 @@ class Trainer:
                 "target": [],
                 "null": [],
                 "source_weights": [],
+                "joint_source_weights": [],
                 "route_regret": [],
                 "final_regret": [],
                 "entropy": [],
@@ -686,6 +700,10 @@ class Trainer:
                         route_records[task]["null"].append(diagnostics["null_weight"].cpu())
                     if "source_weights" in diagnostics:
                         route_records[task]["source_weights"].append(diagnostics["source_weights"].cpu())
+                    if "joint_source_weights" in diagnostics:
+                        route_records[task]["joint_source_weights"].append(
+                            diagnostics["joint_source_weights"].cpu()
+                        )
                     if "routing_entropy" in diagnostics:
                         route_records[task]["entropy"].append(diagnostics["routing_entropy"].cpu())
         return buffers, records, route_records
@@ -792,6 +810,7 @@ class Trainer:
                 values["mean_null_weight"] = float(null.mean())
                 values["mean_null"] = float(null.mean())
                 values["std_null"] = float(null.std(unbiased=False))
+                values["mean_transfer_mass"] = float((1.0 - null).mean())
                 null_values = null.detach().cpu().numpy().reshape(-1)
                 route_regret_values = regret.detach().cpu().numpy().reshape(-1)
                 harmful_route = route_regret_values > 0
@@ -800,6 +819,10 @@ class Trainer:
                 values["null_weight_route_regret_spearman"] = cls._safe_spearman(
                     null_values, route_regret_values
                 )
+            if record.get("joint_source_weights"):
+                joint = torch.cat(record["joint_source_weights"])
+                values["mean_joint_source_mass"] = float(joint.sum(dim=-1).mean())
+                values["routing_variance_joint"] = float(joint.var(dim=0, unbiased=False).mean())
             if record["source_weights"]:
                 weights = torch.cat(record["source_weights"])
                 values["mean_active_sources"] = float((weights > 0).sum(dim=-1).float().mean())
