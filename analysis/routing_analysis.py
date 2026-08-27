@@ -101,7 +101,12 @@ def collect_routing_records(
             continue
         if device is not None:
             batch = batch.to(device)
-        predictions, diagnostics = _unpack(model(batch, task_name=target_task, return_aux=True))
+        if trainer is not None:
+            predictions, diagnostics = _unpack(trainer.predict_all_tasks(batch, return_aux=True))
+            if isinstance(diagnostics, dict):
+                diagnostics = diagnostics.get(target_task, diagnostics)
+        else:
+            predictions, diagnostics = _unpack(model(batch, task_name=target_task, return_aux=True))
         batch_size = predictions[target_task].size(0)
         weights = _as_batch_weights(diagnostics, batch_size, len(task_names), predictions[target_task].device)
         weights = weights.detach().cpu()
@@ -142,8 +147,10 @@ def collect_routing_records(
                 "null_weight": float(null[sample_index, 0]),
                 "transfer_mass": float(1.0 - null[sample_index, 0]),
                 "base_prediction": float(base_prediction[sample_index]),
+                "hps_base_prediction": float(base_prediction[sample_index]),
                 "route_prediction": float(route_prediction[sample_index]),
                 "final_prediction": float(final_prediction[sample_index]),
+                "baseline_final_prediction": float(final_prediction[sample_index]),
                 "interval_lower": float(interval_lower[sample_index]),
                 "interval_upper": float(interval_upper[sample_index]),
                 "interval_width": float(interval_upper[sample_index] - interval_lower[sample_index]),

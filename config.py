@@ -1,4 +1,66 @@
+import warnings
+
 import torch
+
+
+_RGCER_ROUTER_FLAGS = (
+    'rgcer_use_source_response',
+    'rgcer_use_target_response',
+    'rgcer_use_molecule_query',
+    'rgcer_use_sparse_routing',
+    'rgcer_use_null_route',
+    'router_top_k',
+    'router_temperature',
+)
+
+
+def resolve_effective_rgcer_config(params):
+    """Separate requested flags from modules active for this mechanism."""
+
+    names = (
+        'rgcer_use_source_response',
+        'rgcer_use_target_response',
+        'rgcer_use_molecule_query',
+        'rgcer_use_sparse_routing',
+        'rgcer_use_null_route',
+        'rgcer_use_film',
+        'rgcer_use_adapter',
+        'rgcer_use_base_aux_loss',
+        'rgcer_fallback_space',
+        'rgcer_transfer_mechanism',
+        'router_top_k',
+        'router_temperature',
+    )
+    requested = {name: getattr(params, name, None) for name in names}
+    mechanism = requested['rgcer_transfer_mechanism'] or 'endpoint_router'
+    effective = dict(requested)
+    ignored = []
+    if getattr(params, 'arch', None) != 'Graphormer_rgcer':
+        ignored = [name for name in names if name != 'rgcer_transfer_mechanism']
+        effective = {
+            'architecture': getattr(params, 'arch', None),
+            'transfer_mechanism': 'hps',
+            'routing_enabled': False,
+        }
+    elif mechanism in {'target_only', 'response_stacking'}:
+        for name in _RGCER_ROUTER_FLAGS:
+            if name in requested:
+                ignored.append(name)
+                effective[name] = None
+        if mechanism in {'target_only', 'response_stacking'}:
+            ignored.append('rgcer_fallback_space')
+            effective['rgcer_fallback_space'] = None
+    effective['architecture'] = getattr(params, 'arch', None)
+    effective['transfer_mechanism'] = 'hps' if getattr(params, 'arch', None) != 'Graphormer_rgcer' else mechanism
+    effective['routing_enabled'] = bool(getattr(params, 'routing_enabled', True))
+    for name in ignored:
+        if requested.get(name) not in (None, True, 'endpoint_router', 0, 1.0):
+            warnings.warn(
+                f"{name} is ignored by architecture/mechanism {getattr(params, 'arch', None)}/{mechanism}.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    return {'requested': requested, 'effective': effective, 'ignored': ignored}
 
 def prepare_args(params):
     r"""Return the configuration of hyperparameters, optimizier, and learning rate scheduler.
@@ -27,6 +89,8 @@ def prepare_args(params):
         kwargs['arch_args']['hidden_dim'] = params.hidden_dim
     if hasattr(params, 'mid_dim'):
         kwargs['arch_args']['mid_dim'] = params.mid_dim
+    if hasattr(params, 'spatial_pos_clip'):
+        kwargs['arch_args']['spatial_pos_max_clip'] = params.spatial_pos_clip
     for name in [
         'use_factorized_prompt',
         'task_residual_scale',
@@ -56,6 +120,8 @@ def prepare_args(params):
         'rgcer_use_base_aux_loss',
         'rgcer_fallback_space',
         'rgcer_transfer_mechanism',
+        'spatial_pos_max_clip',
+        'auxiliary_metadata_overrides',
     ]:
         if hasattr(params, name):
             kwargs['arch_args'][name] = getattr(params, name)

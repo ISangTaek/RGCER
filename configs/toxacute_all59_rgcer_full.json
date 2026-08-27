@@ -1,0 +1,19 @@
+{
+  "dataset": "toxacute",
+  "data_store_dir": "data/toxacute_datastore_v2",
+  "toxacute_task_scope": "all59",
+  "selection_scope": "human3",
+  "arch": "Graphormer_rgcer",
+  "rgcer_transfer_mechanism": "endpoint_router",
+  "split_seed": 42,
+  "splitting": "scaffold",
+  "vs": 0.1,
+  "calibration_size": 0.1,
+  "ts": 0.1,
+  "prediction_mode": "quantile",
+  "fit_conformal": true,
+  "max_path_distance": 8,
+  "spatial_pos_clip": 20,
+  "max_nodes_filter": 512,
+  "hps_warmup_epochs": 10
+}

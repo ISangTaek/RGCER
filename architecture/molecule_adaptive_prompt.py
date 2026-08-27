@@ -47,6 +47,7 @@ class FactorizedTaskPromptBank(nn.Module):
         hidden_dim: int,
         use_factorized_prompt: bool = True,
         task_residual_scale: float = 0.1,
+        metadata_overrides: Optional[Dict[str, dict]] = None,
     ) -> None:
         super().__init__()
         if not task_names:
@@ -78,7 +79,24 @@ class FactorizedTaskPromptBank(nn.Module):
         if not self.use_factorized_prompt:
             return
 
-        self.metadata = build_task_metadata(self.task_names)
+        metadata_overrides = metadata_overrides or {}
+        parsed_metadata = []
+        for task_name in self.task_names:
+            override = metadata_overrides.get(task_name)
+            if override is None:
+                parsed_metadata.extend(build_task_metadata([task_name]))
+                continue
+            required = {
+                key: override[key]
+                for key in ("task_name", "organism", "route", "measurement", "population")
+                if key in override
+            }
+            required["task_name"] = task_name
+            missing = {"organism", "route", "measurement", "population"}.difference(required)
+            if missing:
+                raise ValueError(f"Metadata override for {task_name!r} is missing {sorted(missing)}")
+            parsed_metadata.append(TaskMetadata(**required))
+        self.metadata = parsed_metadata
         self.organism_vocab = _ordered_vocab(item.organism for item in self.metadata)
         self.route_vocab = _ordered_vocab(item.route for item in self.metadata)
         self.measurement_vocab = _ordered_vocab(item.measurement for item in self.metadata)
@@ -424,6 +442,7 @@ class MoleculeAdaptiveTaskConditioner(nn.Module):
         exclude_target_from_sources: bool = True,
         adapter_ratio: float = 0.25,
         gate_init: float = -2.0,
+        metadata_overrides: Optional[Dict[str, dict]] = None,
     ) -> None:
         super().__init__()
         if not task_names or len(set(task_names)) != len(task_names):
@@ -440,6 +459,7 @@ class MoleculeAdaptiveTaskConditioner(nn.Module):
             hidden_dim,
             use_factorized_prompt=use_factorized_prompt,
             task_residual_scale=task_residual_scale,
+            metadata_overrides=metadata_overrides,
         )
         self.relation_encoder = PromptRelationEncoder(
             hidden_dim,

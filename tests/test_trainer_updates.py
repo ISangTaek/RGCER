@@ -161,7 +161,13 @@ def test_train_retains_final_test_result():
     trainer._save_checkpoint = lambda epoch, filename: None
 
     train_result = {"tasks": {"task": {"RMSE": 1.0}}, "score": 1.0, "loss": {"task": 1.0}}
-    validation_result = {"tasks": {"task": {"RMSE": 1.0}}, "score": 1.0, "routing": {}}
+    validation_result = {
+        "tasks": {"task": {"RMSE": 1.0}},
+        "score": 1.0,
+        "selection_score": 1.0,
+        "selection_scope": "all_tasks",
+        "routing": {},
+    }
     test_result = {"tasks": {"task": {"RMSE": 2.0}}, "score": 2.0, "routing": {"task": {}}}
     trainer._train_epoch = lambda loaders, epoch: train_result
 
