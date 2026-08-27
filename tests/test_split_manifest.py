@@ -29,7 +29,9 @@ def test_manifest_keeps_canonical_and_scaffold_groups_together(tmp_path: Path):
         {"sample_id": "f1", "canonical_smiles": "CCBr", "scaffold": "acyclic_f"},
         {"sample_id": "g1", "canonical_smiles": "CCF", "scaffold": "acyclic_g"},
     ]
-    manifest = create_split_manifest(records, ratios={
+    # Grouping/isolation semantics only; scale-dependent constraints need a
+    # realistic corpus and are covered by the dedicated v3 tests.
+    manifest = create_split_manifest(records, splitting="random", ratios={
         "train": 0.5, "validation": 0.2, "calibration": 0.2, "test": 0.1
     })
     path = tmp_path / "split_manifest.json"
@@ -81,8 +83,8 @@ def test_v2_manifest_records_split_group(tmp_path: Path):
         {"sample_id": "acy_1", "canonical_smiles": "CCO", "scaffold": ACYCLIC_SCAFFOLD},
         {"sample_id": "acy_2", "canonical_smiles": "CCO", "scaffold": ACYCLIC_SCAFFOLD},
     ]
-    manifest = create_split_manifest(records, ratios=RATIOS)
-    assert manifest["manifest_version"] == MANIFEST_VERSION == 2
+    manifest = create_split_manifest(records, ratios=RATIOS, enforce_scale_constraints=False)
+    assert manifest["manifest_version"] == MANIFEST_VERSION == 3
     by_id = {record["sample_id"]: record for record in manifest["records"]}
     assert by_id["cyc_1"]["split_group"] == "scaffold::benzene"
     assert by_id["cyc_2"]["split_group"] == "scaffold::benzene"
@@ -174,7 +176,7 @@ def test_v2_rejects_split_group_crossing_splits():
         {"sample_id": "cyc_1", "canonical_smiles": "c1ccccc1", "scaffold": "benzene"},
         {"sample_id": "cyc_2", "canonical_smiles": "c1ccc(O)cc1", "scaffold": "benzene"},
     ]
-    manifest = create_split_manifest(records, ratios=RATIOS)
+    manifest = create_split_manifest(records, ratios=RATIOS, enforce_scale_constraints=False)
     by_id = {record["sample_id"]: record for record in manifest["records"]}
     by_id["acy_1"]["split"] = "train"
     by_id["acy_2"]["split"] = "test"
@@ -187,7 +189,7 @@ def test_v2_rejects_missing_split_group():
         {"sample_id": "cyc_1", "canonical_smiles": "c1ccccc1", "scaffold": "benzene"},
         {"sample_id": "acy_1", "canonical_smiles": "CCO", "scaffold": ACYCLIC_SCAFFOLD},
     ]
-    manifest = create_split_manifest(records, ratios=RATIOS)
+    manifest = create_split_manifest(records, ratios=RATIOS, enforce_scale_constraints=False)
     for record in manifest["records"]:
         del record["split_group"]
     with pytest.raises(ValueError, match="split_group None does not match"):
@@ -199,7 +201,7 @@ def test_v2_rejects_tampered_split_group():
         {"sample_id": "cyc_1", "canonical_smiles": "c1ccccc1", "scaffold": "benzene"},
         {"sample_id": "acy_1", "canonical_smiles": "CCO", "scaffold": ACYCLIC_SCAFFOLD},
     ]
-    manifest = create_split_manifest(records, ratios=RATIOS)
+    manifest = create_split_manifest(records, ratios=RATIOS, enforce_scale_constraints=False)
     manifest["records"][0]["split_group"] = "scaffold::other"
     with pytest.raises(ValueError, match="does not match"):
         validate_manifest(manifest)

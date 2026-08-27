@@ -177,7 +177,7 @@ def test_datastore_rejects_legacy_v1_split_manifest(tmp_path):
         record.pop("split_group", None)
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="DataStore requires split manifest version 2"):
+    with pytest.raises(ValueError, match="DataStore requires split manifest version 3"):
         ToxAcuteDataStore.resolve(root)
 
 
@@ -209,7 +209,7 @@ def test_build_rejects_v1_approved_split_manifest(tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="Approved split manifest must be version 2"):
+    with pytest.raises(ValueError, match="Approved split manifest must be version 3"):
         build_datastore_v2(
             raw_csv,
             root,
