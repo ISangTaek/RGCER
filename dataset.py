@@ -172,7 +172,11 @@ class DataCollator:
         for batch_index, item in enumerate(data_list):
             node_count = item.x.size(0)
             padding_mask[batch_index, :node_count] = False
-            long_distance = item.spatial_pos >= self.spatial_pos_max_clip
+            # ``spatial_pos_max_clip`` is the largest *visible* hop: distances
+            # at the clip (and its clamped representation in the embedding
+            # index) still attend. Only strictly farther hops — including the
+            # 510 marker for disconnected pairs — are masked out.
+            long_distance = item.spatial_pos > self.spatial_pos_max_clip
             attn_bias[batch_index, 1 : node_count + 1, 1 : node_count + 1][long_distance] = float("-inf")
             if node_count < max_nodes:
                 # Valid queries cannot attend to padded keys. Padded query rows

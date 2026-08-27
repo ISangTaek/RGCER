@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from auxiliary_labels import ShuffledEndpointOverlay
 from architecture.response_guided_router import RGCERTaskConditioner
 from trainer import Trainer
-from test_datastore_v2_contract import _write_raw
+from tests.test_datastore_v2_contract import _write_raw
 from toxacute_datastore import ToxAcuteDataStore, ToxAcuteTaskDataset, build_datastore_v2
 
 

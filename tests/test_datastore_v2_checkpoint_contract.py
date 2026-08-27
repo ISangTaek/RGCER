@@ -4,8 +4,8 @@ import torch
 from torch import nn
 
 from loss import MSELoss
-from test_checkpoint_ablation_config import _DummyArchitecture, _args
-from test_datastore_v2_contract import _write_raw
+from tests.test_checkpoint_ablation_config import _DummyArchitecture, _args
+from tests.test_datastore_v2_contract import _write_raw
 from toxacute_datastore import ToxAcuteDataStore, build_datastore_v2
 from trainer import Trainer
 from weighting.EW import EW

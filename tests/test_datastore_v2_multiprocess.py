@@ -1,5 +1,5 @@
 from dataset import DataCollator, DataloaderWrapper
-from test_datastore_v2_contract import _write_raw
+from tests.test_datastore_v2_contract import _write_raw
 from toxacute_datastore import ToxAcuteDataStore, build_datastore_v2
 
 
