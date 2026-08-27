@@ -838,6 +838,14 @@ class Trainer:
             apply_conformal=False,
             routing_enabled_override=routing_enabled_override,
         )
+        splitting = getattr(self.args, "splitting", None)
+        if splitting == "scaffold":
+            warnings.warn(
+                "Standard split-conformal finite-sample coverage assumes exchangeability; "
+                "scaffold-split coverage is reported empirically under structural shift.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         for task in self.task_name:
             if not self._is_regression(task):
                 continue
@@ -851,6 +859,17 @@ class Trainer:
                 torch.cat(records[task]["upper"]),
                 torch.cat(records[task]["target"]),
             )
+
+    def _conformal_validity(self):
+        """Coverage-claim metadata: method, alpha, and split-type assumptions."""
+
+        from conformal import exchangeability_metadata
+
+        return {
+            "conformal_method": "taskwise_cqr" if self._prediction_mode() == "quantile" else None,
+            "conformal_alpha": float(getattr(self.args, "conformal_alpha", 0.10)),
+            **exchangeability_metadata(getattr(self.args, "splitting", None)),
+        }
 
     def _manifest_hash(self):
         if self.data_metadata is not None:
@@ -961,6 +980,7 @@ class Trainer:
                 "upper": getattr(self.args, "upper_quantile", 0.95),
             },
             "conformal_state": self.conformal_calibrator.state_dict(),
+            "conformal_validity": self._conformal_validity(),
             "hps_warmup_epochs": getattr(self.args, "hps_warmup_epochs", 0),
             "routing_enabled": self._routing_enabled(epoch),
             "rgcer_config": self._rgcer_config(),

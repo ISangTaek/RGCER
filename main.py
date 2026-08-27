@@ -433,6 +433,7 @@ def main(params):
             )
             if params.save_path:
                 metrics_payload = {"history": history}
+                metrics_payload["conformal"] = trainer._conformal_validity()
                 if trainer.final_test_result is not None:
                     metrics_payload["test"] = trainer.final_test_result
                 _write_json(Path(params.save_path) / "metrics.json", metrics_payload)
@@ -452,7 +453,10 @@ def main(params):
         else:
             result = trainer.test(loaders["test"])
             if params.save_path:
-                _write_json(Path(params.save_path) / "metrics.json", {"test": result})
+                _write_json(
+                    Path(params.save_path) / "metrics.json",
+                    {"test": result, "conformal": trainer._conformal_validity()},
+                )
                 _write_json(
                     Path(params.save_path) / "routing_summary.json",
                     {
