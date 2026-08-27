@@ -17,6 +17,21 @@ class TaskConformalState:
     count: int
 
 
+def minimum_calibration_size(alpha: float) -> int:
+    """Smallest calibration size supporting a finite corrected rank.
+
+    Split conformal requires ``ceil((n+1)(1-alpha)) <= n``; solving for n
+    gives the closed form below (9 samples at alpha=.10, 19 at alpha=.05).
+    This is the *mathematical* floor — ``ConformalCalibrator``'s
+    ``min_calibration_size`` default of 30 is only a statistical stability
+    warning threshold, not this minimum.
+    """
+
+    if not 0.0 < float(alpha) < 1.0:
+        raise ValueError("alpha must be in (0, 1)")
+    return math.ceil((1.0 - float(alpha)) / float(alpha))
+
+
 class InsufficientCalibrationError(ValueError):
     """The calibration set cannot support a finite rank for this alpha.
 
@@ -30,7 +45,7 @@ class InsufficientCalibrationError(ValueError):
         self.count = int(count)
         self.corrected_rank = int(corrected_rank)
         self.alpha = float(alpha)
-        minimum = math.ceil((1.0 - alpha) / alpha)
+        minimum = minimum_calibration_size(self.alpha)
         super().__init__(
             f"Task {task!r}: {count} calibration scores cannot support the corrected "
             f"rank {corrected_rank} > n implied by alpha={alpha}. A finite "
@@ -68,6 +83,14 @@ def exchangeability_metadata(splitting: str | None) -> dict:
 
 
 class ConformalCalibrator:
+    """Task-wise split-conformal (CQR) calibration.
+
+    ``min_calibration_size`` (default 30) is a *statistical stability
+    warning threshold*, not the finite-rank mathematical minimum — see
+    :func:`minimum_calibration_size` for the hard floor that
+    :class:`InsufficientCalibrationError` enforces.
+    """
+
     def __init__(self, alpha: float = 0.10, min_calibration_size: int = 30):
         if not 0.0 < alpha < 1.0:
             raise ValueError("alpha must be in (0, 1)")
@@ -142,4 +165,5 @@ __all__ = [
     "InsufficientCalibrationError",
     "TaskConformalState",
     "exchangeability_metadata",
+    "minimum_calibration_size",
 ]

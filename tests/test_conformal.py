@@ -73,3 +73,37 @@ def test_exchangeability_metadata_tracks_split_semantics():
 
     unknown = exchangeability_metadata(None)
     assert unknown["finite_sample_exchangeability_guarantee_applicable"] is False
+
+
+def test_minimum_calibration_size_matches_closed_form():
+    from conformal import minimum_calibration_size
+
+    assert minimum_calibration_size(0.10) == 9
+    assert minimum_calibration_size(0.05) == 19
+    assert minimum_calibration_size(0.50) == 1
+    with pytest.raises(ValueError):
+        minimum_calibration_size(0.0)
+    with pytest.raises(ValueError):
+        minimum_calibration_size(1.5)
+
+
+def test_alpha_010_boundary_n8_fails_n9_passes():
+    calibrator = ConformalCalibrator(alpha=0.10)
+    lower, upper, target = _scores(8)
+    with pytest.raises(InsufficientCalibrationError):
+        calibrator.fit_task("thin8", lower, upper, target)
+
+    lower9, upper9, target9 = _scores(9)
+    state = ConformalCalibrator(alpha=0.10).fit_task("thin9", lower9, upper9, target9)
+    assert int(state.count) == 9
+
+
+def test_n9_below_stability_threshold_warns_but_fits():
+    """n_min=9 satisfies the rank; only the 30-sample stability warning fires."""
+
+    lower, upper, target = _scores(9)
+    with pytest.warns(RuntimeWarning, match="stability|minimum is"):
+        state = ConformalCalibrator(alpha=0.10, min_calibration_size=30).fit_task(
+            "edge", lower, upper, target
+        )
+    assert int(state.count) == 9

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import random
 import warnings
 from pathlib import Path
@@ -80,6 +81,10 @@ class Trainer:
         self.kwargs = kwargs
         self.seed = int(getattr(args, "seed", 42))
         self.selection_scope = str(getattr(args, "selection_scope", "human3"))
+        self.conformal_scope = str(getattr(args, "conformal_scope", "human3"))
+        if self.conformal_scope not in {"human3", "all_tasks"}:
+            raise ValueError(f"Unknown conformal_scope: {self.conformal_scope!r}")
+        self.conformal_fit_report: list[dict] = []
         self.source_policy = str(getattr(args, "rgcer_source_policy", DEFAULT_SOURCE_POLICY))
         if self.source_policy not in SOURCE_POLICY_CHOICES:
             raise ValueError(f"Unknown rgcer_source_policy: {self.source_policy!r}")
@@ -684,7 +689,14 @@ class Trainer:
                         routing_enabled_override=routing_enabled_override,
                     )
                     final_raw = output[task]
-                    final_decoded = self.decode_task_output(task, final_raw, apply_conformal=apply_conformal)
+                    # Per-task conformal gating (§23): point metrics cover the
+                    # full task list, but qhat is only applied where a state
+                    # exists — never labelling uncalibrated animal intervals
+                    # as conformal.
+                    apply_task_conformal = (
+                        apply_conformal and task in self.conformal_calibrator.states
+                    )
+                    final_decoded = self.decode_task_output(task, final_raw, apply_conformal=apply_task_conformal)
                     target = batch.y.reshape(-1, 1).float()
                     buffers[task]["pred"].append(final_decoded["median"].cpu())
                     buffers[task]["label"].append(target.cpu())
@@ -723,23 +735,34 @@ class Trainer:
         )
         result = self._score_buffers(buffers)
         if self._prediction_mode() == "quantile":
-            interval_values = []
-            for task in self.task_name:
-                if not self._is_regression(task) or not records[task]["target"]:
-                    continue
-                # Auxiliary stress-test endpoints may be used as router
-                # sources, but they must not affect the formal CQR report.
-                if not self.task_dict[task].get("fit_conformal", True):
+            scoped_tasks = self._conformal_tasks()
+            task_interval_metrics = {}
+            for task in scoped_tasks:
+                if not records[task]["target"]:
                     continue
                 lower = torch.cat(records[task]["lower"])
                 upper = torch.cat(records[task]["upper"])
                 target = torch.cat(records[task]["target"])
                 if mode == "test" and task in self.conformal_calibrator.states:
                     lower, upper = self.conformal_calibrator.apply(task, lower, upper)
-                interval_values.append(compute_interval_metrics(lower, upper, target, self.args.conformal_alpha))
-            if interval_values:
+                # Interval reports keep the per-task view even when the
+                # split carries few samples; macro alone would hide which
+                # human endpoint is actually covered.
+                task_interval_metrics[task] = compute_interval_metrics(
+                    lower, upper, target, self.args.conformal_alpha
+                )
+            if task_interval_metrics:
+                macro_values = list(task_interval_metrics.values())
                 result["interval"] = {
-                    key: float(np.nanmean([value[key] for value in interval_values])) for key in interval_values[0]
+                    "scope": self.conformal_scope,
+                    "tasks": {
+                        task: {key: float(value) for key, value in values.items()}
+                        for task, values in task_interval_metrics.items()
+                    },
+                    "macro": {
+                        key: float(np.nanmean([value[key] for value in macro_values]))
+                        for key in macro_values[0]
+                    },
                 }
         result["routing"] = self._evaluation_routing_summary(route_records)
         self._print_metrics(mode, epoch if mode == "validation" else None, result)
@@ -858,6 +881,26 @@ class Trainer:
             aggregate[key] = float(np.nanmean(values)) if values else float("nan")
         return aggregate
 
+    def _conformal_tasks(self):
+        """Tasks that receive CQR states, per ``--conformal_scope``.
+
+        Primary conformal evaluation targets the three human endpoints even
+        though training/point evaluation cover all 59; interval reports are
+        scoped accordingly instead of silently applying qhat everywhere.
+        """
+
+        if self.conformal_scope == "human3":
+            return [
+                task
+                for task in self.task_name
+                if task in HUMAN_TARGET_TASKS and self.task_dict[task].get("fit_conformal", True)
+            ]
+        return [
+            task
+            for task in self.task_name
+            if self._is_regression(task) and self.task_dict[task].get("fit_conformal", True)
+        ]
+
     def _fit_conformal(self, calibration_dataloaders_dict, routing_enabled_override=None):
         if self._prediction_mode() != "quantile" or not getattr(self.args, "fit_conformal", True):
             return
@@ -875,18 +918,39 @@ class Trainer:
                 RuntimeWarning,
                 stacklevel=2,
             )
-        for task in self.task_name:
-            if not self._is_regression(task):
-                continue
-            if not self.task_dict[task].get("fit_conformal", True):
-                continue
+        self.conformal_fit_report = []
+        for task in self._conformal_tasks():
             if not records[task]["target"]:
                 raise ValueError(f"No calibration samples for {task}.")
-            self.conformal_calibrator.fit_task(
+            state = self.conformal_calibrator.fit_task(
                 task,
                 torch.cat(records[task]["lower"]),
                 torch.cat(records[task]["upper"]),
                 torch.cat(records[task]["target"]),
+            )
+            from conformal import minimum_calibration_size
+
+            required_minimum = minimum_calibration_size(self.conformal_calibrator.alpha)
+            entry = {
+                "task": task,
+                "alpha": float(self.conformal_calibrator.alpha),
+                "calibration_count": int(state.count),
+                "required_minimum": int(required_minimum),
+                "stability_threshold": int(self.conformal_calibrator.min_calibration_size),
+                "qhat": float(state.qhat),
+                "status": (
+                    "OK"
+                    if state.count >= self.conformal_calibrator.min_calibration_size
+                    else "LOW_CALIBRATION_STABILITY"
+                ),
+            }
+            self.conformal_fit_report.append(entry)
+            print(
+                "[conformal] "
+                + json.dumps(
+                    {key: entry[key] for key in entry if key != "status"}
+                    | {"status": entry["status"]}
+                )
             )
 
     def _conformal_validity(self):
@@ -1010,6 +1074,7 @@ class Trainer:
             },
             "conformal_state": self.conformal_calibrator.state_dict(),
             "conformal_validity": self._conformal_validity(),
+            "conformal_report": list(self.conformal_fit_report),
             "hps_warmup_epochs": getattr(self.args, "hps_warmup_epochs", 0),
             "routing_enabled": self._routing_enabled(epoch),
             "rgcer_config": self._rgcer_config(),

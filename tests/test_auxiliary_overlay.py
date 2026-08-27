@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 from types import SimpleNamespace
 
@@ -80,8 +81,15 @@ def test_auxiliary_endpoint_is_excluded_from_interval_report():
         "fake": {"metrics": ["RMSE"], "fit_conformal": False},
     }
     trainer.args = SimpleNamespace(conformal_alpha=0.1)
+    trainer.conformal_scope = "human3"
+    trainer.conformal_calibrator = __import__("conformal").ConformalCalibrator(alpha=0.1)
     trainer._prediction_mode = lambda: "quantile"
     trainer._is_regression = lambda task: True
+    # Scope selection is covered elsewhere; here the aux exclusion comes from
+    # the fit_conformal flag, so mirror that part of the real helper.
+    trainer._conformal_tasks = lambda: [
+        task for task in trainer.task_name if trainer.task_dict[task].get("fit_conformal", True)
+    ]
     trainer._collect_predictions = lambda *args, **kwargs: (
         {},
         {
@@ -103,4 +111,10 @@ def test_auxiliary_endpoint_is_excluded_from_interval_report():
 
     result = trainer._evaluate({}, mode="validation")
 
-    assert result["interval"]["MeanWidth"] == 1.0
+    interval = result["interval"]
+    assert interval["scope"] == "human3"
+    # Auxiliary endpoints stay excluded from the formal CQR report; the new
+    # scoped shape keeps per-task coverage next to a macro summary.
+    assert set(interval["tasks"]) == {"formal"}
+    assert interval["tasks"]["formal"]["MeanWidth"] == pytest.approx(1.0)
+    assert interval["macro"]["MeanWidth"] == pytest.approx(1.0)

@@ -655,6 +655,14 @@ def build_parser():
         "human target endpoints (falls back to all_tasks when the run has none).",
     )
     parser.add_argument(
+        "--conformal_scope",
+        choices=["human3", "all_tasks"],
+        default="human3",
+        help="Which regression tasks receive CQR states: primary conformal "
+        "evaluation targets the human endpoints while point metrics still cover "
+        "every task.",
+    )
+    parser.add_argument(
         "--rgcer_source_policy",
         choices=["all_except_target", "animal56_only"],
         default="animal56_only",
