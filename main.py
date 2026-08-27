@@ -311,8 +311,13 @@ def _prediction_records(params, trainer, batch, task_names):
     batch_smiles = list(getattr(batch, "smiles", [""] * batch.y.size(0)))
     for sample_index, smiles in enumerate(batch_smiles):
         row = {"smiles": smiles}
+        apply_conformal = bool(getattr(params, "fit_conformal", True))
         for task in task_names:
-            decoded = trainer.decode_task_output(task, predictions[task][sample_index : sample_index + 1])
+            decoded = trainer.decode_task_output(
+                task,
+                predictions[task][sample_index : sample_index + 1],
+                apply_conformal=apply_conformal,
+            )
             median = float(decoded["median"].item())
             lower = float(decoded["lower"].item())
             upper = float(decoded["upper"].item())
@@ -481,7 +486,9 @@ def main(params):
             predictions = trainer.predict_all_tasks(batch)
         print("--- Predictions ---")
         for task in task_names:
-            decoded = trainer.decode_task_output(task, predictions[task])
+            decoded = trainer.decode_task_output(
+                task, predictions[task], apply_conformal=bool(getattr(params, "fit_conformal", True))
+            )
             print(
                 f"{task}: median={decoded['median'].item():.6f}, "
                 f"lower={decoded['lower'].item():.6f}, upper={decoded['upper'].item():.6f}, "

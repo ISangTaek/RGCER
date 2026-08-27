@@ -244,10 +244,16 @@ class Trainer:
             "upper": self._denormalize_tensor(task, decoded.upper),
         }
         if apply_conformal and mode == "quantile":
-            if task in self.conformal_calibrator.states:
-                result["lower"], result["upper"] = self.conformal_calibrator.apply(
-                    task, result["lower"], result["upper"]
+            if task not in self.conformal_calibrator.states:
+                # Fail fast instead of silently reporting uncalibrated bands
+                # as conformal intervals (e.g. --no-fit_conformal runs).
+                raise ValueError(
+                    f"No conformal state fitted for task {task!r}; re-run with "
+                    "--fit_conformal or request apply_conformal=False."
                 )
+            result["lower"], result["upper"] = self.conformal_calibrator.apply(
+                task, result["lower"], result["upper"]
+            )
         return result
 
     def _task_schedule(self, dataloaders_dict, epoch):
@@ -712,7 +718,7 @@ class Trainer:
         buffers, records, route_records = self._collect_predictions(
             dataloaders_dict,
             epoch=epoch,
-            apply_conformal=mode == "test",
+            apply_conformal=(mode == "test" and bool(getattr(self.args, "fit_conformal", True))),
             routing_enabled_override=routing_enabled_override,
         )
         result = self._score_buffers(buffers)
@@ -1090,6 +1096,11 @@ class Trainer:
         if not isinstance(stored_rgcer, dict):
             raise ValueError("Checkpoint rgcer_config is invalid")
         for name, value in current_rgcer.items():
+            if name == "fit_conformal":
+                # Provenance-only runtime switch: a checkpoint trained with or
+                # without CQR stays usable either way; requesting intervals
+                # without fitted states fails at decode time below.
+                continue
             if stored_rgcer.get(name) != value:
                 raise ValueError(f"Checkpoint RGCER setting {name!r} does not match current configuration")
         current_manifest_hash = self._manifest_hash()
