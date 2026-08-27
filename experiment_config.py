@@ -6,6 +6,9 @@ scope, however, defaults to all 59 endpoints.
 """
 
 TOXACUTE_RAW_CSV = "data/toxacute.csv"
+# Formal experiments use a repository-relative, versioned DataStore root.  The
+# legacy V1 directory remains available for compatibility-only callers.
+TOXACUTE_DATASTORE_DIR = "data/toxacute_datastore_v2"
 TOXACUTE_PREPROCESSED_DIR = r"D:\PROJECT\MTL\MultiTask Toxic Prediction Reborn\processed_graph_data"
 TOXACUTE_SMOKE_RUN_DIR = "artifacts/runs/toxacute_smoke_human3"
 TOXACUTE_MAIN_RUN_DIR = "artifacts/runs/toxacute_all59_rgcer"

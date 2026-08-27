@@ -28,3 +28,8 @@ __pycache__/
 .mypy_cache/
 .idea/
 .vscode/
+
+# Local scratch and probe outputs
+.tmp/
+.qwen/
+_check*.py

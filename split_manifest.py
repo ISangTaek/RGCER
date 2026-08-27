@@ -1,4 +1,11 @@
-"""Global, group-safe train/validation/calibration/test manifests."""
+"""Global, group-safe train/validation/calibration/test manifests.
+
+Manifest version 2 (current) routes acyclic chemistry by canonical SMILES:
+under scaffold splitting, cyclic molecules share their Murcko scaffold group
+while acyclic molecules are kept together only within their exact structure,
+so acyclic evaluation chemistry is spread across splits instead of landing in
+a single ``__ACYCLIC__`` super-group.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +24,24 @@ DEFAULT_RATIOS = {
     "calibration": 0.10,
     "test": 0.10,
 }
+MANIFEST_VERSION = 2
+ACYCLIC_SCAFFOLD = "__ACYCLIC__"
+
+
+def split_group_key(record: dict, splitting: str) -> str:
+    """Group key deciding which chemistry must stay inside one split.
+
+    Scaffold splitting groups cyclic molecules by scaffold and acyclic
+    molecules by canonical SMILES; random splitting always groups by
+    canonical SMILES.
+    """
+    canonical = str(record.get("canonical_smiles") or record["sample_id"])
+    if splitting == "scaffold":
+        scaffold = str(record.get("scaffold") or "")
+        if scaffold and scaffold != ACYCLIC_SCAFFOLD:
+            return f"scaffold::{scaffold}"
+        return f"acyclic::{canonical}"
+    return f"canonical::{canonical}"
 
 
 def create_split_manifest(
@@ -41,11 +66,11 @@ def create_split_manifest(
     if any(not record.get("sample_id") for record in records):
         raise ValueError("Every manifest record needs a non-empty sample_id")
 
-    group_field = "scaffold" if splitting == "scaffold" else "canonical_smiles"
     groups: dict[str, list[dict]] = {}
     for record in records:
-        group_key = record.get(group_field) or record.get("canonical_smiles") or record["sample_id"]
-        groups.setdefault(str(group_key), []).append(record)
+        group_key = split_group_key(record, splitting)
+        record["split_group"] = group_key
+        groups.setdefault(group_key, []).append(record)
 
     rng = np.random.default_rng(seed)
     grouped = list(groups.values())
@@ -78,7 +103,7 @@ def create_split_manifest(
         output_records.append(record)
 
     manifest = {
-        "manifest_version": 1,
+        "manifest_version": MANIFEST_VERSION,
         "splitting": splitting,
         "seed": seed,
         "ratios": ratios,
@@ -120,23 +145,47 @@ def validate_manifest(manifest: dict) -> None:
             if by_split[left] & by_split[right]:
                 raise AssertionError(f"Sample IDs overlap between {left} and {right}")
 
-    # Canonical SMILES are always kept together.  Scaffold isolation is a
-    # property of scaffold splitting only; enforcing it for a random split
-    # rejects a valid random experiment when unrelated molecules share a
-    # scaffold by chance.
-    fields = ["canonical_smiles"]
-    if splitting == "scaffold":
-        fields.append("scaffold")
-    for field in fields:
+    # Group isolation: a split_group must never cross splits.  Version 2
+    # groups acyclic chemistry by canonical SMILES instead of the single
+    # __ACYCLIC__ super-group; version 1 grouped everything (scaffold
+    # splitting included) so its invariants are re-derived from the stored
+    # raw fields.
+    manifest_version = int(manifest.get("manifest_version", 1))
+    if manifest_version not in {1, 2}:
+        raise ValueError(f"Unsupported split manifest version: {manifest_version}")
+    if manifest_version == 2:
+        for record in records:
+            expected_group = split_group_key(record, splitting)
+            if record.get("split_group") != expected_group:
+                raise ValueError(
+                    f"split_group {record.get('split_group')!r} does not match "
+                    f"{expected_group!r} for sample_id={record['sample_id']!r}"
+                )
         locations: dict[str, str] = {}
         for record in records:
-            value = record.get(field)
-            if not value:
-                continue
+            value = record["split_group"]
             split = record["split"]
             previous = locations.setdefault(value, split)
             if previous != split:
-                raise AssertionError(f"{field} crosses split: {value}")
+                raise AssertionError(f"split_group crosses split: {value}")
+    else:
+        # Version 1: canonical SMILES are always kept together.  Scaffold
+        # isolation is a property of scaffold splitting only; enforcing it
+        # for a random split rejects a valid random experiment when
+        # unrelated molecules share a scaffold by chance.
+        fields = ["canonical_smiles"]
+        if splitting == "scaffold":
+            fields.append("scaffold")
+        for field in fields:
+            locations: dict[str, str] = {}
+            for record in records:
+                value = record.get(field)
+                if not value:
+                    continue
+                split = record["split"]
+                previous = locations.setdefault(value, split)
+                if previous != split:
+                    raise AssertionError(f"{field} crosses split: {value}")
 
 
 def write_manifest(manifest: dict, path: str | Path) -> None:

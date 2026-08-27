@@ -28,6 +28,7 @@ from molecular_features import (
     scaffold_from_mol,
 )
 from split_manifest import create_split_manifest, write_manifest
+from toxacute_datastore import build_datastore_v2
 
 
 def one_of_k_encoding_unk(x, allowable_set):
@@ -127,17 +128,9 @@ def _build_edge_tensors(mol: Chem.Mol):
     return adjacency, edge_index, edge_attr, attn_edge_type, edge_feature_matrix
 
 
-def get_graph_data_from_smiles(
-    smiles_string,
-    label_val,
-    convert_x_fn=None,
-    *,
-    sample_id="inference_sample",
-    task_name=None,
-    max_path_distance=8,
-):
-    """Create one graph with atom, direct-bond, and multi-hop bond features."""
-    del convert_x_fn
+def _build_graph_feature_record(smiles_string, *, sample_id="inference_sample", max_path_distance=8):
+    """Build task-independent graph tensors and molecule metadata once."""
+
     mol, canonical_smiles = canonicalize_smiles(str(smiles_string))
     if mol.GetNumAtoms() == 0:
         raise ValueError("SMILES produced an empty molecule")
@@ -159,22 +152,78 @@ def get_graph_data_from_smiles(
     edge_input_np = edge_input_full[:, :, : int(max_path_distance), :]
 
     degree = torch.from_numpy(adjacency.sum(axis=1).astype(np.int64))
+    return {
+        "x": atom_matrix,
+        "edge_index": edge_index,
+        "edge_attr": edge_attr,
+        "in_degree": degree,
+        "out_degree": degree.clone(),
+        "spatial_pos": torch.from_numpy(spatial_pos_np.astype(np.int64)),
+        "attn_edge_type": attn_edge_type,
+        "edge_input": torch.from_numpy(edge_input_np.astype(np.int64)),
+        "raw_smiles": str(smiles_string),
+        "canonical_smiles": canonical_smiles,
+        "scaffold": scaffold_from_mol(mol),
+        "sample_id": str(sample_id),
+        "num_nodes": int(mol.GetNumAtoms()),
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "graph_record_version": 1,
+    }
+
+
+def get_graph_features_from_smiles(
+    smiles_string,
+    *,
+    sample_id="inference_sample",
+    max_path_distance=8,
+):
+    """Return task-independent tensors for the DataStore V2 graph record."""
+
+    record = _build_graph_feature_record(
+        smiles_string,
+        sample_id=sample_id,
+        max_path_distance=max_path_distance,
+    )
+    return {
+        key: value
+        for key, value in record.items()
+        if key not in {"edge_index", "edge_attr"}
+    }
+
+
+def get_graph_data_from_smiles(
+    smiles_string,
+    label_val=0.0,
+    convert_x_fn=None,
+    *,
+    sample_id="inference_sample",
+    task_name=None,
+    max_path_distance=8,
+):
+    """Compatibility wrapper returning the legacy task-labelled PyG object."""
+
+    del convert_x_fn
+    record = _build_graph_feature_record(
+        smiles_string,
+        sample_id=sample_id,
+        max_path_distance=max_path_distance,
+    )
     return Data(
-        x=atom_matrix,
-        edge_index=edge_index,
-        edge_attr=edge_attr,
-        in_degree=degree,
-        out_degree=degree.clone(),
-        spatial_pos=torch.from_numpy(spatial_pos_np.astype(np.int64)),
-        attn_edge_type=attn_edge_type,
-        edge_input=torch.from_numpy(edge_input_np.astype(np.int64)),
+        x=record["x"],
+        edge_index=record["edge_index"],
+        edge_attr=record["edge_attr"],
+        in_degree=record["in_degree"],
+        out_degree=record["out_degree"],
+        spatial_pos=record["spatial_pos"],
+        attn_edge_type=record["attn_edge_type"],
+        edge_input=record["edge_input"],
         y=torch.tensor([float(label_val)], dtype=torch.float),
         label=float(label_val),
         smiles=str(smiles_string),
         raw_smiles=str(smiles_string),
-        canonical_smiles=canonical_smiles,
-        scaffold_smiles=scaffold_from_mol(mol),
-        scaffold=scaffold_from_mol(mol),
+        canonical_smiles=record["canonical_smiles"],
+        scaffold_smiles=record["scaffold"],
+        scaffold=record["scaffold"],
         sample_id=str(sample_id),
         task_name=task_name,
         feature_schema_version=FEATURE_SCHEMA_VERSION,
@@ -240,8 +289,6 @@ def preprocess_and_save(
     for task_name in tasks:
         task_output_dir = output_dir_base / task_name
         task_output_dir.mkdir(parents=True, exist_ok=True)
-        for stale_file in task_output_dir.glob("data_*.pt"):
-            stale_file.unlink()
         processed = 0
         skipped = 0
         for row_index, record in record_by_index.items():
@@ -267,16 +314,47 @@ def preprocess_and_save(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Offline molecular Graphormer preprocessing")
+    parser.add_argument("--build_datastore_v2", action="store_true")
     parser.add_argument("--raw_csv_path", type=str, default=TOXACUTE_RAW_CSV)
     parser.add_argument("--task_list", type=str, default=",".join(TOXACUTE_TASKS))
     parser.add_argument("--output_dir", type=str, default=TOXACUTE_PREPROCESSED_DIR)
+    parser.add_argument("--data_store_dir", type=str, default="data/toxacute_datastore_v2")
+    parser.add_argument("--split_manifest_path", type=str, default=None)
     parser.add_argument("--splitting", choices=["random", "scaffold"], default="scaffold")
     parser.add_argument("--valid_size", type=float, default=0.1)
     parser.add_argument("--calibration_size", type=float, default=0.1)
     parser.add_argument("--test_size", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--split_seed", type=int, default=42)
     parser.add_argument("--max_path_distance", type=int, default=8)
+    parser.add_argument("--lmdb_map_size_gb", type=float, default=64.0)
+    parser.add_argument("--commit_every", type=int, default=512)
+    parser.add_argument(
+        "--graph_shard_max_gb",
+        type=float,
+        default=4.0,
+        help="Rollover cap for each graph shard file; bounds the size of any "
+        "single on-disk data file produced by the build.",
+    )
     args = parser.parse_args()
+    if args.build_datastore_v2:
+        build_path = build_datastore_v2(
+            args.raw_csv_path,
+            args.data_store_dir,
+            task_names=args.task_list,
+            splitting=args.splitting,
+            valid_size=args.valid_size,
+            calibration_size=args.calibration_size,
+            test_size=args.test_size,
+            split_seed=args.split_seed,
+            max_path_distance=args.max_path_distance,
+            lmdb_map_size_gb=args.lmdb_map_size_gb,
+            commit_every=args.commit_every,
+            split_manifest_path=args.split_manifest_path,
+            graph_shard_max_gb=args.graph_shard_max_gb,
+        )
+        print(f"DataStore V2 build ready: {build_path}")
+        raise SystemExit(0)
     preprocess_and_save(
         args.raw_csv_path,
         args.task_list,
