@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import json
 import os
 import warnings
@@ -391,44 +392,47 @@ if __name__ == "__main__":
         default_priority = list(HUMAN_TARGET_TASKS)
     else:
         default_priority = []
-    if args.build_datastore_v2:
-        if args.plan_split_only:
-            import json
+    if args.plan_split_only:
+        if args.build_datastore_v2:
+            raise SystemExit(
+                "--plan_split_only plans the split only; drop --build_datastore_v2 "
+                "here, then pass the approved manifest to --build_datastore_v2."
+            )
+        import json
 
-            manifest, report = plan_toxacute_split(
-                args.raw_csv_path,
-                task_names=args.task_list,
-                splitting=args.splitting,
-                valid_size=args.valid_size,
-                calibration_size=args.calibration_size,
-                test_size=args.test_size,
-                split_seed=args.split_seed,
-                conformal_alpha=args.conformal_alpha,
-                conformal_scope=args.conformal_scope,
-                priority_task_names=default_priority,
-                conformal_task_names=(
-                    list(HUMAN_TARGET_TASKS)
-                    if args.conformal_scope == "human3"
-                    else None
-                ),
-                num_candidates=args.split_num_candidates,
-                oversized_eval_fraction=args.oversized_eval_fraction,
-                min_priority_eval_count=args.min_priority_eval_count,
-            )
-            output_manifest = Path(args.split_manifest_path or "artifacts/split_manifest_v3.json")
-            output_manifest.parent.mkdir(parents=True, exist_ok=True)
-            write_manifest(manifest, output_manifest)
-            report_path = output_manifest.with_suffix(".report.json")
-            report_path.write_text(
-                json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
-            print(f"Planned split manifest written: {output_manifest}")
-            print(f"Split report written: {report_path}")
-            print(f"Status: {report['status']}")
-            for failure in report["hard_constraint_failures"]:
-                print(f"  HARD-FAIL {failure}")
-            raise SystemExit(0 if report["status"] == "PASS" else 1)
+        manifest, report = plan_toxacute_split(
+            args.raw_csv_path,
+            task_names=args.task_list,
+            splitting=args.splitting,
+            valid_size=args.valid_size,
+            calibration_size=args.calibration_size,
+            test_size=args.test_size,
+            split_seed=args.split_seed,
+            conformal_alpha=args.conformal_alpha,
+            conformal_scope=args.conformal_scope,
+            priority_task_names=default_priority,
+            conformal_task_names=(
+                list(HUMAN_TARGET_TASKS) if args.conformal_scope == "human3" else None
+            ),
+            num_candidates=args.split_num_candidates,
+            oversized_eval_fraction=args.oversized_eval_fraction,
+            min_priority_eval_count=args.min_priority_eval_count,
+        )
+        output_manifest = Path(args.split_manifest_path or "artifacts/split_manifest_v3.json")
+        output_manifest.parent.mkdir(parents=True, exist_ok=True)
+        write_manifest(manifest, output_manifest)
+        report_path = output_manifest.with_suffix(".report.json")
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        print(f"Planned split manifest written: {output_manifest}")
+        print(f"Split report written: {report_path}")
+        print(f"Status: {report['status']}")
+        for failure in report["hard_constraint_failures"]:
+            print(f"  HARD-FAIL {failure}")
+        raise SystemExit(0 if report["status"] == "PASS" else 1)
+    if args.build_datastore_v2:
         build_path = build_datastore_v2(
             args.raw_csv_path,
             args.data_store_dir,
