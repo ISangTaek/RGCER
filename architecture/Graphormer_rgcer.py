@@ -173,12 +173,17 @@ class Graphormer_rgcer(AbsArchitecture):
         return getattr(self.decoders[task], "mode", self.prediction_mode)
 
     def _response_profile(self, h):
-        detached_h = h.detach()
-        responses = []
-        for task in self.task_name:
-            raw = self.decoders[task](detached_h)
-            responses.append(point_from_raw(raw, self._head_mode(task)).detach())
-        return torch.stack(responses, dim=1)
+        # Review §25-28: the router consumes these preliminary responses as
+        # routing evidence, so they must be deterministic even in train mode
+        # (heads called with deterministic=True pin their dropout off) and
+        # must never feed gradients back into the source heads or backbone.
+        with torch.no_grad():
+            detached_h = h.detach()
+            responses = []
+            for task in self.task_name:
+                raw = self.decoders[task](detached_h, deterministic=True)
+                responses.append(point_from_raw(raw, self._head_mode(task)))
+            return torch.stack(responses, dim=1)
 
     @staticmethod
     def _decoded_diagnostics(base_decoded, route_decoded, final_decoded):
