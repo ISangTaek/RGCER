@@ -706,6 +706,312 @@ def _write_json(path: Path, payload: Mapping | Sequence) -> None:
     )
 
 
+def scan_chemistry(raw_csv_path: str | Path, task_names: Sequence[str] | str | None = None):
+    """Parse the raw CSV and build per-row chemistry metadata + label matrix.
+
+    The scan uses exactly the same RDKit canonicalization as the graph
+    builder, so the sample set planned here is the sample set that will be
+    serialized.  No graphs are constructed at this stage.
+    """
+
+    import pandas as pd
+
+    from preprocess_data import _records_from_dataframe
+
+    raw_csv_path = Path(raw_csv_path)
+    if not raw_csv_path.exists():
+        raise FileNotFoundError(f"Raw CSV data file not found: {raw_csv_path}")
+    dataframe = pd.read_csv(raw_csv_path)
+    tasks = _task_names_from_input(dataframe, task_names)
+    records, errors = _records_from_dataframe(dataframe)
+    if not records:
+        raise ValueError("No valid SMILES records found in the raw CSV")
+    label_presence = np.zeros((len(records), len(tasks)), dtype=np.int64)
+    for row_position, record in enumerate(records):
+        values = dataframe.iloc[int(record["row_index"])]
+        for task_index, task_name in enumerate(tasks):
+            if _is_valid_label(values[task_name]):
+                label_presence[row_position, task_index] = 1
+    return {
+        "dataframe": dataframe,
+        "tasks": tasks,
+        "records": records,
+        "errors": errors,
+        "label_presence": label_presence,
+        "raw_csv_sha256": sha256_file(raw_csv_path),
+    }
+
+
+def _split_report(
+    manifest: Mapping,
+    *,
+    num_samples: int,
+    parse_failures: int,
+    raw_csv_sha256: str,
+    labels_presence: np.ndarray,
+    task_names: Sequence[str],
+    priority_task_names: Sequence[str],
+    conformal_task_names: Sequence[str],
+    conformal_alpha: float,
+    splitting: str = "scaffold",
+) -> dict:
+    """Aggregate §32 split-report fields from a freshly planned manifest.
+
+    Scale-dependent hard rules (dominance, acyclic eval coverage, priority
+    and conformal floors) apply to formal scaffold runs only; random splits
+    and toy corpora report diagnostics without failing.
+    """
+
+    from conformal import minimum_calibration_size
+    from split_manifest import _MIN_EVAL_TARGET_FOR_DOMINANCE_RULE
+
+    smallest_eval_target = min(
+        (float((manifest.get("ratios") or {}).get(name, 0.0)) * num_samples
+         for name in ("validation", "calibration", "test")),
+        default=0.0,
+    )
+    scale_rules_apply = splitting == "scaffold" and (
+        smallest_eval_target >= _MIN_EVAL_TARGET_FOR_DOMINANCE_RULE
+    )
+    hard_rules_apply = splitting == "scaffold"
+
+    records = manifest["records"]
+    ratios = manifest.get("ratios", {})
+    counts: dict[str, int] = {name: 0 for name in SPLIT_NAMES}
+    acyclic: dict[str, int] = {name: 0 for name in SPLIT_NAMES}
+    group_totals: dict[str, dict[str, int]] = {name: {} for name in SPLIT_NAMES}
+
+    for record in records:
+        split_name = str(record["split"])
+        counts[split_name] += 1
+        scaffold = str(record.get("scaffold") or "")
+        if scaffold == "__ACYCLIC__":
+            acyclic[split_name] += 1
+        key = str(record.get("split_group") or record.get("canonical_smiles"))
+        group_totals[split_name][key] = group_totals[split_name].get(key, 0) + 1
+
+    def label_count(split_name: str, task_name: str) -> int:
+        column = task_names.index(task_name)
+        return sum(
+            int(labels_presence[position, column])
+            for position, record in enumerate(records)
+            if str(record["split"]) == split_name
+        )
+
+    human3_counts = {
+        split_name: {
+            task: label_count(split_name, task)
+            for task in priority_task_names
+            if task in task_names
+        }
+        for split_name in SPLIT_NAMES
+    }
+    conformal_counts = {
+        "calibration": {
+            task: label_count("calibration", task)
+            for task in conformal_task_names
+            if task in task_names
+        }
+    }
+
+    largest_group_by_split = {}
+    for split_name in SPLIT_NAMES:
+        placed = group_totals[split_name]
+        if not placed:
+            largest_group_by_split[split_name] = None
+            continue
+        largest_key = max(placed, key=lambda k: placed[k])
+        largest_group_by_split[split_name] = {
+            "key": largest_key,
+            "size": placed[largest_key],
+            "fraction": round(placed[largest_key] / max(counts[split_name], 1), 4),
+        }
+
+    minimum_calibration = minimum_calibration_size(conformal_alpha)
+    hard_failures: list[str] = []
+    if hard_rules_apply:
+        for split_name in ("validation", "calibration", "test"):
+            if float(ratios.get(split_name, 0.0)) <= 0:
+                continue
+            if counts[split_name] == 0:
+                hard_failures.append(f"FAIL_EMPTY_SPLIT:{split_name}")
+            total_acyclic = sum(acyclic.values())
+            if total_acyclic >= 100 and acyclic[split_name] == 0:
+                hard_failures.append(f"FAIL_ACYCLIC_MISSING_EVAL:{split_name}")
+            largest = largest_group_by_split.get(split_name)
+            if largest and scale_rules_apply and largest["fraction"] >= 0.50:
+                hard_failures.append(
+                    f"FAIL_EVAL_GROUP_DOMINANCE:{split_name}:{largest['key']}={largest['fraction']:.2f}"
+                )
+        for task in priority_task_names:
+            if task not in task_names:
+                continue
+            validation_count = human3_counts.get("validation", {}).get(task, 0)
+            test_count = human3_counts.get("test", {}).get(task, 0)
+            if validation_count < 10 or test_count < 10:
+                hard_failures.append(
+                    f"FAIL_PRIORITY_COVERAGE:task={task}:validation={validation_count}:"
+                    f"test={test_count}:minimum=10"
+                )
+        for task, count in conformal_counts.get("calibration", {}).items():
+            if count < minimum_calibration:
+                hard_failures.append(
+                    f"FAIL_CONFORMAL_RANK:task={task}:calibration={count}:"
+                    f"minimum={minimum_calibration}"
+                )
+
+    low_calibration_under_30 = sorted(
+        task for task in priority_task_names + list(conformal_task_names)
+        if task in task_names
+        and 0 < label_count("calibration", task) < 30
+    )
+    return {
+        "manifest_version": int(manifest.get("manifest_version", MANIFEST_VERSION)),
+        "raw_csv_sha256": raw_csv_sha256,
+        "valid_molecules": num_samples,
+        "parse_failures": parse_failures,
+        "split_counts": counts,
+        "split_ratios": {
+            name: round(counts[name] / max(num_samples, 1), 6) for name in SPLIT_NAMES
+        },
+        "acyclic_by_split": acyclic,
+        "largest_group_by_split": largest_group_by_split,
+        "human3_counts": human3_counts,
+        "minimum_calibration_required": minimum_calibration,
+        "conformal_scope_thresholds": {"stability_warning": 30},
+        "conformal_alpha": float(conformal_alpha),
+        "conformal_counts": conformal_counts,
+        "low_calibration_under_30": low_calibration_under_30,
+        "hard_constraint_failures": hard_failures,
+        "status": "PASS" if not hard_failures else "FAIL",
+    }
+
+
+def plan_toxacute_split(
+    raw_csv_path: str | Path,
+    *,
+    task_names: Sequence[str] | str | None = None,
+    splitting: str = "scaffold",
+    valid_size: float = 0.1,
+    calibration_size: float = 0.1,
+    test_size: float = 0.1,
+    split_seed: int = 42,
+    conformal_alpha: float = 0.10,
+    conformal_scope: str = "human3",
+    priority_task_names: Sequence[str] | None = None,
+    conformal_task_names: Sequence[str] | None = None,
+    num_candidates: int = 64,
+    oversized_eval_fraction: float = 0.5,
+    min_priority_eval_count: int = 10,
+) -> tuple[dict, dict]:
+    """Plan a Manifest-V3 split without touching any LMDB storage."""
+
+    from split_manifest import create_split_manifest
+
+    ratios = {
+        "train": 1.0 - float(valid_size) - float(calibration_size) - float(test_size),
+        "validation": float(valid_size),
+        "calibration": float(calibration_size),
+        "test": float(test_size),
+    }
+    scan = scan_chemistry(raw_csv_path, task_names)
+    manifest = create_split_manifest(
+        scan["records"],
+        splitting=splitting,
+        ratios=ratios,
+        seed=int(split_seed),
+        task_names=scan["tasks"],
+        label_presence=scan["label_presence"],
+        priority_task_names=list(priority_task_names or []),
+        conformal_task_names=list(conformal_task_names or []),
+        conformal_alpha=float(conformal_alpha),
+        conformal_scope=conformal_scope,
+        num_candidates=int(num_candidates),
+        oversized_eval_fraction=float(oversized_eval_fraction),
+        min_priority_eval_count=int(min_priority_eval_count),
+        source_csv_sha256=scan["raw_csv_sha256"],
+    )
+    report = _split_report(
+        manifest,
+        num_samples=len(scan["records"]),
+        parse_failures=len(scan["errors"]),
+        raw_csv_sha256=scan["raw_csv_sha256"],
+        labels_presence=scan["label_presence"],
+        task_names=scan["tasks"],
+        priority_task_names=list(priority_task_names or []),
+        conformal_task_names=list(conformal_task_names or []),
+        conformal_alpha=float(conformal_alpha),
+        splitting=splitting,
+    )
+    return manifest, report
+
+
+def _verify_approved_manifest(
+    manifest: Mapping,
+    records: Sequence[Mapping],
+    *,
+    raw_csv_sha256: str,
+    splitting: str,
+    split_seed: int,
+    ratios: Mapping[str, float],
+) -> None:
+    """Lock an externally approved v3 manifest to this exact chemistry (§33-34)."""
+
+    if int(manifest.get("manifest_version", 1)) != MANIFEST_VERSION:
+        raise ValueError(
+            f"Approved split manifest must be version {MANIFEST_VERSION}; "
+            f"found {manifest.get('manifest_version')!r} — regenerate it with "
+            "--plan_split_only"
+        )
+    algorithm = manifest.get("split_algorithm")
+    known = {"constrained_scaffold_v3", "canonical_size_greedy_v1"}
+    if splitting == "scaffold" and algorithm != "constrained_scaffold_v3":
+        raise ValueError(
+            f"Approved scaffold manifest must use split_algorithm="
+            f"'constrained_scaffold_v3'; found {algorithm!r}"
+        )
+    stored_sha = str(manifest.get("source_csv_sha256") or "")
+    if stored_sha != raw_csv_sha256:
+        raise ValueError(
+            "Approved split manifest was generated from a different CSV "
+            f"(source_csv_sha256 mismatch: manifest={stored_sha[:12]}…, csv={raw_csv_sha256[:12]}…)"
+        )
+    if manifest.get("splitting") != splitting:
+        raise ValueError("Approved split manifest splitting does not match the requested splitting")
+    if int(manifest.get("seed")) != int(split_seed):
+        raise ValueError("Approved split manifest seed does not match split_seed")
+    for name, expected in ratios.items():
+        actual = float((manifest.get("ratios") or {}).get(name, np.nan))
+        if not np.isclose(actual, expected):
+            raise ValueError(f"Approved split ratio for {name} does not match requested configuration")
+
+    identity_by_id = {str(record["sample_id"]): record for record in records}
+    mismatches: list[str] = []
+    for entry in manifest.get("records", []):
+        sample_id = str(entry.get("sample_id"))
+        current = identity_by_id.get(sample_id)
+        if current is None:
+            mismatches.append(f"{sample_id}: absent from CSV")
+            continue
+        for field in ("row_index", "canonical_smiles", "scaffold"):
+            expected_value = current.get(field)
+            stored_value = entry.get(field)
+            if field == "row_index":
+                expected_value, stored_value = int(expected_value), int(stored_value)
+            else:
+                expected_value, stored_value = str(expected_value), str(stored_value)
+            if expected_value != stored_value:
+                mismatches.append(
+                    f"{sample_id}.{field}: manifest={stored_value!r} csv={expected_value!r}"
+                )
+    if len(mismatches) >= 6:
+        mismatches = mismatches[:5] + [f"...and {len(mismatches) - 5} more"]
+    if mismatches:
+        raise ValueError(
+            "Approved split manifest chemistry does not match the CSV: " + "; ".join(mismatches)
+        )
+
+
 def build_datastore_v2(
     raw_csv_path: str | Path,
     data_store_dir: str | Path,
@@ -721,6 +1027,13 @@ def build_datastore_v2(
     commit_every: int = 512,
     split_manifest_path: str | Path | None = None,
     graph_shard_max_gb: float = DEFAULT_GRAPH_SHARD_MAX_GB,
+    conformal_alpha: float = 0.10,
+    conformal_scope: str = "human3",
+    priority_task_names: Sequence[str] | None = None,
+    conformal_task_names: Sequence[str] | None = None,
+    num_candidates: int = 64,
+    oversized_eval_fraction: float = 0.5,
+    min_priority_eval_count: int = 10,
 ) -> Path:
     """Build a new V2 artifact and atomically activate it via ``CURRENT``.
 
@@ -749,13 +1062,72 @@ def build_datastore_v2(
     if ratios["train"] <= 0 or any(value < 0 for value in ratios.values()):
         raise ValueError("train/validation/calibration/test ratios are invalid")
 
-    import pandas as pd
+    import pandas as pd  # noqa: F401  (part of the public data contract)
 
-    from preprocess_data import get_graph_features_from_smiles
+    # ---- Phase A: chemistry scan + split planning BEFORE any LMDB I/O -----
+    scan = scan_chemistry(raw_csv_path, task_names)
+    dataframe = scan["dataframe"]
+    tasks = scan["tasks"]
+    chemistry_records = scan["records"]
+    raw_sha256 = scan["raw_csv_sha256"]
 
-    dataframe = pd.read_csv(raw_csv_path)
-    tasks = _task_names_from_input(dataframe, task_names)
-    raw_sha256 = sha256_file(raw_csv_path)
+    if split_manifest_path is None:
+        manifest = create_split_manifest(
+            [dict(record) for record in chemistry_records],
+            splitting=splitting,
+            ratios=ratios,
+            seed=int(split_seed),
+            task_names=tasks,
+            label_presence=scan["label_presence"],
+            priority_task_names=list(priority_task_names or []),
+            conformal_task_names=list(conformal_task_names or []),
+            conformal_alpha=float(conformal_alpha),
+            conformal_scope=conformal_scope,
+            num_candidates=int(num_candidates),
+            oversized_eval_fraction=float(oversized_eval_fraction),
+            min_priority_eval_count=int(min_priority_eval_count),
+            source_csv_sha256=raw_sha256,
+        )
+        split_report = _split_report(
+            manifest,
+            num_samples=len(chemistry_records),
+            parse_failures=len(scan["errors"]),
+            raw_csv_sha256=raw_sha256,
+            labels_presence=scan["label_presence"],
+            task_names=tasks,
+            priority_task_names=list(priority_task_names or []),
+            conformal_task_names=list(conformal_task_names or []),
+            conformal_alpha=float(conformal_alpha),
+            splitting=splitting,
+        )
+    else:
+        manifest = load_manifest(split_manifest_path)
+        _verify_approved_manifest(
+            manifest,
+            chemistry_records,
+            raw_csv_sha256=raw_sha256,
+            splitting=splitting,
+            split_seed=int(split_seed),
+            ratios=ratios,
+        )
+        split_report = _split_report(
+            manifest,
+            num_samples=len(chemistry_records),
+            parse_failures=len(scan["errors"]),
+            raw_csv_sha256=raw_sha256,
+            labels_presence=scan["label_presence"],
+            task_names=tasks,
+            priority_task_names=list(priority_task_names or []),
+            conformal_task_names=list(conformal_task_names or []),
+            conformal_alpha=float(conformal_alpha),
+            splitting=splitting,
+        )
+    if split_report.get("hard_constraint_failures"):
+        raise ValueError(
+            "Planned split violates formal hard constraints; refusing to build "
+            f"LMDB shards: {split_report['hard_constraint_failures']}"
+        )
+
     root.mkdir(parents=True, exist_ok=True)
     builds_root = root / "builds"
     builds_root.mkdir(parents=True, exist_ok=True)
@@ -763,37 +1135,40 @@ def build_datastore_v2(
     temp_build.mkdir(parents=True, exist_ok=False)
     active_writer: _GraphShardWriter | None = None
     try:
-        # Graph tensors are serialized and committed straight into bounded
-        # LMDB shards as rows are processed; only lightweight metadata stays
-        # in RAM, so the full graph list never exists in memory at once.
-        shards_root = temp_build / GRAPH_SHARD_DIRNAME
-        initial_map_size = min(
-            max(8 << 20, int(float(lmdb_map_size_gb) * 1024**3)),
-            shard_max_bytes + _LMDB_OVERHEAD_BYTES,
-        )
+        # ---- Phase B: stream graphs into bounded LMDB shards --------------
+        from preprocess_data import get_graph_features_from_smiles
+
+        raw_smiles_by_row = {
+            int(record["row_index"]): str(record["raw_smiles"]) for record in chemistry_records
+        }
+        sample_ids_by_row = {
+            int(record["row_index"]): str(record["sample_id"]) for record in chemistry_records
+        }
 
         def _open_writer(position: int) -> _GraphShardWriter:
             return _GraphShardWriter(
-                shards_root / shard_name(position),
+                temp_build / GRAPH_SHARD_DIRNAME / shard_name(position),
                 max_bytes=shard_max_bytes,
-                initial_map_size=initial_map_size,
+                initial_map_size=min(
+                    max(8 << 20, int(float(lmdb_map_size_gb) * 1024**3)),
+                    shard_max_bytes + _LMDB_OVERHEAD_BYTES,
+                ),
             )
 
         manifest_records = []
-        errors = []
+        errors = list(scan["errors"])
         shard_entries: list[dict] = []
         shard_position = 0
         shard_start_index = 0
         active_writer = _open_writer(shard_position)
         for row_index, row in dataframe.iterrows():
-            raw_smiles = row.get("smiles", row.get("SMILES"))
-            if raw_smiles is None or (isinstance(raw_smiles, float) and np.isnan(raw_smiles)):
-                errors.append({"row_index": int(row_index), "error": "missing_smiles"})
-                continue
+            raw_smiles = raw_smiles_by_row.get(int(row_index))
+            if raw_smiles is None:
+                continue  # already captured as a parse error during the scan
             try:
                 graph = get_graph_features_from_smiles(
-                    str(raw_smiles),
-                    sample_id=f"row_{int(row_index)}",
+                    raw_smiles,
+                    sample_id=sample_ids_by_row[int(row_index)],
                     max_path_distance=int(max_path_distance),
                 )
             except Exception as exc:
@@ -846,31 +1221,17 @@ def build_datastore_v2(
         if sum(entry["entries"] for entry in validated_shards) != len(manifest_records):
             raise ValueError("Graph shard table does not tile every written record")
 
-        if split_manifest_path is None:
-            manifest = create_split_manifest(
-                manifest_records,
-                splitting=splitting,
-                ratios=ratios,
-                seed=int(split_seed),
+        # The split was planned on the full parsed chemistry set; losing rows
+        # during graph construction would invalidate the planned assignment.
+        planned_ids = {str(r["sample_id"]) for r in chemistry_records}
+        built_ids = {str(r["sample_id"]) for r in manifest_records}
+        if built_ids != planned_ids:
+            lost = sorted(planned_ids - built_ids)
+            raise ValueError(
+                "Graph build lost rows relative to the planned chemistry set "
+                f"(e.g. {lost[:5]}); refusing to publish a partially filled store"
             )
-        else:
-            manifest = load_manifest(split_manifest_path)
-            if int(manifest.get("manifest_version", 1)) != MANIFEST_VERSION:
-                raise ValueError(
-                    f"Approved split manifest must be version {MANIFEST_VERSION}; "
-                    f"found {manifest.get('manifest_version')!r} — regenerate it with "
-                    "the current preprocessing code"
-                )
-            if manifest.get("splitting") != splitting:
-                raise ValueError("Approved split manifest splitting does not match the requested splitting")
-            if int(manifest.get("seed")) != int(split_seed):
-                raise ValueError("Approved split manifest seed does not match split_seed")
-            actual_ratios = manifest.get("ratios", {})
-            for name, expected in ratios.items():
-                if not np.isclose(float(actual_ratios.get(name, np.nan)), expected):
-                    raise ValueError(f"Approved split ratio for {name} does not match requested configuration")
-            _split_codes_for_manifest(manifest, [record["sample_id"] for record in manifest_records])
-        validate_manifest(manifest)
+
         split_codes = _split_codes_for_manifest(manifest, [record["sample_id"] for record in manifest_records])
 
         labels = np.full((len(manifest_records), len(tasks)), np.nan, dtype=np.float32)
@@ -892,6 +1253,7 @@ def build_datastore_v2(
             num_nodes=np.asarray([int(record["num_nodes"]) for record in manifest_records], dtype=np.int64),
         )
         write_manifest(manifest, temp_build / "split_manifest.json")
+        _write_json(temp_build / "split_report.json", split_report)
         _write_json(temp_build / "preprocess_errors.json", errors)
 
         task_stats = {}
@@ -966,6 +1328,9 @@ def build_datastore_v2(
             "split_seed": int(split_seed),
             "split_ratios": ratios,
             "split_manifest_hash": split_hash,
+            "priority_task_names": list(priority_task_names or []),
+            "conformal_scope": conformal_scope,
+            "conformal_alpha": float(conformal_alpha),
             "lmdb_entries": len(manifest_records),
             "labels_shape": list(labels.shape),
             "build_complete": True,

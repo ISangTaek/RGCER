@@ -66,6 +66,23 @@ def _manifest_distribution_stats(manifest: dict) -> dict:
     )
     del canonical_counts[""]
 
+    largest_group_by_split: dict[str, dict] = {}
+    for split_name in ("validation", "calibration", "test"):
+        placed = Counter()
+        for record in records:
+            if record.get("split") != split_name:
+                continue
+            key = str(record.get("split_group") or record.get("canonical_smiles") or record["sample_id"])
+            placed[key] += 1
+        if not placed:
+            continue
+        largest_key, largest_size = max(placed.items(), key=lambda item: item[1])
+        largest_group_by_split[split_name] = {
+            "key": largest_key,
+            "size": int(largest_size),
+            "fraction": round(largest_size / max(split_counts.get(split_name, 0), 1), 4),
+        }
+
     return {
         "actual_split_counts": {name: int(split_counts.get(name, 0)) for name in SPLIT_NAMES},
         "actual_split_ratios": actual_ratios,
@@ -80,6 +97,7 @@ def _manifest_distribution_stats(manifest: dict) -> dict:
                 largest_in_split / max(split_counts.get(largest_group_split, 0), 1), 4
             ),
         },
+        "largest_group_by_split": largest_group_by_split,
         "num_unique_canonical_smiles": len(canonical_counts),
         "num_duplicate_canonical_groups": sum(
             1 for count in canonical_counts.values() if count > 1
@@ -91,7 +109,12 @@ def _manifest_distribution_stats(manifest: dict) -> dict:
 
 
 def _acyclic_concentration_error(distribution: Mapping) -> str | None:
-    """Formal scaffold runs must not strand acyclic chemistry out of evals."""
+    """Formal scaffold runs must not strand acyclic chemistry out of evals.
+
+    Review §37 upgrades the old "two missing splits" rule: with a meaningful
+    acyclic population, *any* evaluation split without acyclic chemistry is
+    a hard failure.
+    """
 
     if int(distribution.get("acyclic_count", 0)) < 100:
         return None
@@ -101,14 +124,57 @@ def _acyclic_concentration_error(distribution: Mapping) -> str | None:
         for name in ("validation", "calibration", "test")
         if by_split.get(name, 0) == 0
     ]
-    if len(missing) >= 2:
+    if missing:
         present = [name for name in SPLIT_NAMES if by_split.get(name, 0)]
         return (
-            f"scaffold split isolates {distribution['acyclic_count']} acyclic molecules "
-            f"into {', '.join(present)}; {', '.join(missing)} never see acyclic chemistry "
-            "— rebuild with the v2 per-canonical acyclic grouping"
+            f"FAIL_ACYCLIC_MISSING_EVAL: {distribution['acyclic_count']} acyclic "
+            f"molecules never reach {', '.join(missing)} "
+            f"(present in {', '.join(present) or 'nowhere'})"
         )
     return None
+
+
+def _eval_dominance_errors(distribution: Mapping) -> list[str]:
+    """Any evaluation split whose largest group owns >=50% is a hard failure."""
+
+    failures = []
+    largest = distribution.get("largest_group_by_split") or {}
+    for split_name in ("validation", "calibration", "test"):
+        entry = largest.get(split_name)
+        if not entry:
+            continue
+        if float(entry.get("fraction", 0.0)) >= 0.50:
+            failures.append(
+                f"FAIL_EVAL_GROUP_DOMINANCE:{split_name}:{entry.get('key')}="
+                f"{float(entry['fraction']):.2f}"
+            )
+    return failures
+
+
+def _conformal_rank_failures(
+    task_rows: Sequence[Mapping],
+    *,
+    conformal_task_names: Sequence[str],
+    conformal_alpha: float,
+) -> list[str]:
+    """Split-conformal finite-rank floors per scoped endpoint (review §37)."""
+
+    if not conformal_task_names:
+        return []
+    from conformal import minimum_calibration_size
+
+    minimum = minimum_calibration_size(conformal_alpha)
+    counts = {row["task"]: int(row.get("calibration", 0)) for row in task_rows}
+    failures = []
+    for task in conformal_task_names:
+        count = counts.get(task)
+        if count is None:
+            continue
+        if count < minimum:
+            failures.append(
+                f"FAIL_CONFORMAL_RANK:{task}:calibration={count}:minimum={minimum}"
+            )
+    return failures
 
 
 def run_datastore_preflight(
@@ -119,14 +185,30 @@ def run_datastore_preflight(
     min_calibration_size: int = 30,
     require_calibration: bool = True,
     ratio_tolerance_pct: float = 5.0,
+    conformal_alpha: float | None = None,
+    conformal_task_names=None,
+    priority_task_names=None,
 ) -> dict:
-    """Validate V2 task coverage before a model or DataLoader is created."""
+    """Validate V2 task coverage before a model or DataLoader is created.
+
+    Alpha-aware calibration rules (review §37): scoped endpoints below
+    ``minimum_calibration_size(alpha)`` are hard failures; counts between the
+    floor and the 30-sample stability threshold only warn.
+    """
+
+    from conformal import minimum_calibration_size
+
+    scoped_conformal = [str(name) for name in (conformal_task_names or [])]
+    priority_names = [str(name) for name in (priority_task_names or [])]
 
     store = store_or_root if isinstance(store_or_root, ToxAcuteDataStore) else ToxAcuteDataStore.resolve(store_or_root)
     try:
         store.validate(strict=False, expected_task_names=task_names)
         rows = []
-        failures = []
+        failures: list[str] = []
+        minimum_rank = (
+            minimum_calibration_size(conformal_alpha) if conformal_alpha else None
+        )
         for task_name in task_names:
             all_indices = store.get_task_indices(task_name, split=None)
             counts = {
@@ -139,7 +221,9 @@ def run_datastore_preflight(
             if max_nodes_filter is not None:
                 excluded_nodes = int(np.sum(store.num_nodes[all_indices] > int(max_nodes_filter)))
             status = "OK"
-            if counts["train"] == 0:
+            if task_name in scoped_conformal and minimum_rank is not None and counts["calibration"] < minimum_rank:
+                status = f"FAIL_CONFORMAL_RANK"
+            elif counts["train"] == 0:
                 status = "FAIL_EMPTY_TRAIN"
             elif counts["validation"] == 0:
                 status = "FAIL_EMPTY_VAL"
@@ -147,22 +231,22 @@ def run_datastore_preflight(
                 status = "FAIL_EMPTY_CAL"
             elif counts["test"] == 0:
                 status = "FAIL_EMPTY_TEST"
+            elif task_name in scoped_conformal and counts["calibration"] < int(min_calibration_size):
+                status = "LOW_CALIBRATION_STABILITY"
             elif counts["calibration"] < int(min_calibration_size):
                 status = "LOW_CALIBRATION"
             if status.startswith("FAIL_"):
-                failures.append((task_name, status))
+                failures.append(f"{task_name}={status}")
             rows.append(
                 {
                     "task": task_name,
                     **counts,
                     "excluded_nodes": excluded_nodes,
                     "low_calibration": counts["calibration"] < int(min_calibration_size),
+                    "conformal_scoped": task_name in scoped_conformal,
                     "status": status,
                 }
             )
-        if failures:
-            formatted = ", ".join(f"{task}={status}" for task, status in failures)
-            raise DataPreflightError(f"DataStore V2 formal split preflight failed: {formatted}")
         metadata = store.metadata
         report_warnings: list[str] = []
 
@@ -177,20 +261,32 @@ def run_datastore_preflight(
                         f"actual {split_name} share deviates by {deviation:+.1f}pp "
                         f"from the configured ratio ({distribution['actual_split_ratios'][split_name]:.3f})"
                     )
-            acyclic_by_split = distribution.get("acyclic_by_split", {})
-            concentration_error = _acyclic_concentration_error(distribution)
-            if concentration_error:
-                raise DataPreflightError(concentration_error)
-            missing_evals = [
-                name
-                for name in ("validation", "calibration", "test")
-                if acyclic_by_split.get(name, 0) == 0
-            ]
-            if missing_evals and int(distribution.get("acyclic_count", 0)) >= 100:
-                report_warnings.append(
-                    f"acyclic chemistry absent from {', '.join(missing_evals)} "
-                    f"({distribution['acyclic_count']} acyclic molecules total)"
-                )
+        concentration_error = _acyclic_concentration_error(distribution)
+        if concentration_error:
+            failures.append(concentration_error)
+        failures.extend(_eval_dominance_errors(distribution))
+        failures.extend(
+            _conformal_rank_failures(
+                rows,
+                conformal_task_names=scoped_conformal,
+                conformal_alpha=conformal_alpha or 0.10,
+            )
+        )
+        if priority_names:
+            per_task = {row["task"]: row for row in rows}
+            for task in priority_names:
+                entry = per_task.get(task)
+                if entry is None:
+                    continue
+                if entry["validation"] < 10 or entry["test"] < 10:
+                    failures.append(
+                        f"FAIL_PRIORITY_COVERAGE:{task}:validation={entry['validation']}:"
+                        f"test={entry['test']}:minimum=10"
+                    )
+        if failures:
+            raise DataPreflightError(
+                "DataStore V2 formal preflight failed (" + "; ".join(failures) + ")"
+            )
         return {
             "format": "toxacute_datastore",
             "format_version": 2,
@@ -201,6 +297,9 @@ def run_datastore_preflight(
             "feature_schema_version": metadata.get("feature_schema_version"),
             "graph_layout": metadata.get("graph_layout"),
             "max_path_distance": metadata.get("max_path_distance"),
+            "conformal_scope_tasks": scoped_conformal,
+            "conformal_alpha": conformal_alpha,
+            "priority_task_names": priority_names,
             "task_names": list(task_names),
             "max_nodes_filter": max_nodes_filter,
             **distribution,

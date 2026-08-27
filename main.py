@@ -138,6 +138,28 @@ def effective_prediction_mode(params):
     return requested
 
 
+def _priority_tasks(params, task_names):
+    """Endpoints the formal split/preflight must cover with human floors."""
+
+    if getattr(params, "conformal_scope", "human3") == "human3":
+        return [name for name in HUMAN_TARGET_TASKS if name in task_names]
+    return []
+
+
+def _conformal_scope_tasks(params, task_names):
+    """Endpoints that must reach the conformal finite-rank calibration floor."""
+
+    if not getattr(params, "fit_conformal", True):
+        return []
+    scope = getattr(params, "conformal_scope", "human3")
+    if scope == "human3":
+        return [name for name in HUMAN_TARGET_TASKS if name in task_names]
+    if scope == "all_tasks":
+        auxiliary = set(getattr(params, "auxiliary_task_names", []) or [])
+        return [name for name in task_names if name not in auxiliary]
+    raise ValueError(f"Unknown conformal_scope: {scope!r}")
+
+
 def task_names_for_params(params):
     if params.dataset == "toxacute":
         scopes = {"human3": HUMAN_TARGET_TASKS, "animal56": ANIMAL_SOURCE_TASKS, "all59": TOXACUTE_TASKS}
@@ -357,6 +379,11 @@ def main(params):
             max_nodes_filter=params.max_nodes_filter,
             min_calibration_size=params.min_calibration_size,
             require_calibration=bool(params.fit_conformal and effective_prediction_mode(params) == "quantile"),
+            conformal_alpha=(
+                params.conformal_alpha if params.fit_conformal else None
+            ),
+            conformal_task_names=_conformal_scope_tasks(params, formal_task_names),
+            priority_task_names=_priority_tasks(params, formal_task_names),
         )
         output_root = Path(params.save_path or ".")
         output_root.mkdir(parents=True, exist_ok=True)
@@ -397,6 +424,11 @@ def main(params):
                 require_calibration=bool(
                     params.fit_conformal and effective_prediction_mode(params) == "quantile"
                 ),
+                conformal_alpha=(
+                    params.conformal_alpha if params.fit_conformal else None
+                ),
+                conformal_task_names=_conformal_scope_tasks(params, formal_task_names),
+                priority_task_names=_priority_tasks(params, formal_task_names),
             )
             if params.save_path:
                 _write_json(Path(params.save_path) / "data_preflight.json", preflight)

@@ -29,7 +29,7 @@ from molecular_features import (
     scaffold_from_mol,
 )
 from split_manifest import create_split_manifest, write_manifest
-from toxacute_datastore import build_datastore_v2
+from toxacute_datastore import build_datastore_v2, plan_toxacute_split
 
 
 def one_of_k_encoding_unk(x, allowable_set):
@@ -365,8 +365,70 @@ if __name__ == "__main__":
         help="Rollover cap for each graph shard file; bounds the size of any "
         "single on-disk data file produced by the build.",
     )
+    parser.add_argument(
+        "--plan_split_only",
+        action="store_true",
+        help="Run the chemistry scan and Manifest-V3 planning (writing the "
+        "manifest + split report) WITHOUT building any LMDB storage. The "
+        "formal flow is: plan -> human review of split_report.json -> "
+        "--build_datastore_v2 --split_manifest_path <approved manifest>.",
+    )
+    parser.add_argument("--conformal_alpha", type=float, default=0.10)
+    parser.add_argument(
+        "--conformal_scope",
+        choices=["human3", "all_tasks"],
+        default="human3",
+        help="Endpoints that must satisfy the conformal calibration floor in "
+        "the planned split; recorded in the report and datastore metadata.",
+    )
+    parser.add_argument("--split_num_candidates", type=int, default=64)
+    parser.add_argument("--oversized_eval_fraction", type=float, default=0.5)
+    parser.add_argument("--min_priority_eval_count", type=int, default=10)
     args = parser.parse_args()
+    from architecture.toxacute_tasks import HUMAN_TARGET_TASKS
+
+    if args.conformal_scope == "human3":
+        default_priority = list(HUMAN_TARGET_TASKS)
+    else:
+        default_priority = []
     if args.build_datastore_v2:
+        if args.plan_split_only:
+            import json
+
+            manifest, report = plan_toxacute_split(
+                args.raw_csv_path,
+                task_names=args.task_list,
+                splitting=args.splitting,
+                valid_size=args.valid_size,
+                calibration_size=args.calibration_size,
+                test_size=args.test_size,
+                split_seed=args.split_seed,
+                conformal_alpha=args.conformal_alpha,
+                conformal_scope=args.conformal_scope,
+                priority_task_names=default_priority,
+                conformal_task_names=(
+                    list(HUMAN_TARGET_TASKS)
+                    if args.conformal_scope == "human3"
+                    else None
+                ),
+                num_candidates=args.split_num_candidates,
+                oversized_eval_fraction=args.oversized_eval_fraction,
+                min_priority_eval_count=args.min_priority_eval_count,
+            )
+            output_manifest = Path(args.split_manifest_path or "artifacts/split_manifest_v3.json")
+            output_manifest.parent.mkdir(parents=True, exist_ok=True)
+            write_manifest(manifest, output_manifest)
+            report_path = output_manifest.with_suffix(".report.json")
+            report_path.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            print(f"Planned split manifest written: {output_manifest}")
+            print(f"Split report written: {report_path}")
+            print(f"Status: {report['status']}")
+            for failure in report["hard_constraint_failures"]:
+                print(f"  HARD-FAIL {failure}")
+            raise SystemExit(0 if report["status"] == "PASS" else 1)
         build_path = build_datastore_v2(
             args.raw_csv_path,
             args.data_store_dir,
@@ -381,6 +443,13 @@ if __name__ == "__main__":
             commit_every=args.commit_every,
             split_manifest_path=args.split_manifest_path,
             graph_shard_max_gb=args.graph_shard_max_gb,
+            conformal_alpha=args.conformal_alpha,
+            conformal_scope=args.conformal_scope,
+            priority_task_names=default_priority,
+            conformal_task_names=list(HUMAN_TARGET_TASKS) if args.conformal_scope == "human3" else [],
+            num_candidates=args.split_num_candidates,
+            oversized_eval_fraction=args.oversized_eval_fraction,
+            min_priority_eval_count=args.min_priority_eval_count,
         )
         print(f"DataStore V2 build ready: {build_path}")
         raise SystemExit(0)

@@ -3,6 +3,8 @@
 from data_preflight import (
     DataPreflightError,
     _acyclic_concentration_error,
+    _conformal_rank_failures,
+    _eval_dominance_errors,
     _manifest_distribution_stats,
 )
 import pytest
@@ -90,10 +92,18 @@ def _distribution_with_acyclic(acyclic_by_split):
     }
 
 
-def test_acyclic_concentration_hard_fails_when_two_eval_splits_miss_acyclic():
-    distribution = _distribution_with_acyclic({"train": 150})
+def test_acyclic_concentration_hard_fails_when_any_eval_split_misses_acyclic():
+    """Review §37: with >=100 acyclic molecules, ANY missing eval split fails."""
+
+    double_missing = _distribution_with_acyclic({"train": 320})
+    error = _acyclic_concentration_error(double_missing)
+    assert error is not None and "FAIL_ACYCLIC_MISSING_EVAL" in error
     with pytest.raises(DataPreflightError, match="acyclic"):
-        raise DataPreflightError(_acyclic_concentration_error(distribution))
+        raise DataPreflightError(error)
+
+    single_missing = _distribution_with_acyclic({"train": 280, "validation": 15, "calibration": 5})
+    error_single = _acyclic_concentration_error(single_missing)
+    assert error_single is not None and "FAIL_ACYCLIC_MISSING_EVAL" in error_single
 
 
 def test_acyclic_concentration_allows_small_or_well_spread_sets():
@@ -101,16 +111,49 @@ def test_acyclic_concentration_allows_small_or_well_spread_sets():
     small = _distribution_with_acyclic({"train": 80})
     assert _acyclic_concentration_error(small) is None
 
-    spread = _distribution_with_acyclic({"train": 200, "validation": 30, "calibration": 25, "test": 40})
+    spread = _distribution_with_acyclic(
+        {"train": 200, "validation": 30, "calibration": 25, "test": 40}
+    )
     assert _acyclic_concentration_error(spread) is None
 
-    # Two missing eval splits hard-fail; a single one stays warning-level.
-    single_missing = _distribution_with_acyclic({"train": 280, "validation": 15, "calibration": 5})
-    assert _acyclic_concentration_error(single_missing) is None
 
-    double_missing = _distribution_with_acyclic({"train": 320})
-    error = _acyclic_concentration_error(double_missing)
-    assert error is not None and "acyclic" in error
+def test_eval_group_dominance_hard_failures():
+    dominated = {
+        "largest_group_by_split": {
+            "validation": {"key": "scaffold::c1ccccc1", "size": 90, "fraction": 0.95},
+            "calibration": {"key": "scaffold::SC1", "size": 3, "fraction": 0.12},
+            "test": {"key": "scaffold::SC2", "size": 4, "fraction": 0.10},
+        }
+    }
+    errors = _eval_dominance_errors(dominated)
+    assert len(errors) == 1 and "FAIL_EVAL_GROUP_DOMINANCE:validation" in errors[0]
+
+    healthy = {
+        "largest_group_by_split": {
+            name: {"key": f"k{name}", "size": 2, "fraction": 0.08}
+            for name in ("validation", "calibration", "test")
+        }
+    }
+    assert _eval_dominance_errors(healthy) == []
+
+
+def test_conformal_rank_failures_name_scoped_tasks():
+    from conformal import minimum_calibration_size
+
+    minimum = minimum_calibration_size(0.10)
+    rows = [
+        {"task": "human_oral_TDLo", "calibration": minimum - 1},
+        {"task": "women_oral_TDLo", "calibration": minimum},
+        {"task": "rat_oral_LD50", "calibration": 0},  # not scoped -> ignored
+    ]
+    failures = _conformal_rank_failures(
+        rows,
+        conformal_task_names=["human_oral_TDLo", "women_oral_TDLo"],
+        conformal_alpha=0.10,
+    )
+    assert len(failures) == 1
+    assert failures[0].startswith("FAIL_CONFORMAL_RANK:human_oral_TDLo")
+    assert f"minimum={minimum}" in failures[0]
 
 
 def test_concentration_rule_reads_nested_payload_format_used_in_reports():
