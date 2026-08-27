@@ -15,5 +15,7 @@ def test_schedule_uses_each_task_batch_once():
     trainer = Trainer.__new__(Trainer)
     trainer.task_name = ["a", "b", "c"]
     trainer.seed = 5
+    # Minimal fixture predates the sampling switch; pin the historical default.
+    trainer.args = SimpleNamespace(task_sampling="proportional")
     schedule = trainer._task_schedule({"a": SizedLoader(5), "b": SizedLoader(2), "c": SizedLoader(1)}, 0)
     assert {task: schedule.count(task) for task in trainer.task_name} == {"a": 5, "b": 2, "c": 1}

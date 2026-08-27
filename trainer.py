@@ -262,14 +262,58 @@ class Trainer:
         return result
 
     def _task_schedule(self, dataloaders_dict, epoch):
+        """Per-epoch task batch order (review §38-39).
+
+        Default ``proportional`` keeps the historical data-proportional
+        exposure so every baseline trains under the same schedule; the
+        recorded diagnostics make that bias visible instead of silent.
+        ``human_target_floor`` (ablation-only) additionally appends one full
+        extra pass of each human target loader.
+        """
+
         schedule = []
         for task in self.task_name:
             loader = dataloaders_dict.get(task)
             if loader is not None:
                 schedule.extend([task] * len(loader))
+        sampling = str(getattr(self.args, "task_sampling", "proportional") or "proportional")
+        if sampling == "human_target_floor":
+            for task in HUMAN_TARGET_TASKS:
+                if task not in self.task_name:
+                    continue
+                loader = dataloaders_dict.get(task)
+                if loader is not None and len(loader) > 0:
+                    schedule.extend([task] * len(loader))
+        elif sampling != "proportional":
+            raise ValueError(f"Unknown --task_sampling: {sampling!r}")
         rng = np.random.default_rng(self.seed + int(epoch))
         rng.shuffle(schedule)
         return list(schedule)
+
+    def _schedule_diagnostics(self, schedule, dataloaders_dict):
+        """Per-epoch exposure report so data-proportionality stays auditable."""
+
+        human_tasks = [task for task in HUMAN_TARGET_TASKS if task in self.task_name]
+        batches: dict[str, int] = {}
+        for task in schedule:
+            batches[task] = batches.get(task, 0) + 1
+        total_updates = max(len(schedule), 1)
+        fractions = {task: round(count / total_updates, 6) for task, count in sorted(batches.items())}
+        dataset_batches = {
+            task: len(loader)
+            for task in self.task_name
+            for loader in [dataloaders_dict.get(task)]
+            if loader is not None
+        }
+        human_batches = sum(batches.get(task, 0) for task in human_tasks)
+        return {
+            "task_batches": dict(sorted(batches.items())),
+            "loader_batches_per_pass": dataset_batches,
+            "fraction_of_updates": fractions,
+            "human3_fraction": round(human_batches / total_updates, 6),
+            "total_updates": total_updates,
+            "task_sampling": str(getattr(self.args, "task_sampling", "proportional")),
+        }
 
     def _loss(self, task, prediction, labels):
         loss_fn = self.task_dict[task]["loss_fn"]
@@ -511,6 +555,7 @@ class Trainer:
         self.model.train()
         self.loss_balancer.train()
         schedule = self._task_schedule(train_dataloaders_dict, epoch)
+        schedule_diagnostics = self._schedule_diagnostics(schedule, train_dataloaders_dict)
         self.schedule_usage = {task: 0 for task in self.task_name}
         self.training_cache = {}
         iterators = {
@@ -573,6 +618,8 @@ class Trainer:
         self.optimizer_updates += update_count
         result["updates"] = update_count
         result["schedule_usage"] = dict(self.schedule_usage)
+        schedule_diagnostics["completed_updates"] = update_count
+        result["schedule_diagnostics"] = schedule_diagnostics
         result["routing"] = self._routing_summary()
         return result
 
@@ -985,6 +1032,18 @@ class Trainer:
             "spatial_pos_max_clip": getattr(
                 self.args, "spatial_pos_clip", getattr(self.args, "spatial_pos_max_clip", 20)
             ),
+            # §42 provenance: behaviour-affecting sizes/rates that a
+            # state_dict alone cannot reveal on resume.
+            "hidden_dim": int(getattr(self.args, "hidden_dim", 0) or 0),
+            "a_layers": int(getattr(self.args, "a_layers", 0) or 0),
+            "a_heads": int(getattr(self.args, "a_heads", 0) or 0),
+            "mid_dim": int(getattr(self.args, "mid_dim", 0) or 0),
+            "head_hidden_dim": int(getattr(self.args, "head_hidden_dim", 0) or 0),
+            "head_dropout": float(getattr(self.args, "head_dropout", 0.0)),
+            "adapter_ratio": float(getattr(self.args, "adapter_ratio", 0.25)),
+            "response_hidden_dim": int(getattr(self.args, "response_hidden_dim", 0) or 0),
+            "task_sampling": str(getattr(self.args, "task_sampling", "proportional")),
+            "conformal_scope": self.conformal_scope,
             "router_top_k": getattr(self.args, "router_top_k", 0),
             "router_temperature": getattr(self.args, "router_temperature", 1.0),
             "exclude_target_from_sources": getattr(self.args, "exclude_target_from_sources", True),
@@ -1150,6 +1209,18 @@ class Trainer:
             "exclude_target_from_sources",
             "use_factorized_prompt",
             "spatial_pos_max_clip",
+            # §42 provenance: silent-training-behaviour knobs that would not
+            # surface as state_dict shape mismatches on resume.
+            "hidden_dim",
+            "a_layers",
+            "a_heads",
+            "mid_dim",
+            "head_hidden_dim",
+            "head_dropout",
+            "adapter_ratio",
+            "response_hidden_dim",
+            "task_sampling",
+            "conformal_scope",
             "task_metadata",
         ):
             if stored_architecture.get(name) != current_config.get(name):

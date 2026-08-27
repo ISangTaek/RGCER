@@ -695,6 +695,16 @@ def build_parser():
         "every task.",
     )
     parser.add_argument(
+        "--task_sampling",
+        choices=["proportional", "human_target_floor"],
+        default="proportional",
+        help="Schedule exposure (review §39). proportional keeps the historical "
+        "data-proportional mix for every model; human_target_floor adds one "
+        "full extra pass of each human target loader per epoch and is meant "
+        "for ablations only. Per-epoch exposure is recorded in "
+        "schedule_diagnostics either way.",
+    )
+    parser.add_argument(
         "--rgcer_source_policy",
         choices=["all_except_target", "animal56_only"],
         default="animal56_only",

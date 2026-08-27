@@ -160,13 +160,38 @@ pytest tests/
   `<save_path>/<experiment_tag>/seed_<seed>/` and receives `args.json`,
   `architecture_summary.txt`, `metrics.json`, `routing_summary.json`, and the
   best checkpoint (`<prefix>_<tag>_seed<seed>`).
-- **Checkpoints are strict v4**: they must contain `checkpoint_version=4`,
-  `model_state`, `optimizer_state`, `weighting_state`, `epoch`, … and are
-  loaded with `strict=True`. `test` / `single_inference` / `batch_inference`
-  modes require `--load_path` pointing at a full checkpoint.
+- **Checkpoints are strict v5 for formal DataStore V2 runs** (legacy
+  non-V2 paths remain v4): they must contain `checkpoint_version=5`,
+  `model_state`, `optimizer_state`, `weighting_state`, `epoch`, a
+  `data_config` block binding the DataStore fingerprint/build id/split
+  manifest hash, and are loaded with `strict=True`. `test` /
+  `single_inference` / `batch_inference` modes require `--load_path`
+  pointing at a full checkpoint. `architecture_config` additionally pins
+  behaviour-affecting sizes/rates (`head_dropout`, `hidden_dim`,
+  `a_layers`, `adapter_ratio`, …) so a resume cannot silently change them.
+- **Split protocol**: build order is chemistry scan → Manifest-V3 planning →
+  hard preflight PASS → LMDB shards. Plan first with
+  `preprocess_data.py --plan_split_only ...` (writes the manifest plus
+  `split_report.json` carrying hard-constraint status), then pass the
+  approved file to `--build_datastore_v2 --split_manifest_path <file>`.
+  The planner pins oversized scaffolds (e.g. benzene) to train, balances
+  endpoint *label presence* (never values) with human3 priority, and
+  enforces acyclic eval coverage plus a 50% single-group dominance cap on
+  every evaluation split. The store only accepts version-3 manifests.
+- **Conformal scope & alpha floor**: `--conformal_scope human3|all_tasks`
+  (default human3) selects which endpoints receive CQR states; point
+  metrics always cover every task and intervals are labelled conformal
+  only where qhat exists. Scoped endpoints below
+  `ceil((1-alpha)/alpha)` calibration rows fail preflight
+  (`FAIL_CONFORMAL_RANK`) before training starts; counts between the
+  floor and 30 warn (`LOW_CALIBRATION_STABILITY`).
+- **Response-profile determinism**: the RGCER router consumes head
+  evaluations computed with dropout pinned off (`deterministic=True`) and
+  no grad, so identical molecules yield identical routing evidence in
+  train mode; supervised head calls keep normal dropout.
 - **Split ratios** must satisfy `vs + calibration_size + ts < 1.0`. The split
-  manifest (`split_manifest.json` in the preprocessed dir) is the single
-  source of truth for all tasks — never re-split per task.
+  manifest is the single source of truth for all tasks — never re-split
+  per task.
 - **Prediction mode**: `quantile` is the default and only makes sense for
   regression datasets; classification datasets (`hiv`, `bace`, `bbbp`, `muv`,
   `tox21`, `sider`, `clintox`) are automatically forced to `point` with a
@@ -180,7 +205,11 @@ pytest tests/
 - **Task-wise training**: one use of every task batch per epoch
   (`tasks_per_update` controls how many tasks update per optimizer step);
   HPS warmup (`--hps_warmup_epochs`, default 10) runs before routing is
-  enabled (`--routing_enabled`).
+  enabled (`--routing_enabled`). Exposure is data-proportional by default
+  (`--task_sampling proportional`); `human_target_floor` adds one extra
+  full pass of each human loader per epoch for ablations, and every epoch
+  records `schedule_diagnostics` (per-task batches, update fractions,
+  human3 fraction) in the history/metrics output.
 - RDKit app logging is disabled globally in `main.py`.
 - `data/`, `artifacts/`, `processed_graph_data/` contents are git-ignored —
   large data files never go into git.
