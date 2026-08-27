@@ -13,7 +13,7 @@ from torch.nn.utils import clip_grad_norm_
 
 from conformal import ConformalCalibrator
 from architecture.prediction_heads import decode_prediction
-from architecture.toxacute_tasks import HUMAN_TARGET_TASKS
+from architecture.toxacute_tasks import ANIMAL_SOURCE_TASKS, HUMAN_TARGET_TASKS
 from loss import QuantileRegressionLoss
 from metric import (
     compute_classification_metrics,
@@ -23,6 +23,36 @@ from metric import (
 from molecular_features import FEATURE_SCHEMA_VERSION
 from split_manifest import load_manifest, manifest_hash
 from utils import count_parameters
+
+
+SOURCE_POLICY_CHOICES = ("all_except_target", "animal56_only")
+DEFAULT_SOURCE_POLICY = "animal56_only"
+
+
+def build_source_policy_mask(task_names, *, policy, allowed_auxiliary=()):
+    """Return the router-source allow-list implied by the source policy.
+
+    ``animal56_only`` keeps the animal→human claim honest: for a human
+    target only animal endpoints may act as sources.  The router still
+    excludes the target itself; shuffled auxiliary stress endpoints stay
+    usable only when they are explicitly allowed by name.
+    """
+
+    if policy not in SOURCE_POLICY_CHOICES:
+        raise ValueError(f"Unknown rgcer_source_policy: {policy!r}")
+    allowed_auxiliary = [str(name) for name in (allowed_auxiliary or [])]
+    unknown = [name for name in allowed_auxiliary if name not in task_names]
+    if unknown:
+        raise ValueError(
+            f"explicitly_allowed_auxiliary_sources references tasks outside this run: {unknown}"
+        )
+    mask = []
+    for name in task_names:
+        if policy == "all_except_target":
+            mask.append(True)
+        else:
+            mask.append((name in ANIMAL_SOURCE_TASKS) or (name in set(allowed_auxiliary)))
+    return mask
 
 
 class Trainer:
@@ -50,6 +80,19 @@ class Trainer:
         self.kwargs = kwargs
         self.seed = int(getattr(args, "seed", 42))
         self.selection_scope = str(getattr(args, "selection_scope", "human3"))
+        self.source_policy = str(getattr(args, "rgcer_source_policy", DEFAULT_SOURCE_POLICY))
+        if self.source_policy not in SOURCE_POLICY_CHOICES:
+            raise ValueError(f"Unknown rgcer_source_policy: {self.source_policy!r}")
+        self.allowed_auxiliary_sources = tuple(
+            str(name)
+            for name in (getattr(args, "explicitly_allowed_auxiliary_sources", None) or ())
+        )
+        build_source_policy_mask(
+            self.task_name,
+            policy=self.source_policy,
+            allowed_auxiliary=self.allowed_auxiliary_sources,
+        )
+        self._source_mask_by_device: dict[torch.device, torch.Tensor] = {}
         self._set_seed(self.seed)
         self.device = self._resolve_device(args)
         if architecture is None or encoder_class is None:
@@ -260,6 +303,39 @@ class Trainer:
             return True
         return epoch >= getattr(self.args, "hps_warmup_epochs", 0)
 
+    def source_policy_mask(self, device=None):
+        """Default router-source mask for the current task list and policy.
+
+        Returns ``None`` unless this instance was fully constructed with a
+        source policy: minimally wired fixtures keep the previous behaviour
+        of passing no mask at all.
+        """
+
+        if not self._is_rgcer:
+            return None
+        if not getattr(self, "source_policy", None) or not getattr(self, "task_name", None):
+            return None
+        target_device = device if device is not None else getattr(
+            self, "device", torch.device("cpu")
+        )
+        cached = self._source_mask_by_device.get(target_device)
+        if cached is None:
+            mask = build_source_policy_mask(
+                self.task_name,
+                policy=self.source_policy,
+                allowed_auxiliary=self.allowed_auxiliary_sources,
+            )
+            cached = torch.tensor(mask, dtype=torch.bool, device=target_device)
+            self._source_mask_by_device[target_device] = cached
+        return cached
+
+    def effective_source_mask(self, source_mask, device=None):
+        """Explicit masks win; otherwise the configured policy applies."""
+
+        if source_mask is not None:
+            return source_mask
+        return self.source_policy_mask(device)
+
     def _eligible_for_best(self, epoch: int) -> bool:
         """Only routed Full RGCER epochs may define its best checkpoint."""
 
@@ -276,6 +352,7 @@ class Trainer:
                 task_name=task,
                 return_aux=return_aux,
                 routing_enabled=self._routing_enabled(epoch, routing_enabled_override),
+                source_mask=self.effective_source_mask(None),
             )
         else:
             result = self.model(batch, task_name=task, return_aux=return_aux)
@@ -285,22 +362,23 @@ class Trainer:
 
     @torch.no_grad()
     def predict_all_tasks(self, batch, *, return_aux=False, source_mask=None):
-        """Run inference with the routing state recorded by the checkpoint."""
+        """Run inference with the configured source policy applied by default."""
 
         self.model.eval()
+        default_mask = self.effective_source_mask(source_mask)
         if self._is_rgcer:
             return self.model(
                 batch,
                 return_all_tasks=True,
                 return_aux=return_aux,
-                source_mask=source_mask,
+                source_mask=default_mask,
                 routing_enabled=self._routing_enabled(None),
             )
         return self.model(
             batch,
             return_all_tasks=True,
             return_aux=return_aux,
-            source_mask=source_mask,
+            source_mask=default_mask,
         )
 
     def _training_step(self, batch, task, epoch):
@@ -826,6 +904,8 @@ class Trainer:
             "rgcer_transfer_mechanism": _value("rgcer_transfer_mechanism", "endpoint_router"),
             "router_top_k": _value("router_top_k", 0),
             "router_temperature": _value("router_temperature", 1.0),
+            "rgcer_source_policy": self.source_policy,
+            "allowed_auxiliary_sources": list(self.allowed_auxiliary_sources),
             "exclude_target_from_sources": getattr(self.args, "exclude_target_from_sources", True),
             "use_factorized_prompt": architecture_config["use_factorized_prompt"],
             "prediction_mode": self._prediction_mode(),

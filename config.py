@@ -28,6 +28,7 @@ def resolve_effective_rgcer_config(params):
         'rgcer_use_base_aux_loss',
         'rgcer_fallback_space',
         'rgcer_transfer_mechanism',
+        'rgcer_source_policy',
         'router_top_k',
         'router_temperature',
     )
@@ -54,7 +55,7 @@ def resolve_effective_rgcer_config(params):
     effective['transfer_mechanism'] = 'hps' if getattr(params, 'arch', None) != 'Graphormer_rgcer' else mechanism
     effective['routing_enabled'] = bool(getattr(params, 'routing_enabled', True))
     for name in ignored:
-        if requested.get(name) not in (None, True, 'endpoint_router', 0, 1.0):
+        if requested.get(name) not in (None, True, 'endpoint_router', 0, 1.0, 'animal56_only'):
             warnings.warn(
                 f"{name} is ignored by architecture/mechanism {getattr(params, 'arch', None)}/{mechanism}.",
                 RuntimeWarning,
@@ -120,6 +121,7 @@ def prepare_args(params):
         'rgcer_use_base_aux_loss',
         'rgcer_fallback_space',
         'rgcer_transfer_mechanism',
+        'rgcer_source_policy',
         'spatial_pos_max_clip',
         'auxiliary_metadata_overrides',
     ]:

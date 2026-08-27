@@ -5,6 +5,7 @@
   "selection_scope": "human3",
   "arch": "Graphormer_rgcer",
   "rgcer_transfer_mechanism": "endpoint_router",
+  "rgcer_source_policy": "animal56_only",
   "split_seed": 42,
   "splitting": "scaffold",
   "vs": 0.1,

@@ -56,6 +56,7 @@ RGCER_FLAG_NAMES = (
     "rgcer_use_base_aux_loss",
     "rgcer_fallback_space",
     "rgcer_transfer_mechanism",
+    "rgcer_source_policy",
 )
 
 
@@ -360,6 +361,26 @@ def main(params):
     if params.mode in {"train", "test", "batch_inference"}:
         store = _resolve_data_store(params, formal_task_names, required=True)
         task_names = _attach_shuffled_endpoint(params, store, task_names)
+        if getattr(params, "explicitly_allowed_auxiliary_sources", None):
+            unknown = [
+                name
+                for name in params.explicitly_allowed_auxiliary_sources
+                if name not in task_names
+            ]
+            if unknown:
+                raise ValueError(
+                    "--explicitly_allowed_auxiliary_sources names tasks outside this run: "
+                    f"{unknown}; available={task_names}"
+                )
+        if params.arch == "Graphormer_rgcer" and task_names:
+            # Fail before any training I/O when the policy contradicts the run.
+            from trainer import build_source_policy_mask
+
+            build_source_policy_mask(
+                task_names,
+                policy=params.rgcer_source_policy,
+                allowed_auxiliary=params.explicitly_allowed_auxiliary_sources,
+            )
         if params.mode in {"train", "test"}:
             from data_preflight import run_datastore_preflight
 
@@ -622,6 +643,22 @@ def build_parser():
         help="Task scope for best-checkpoint selection. human3 selects on the three "
         "human target endpoints (falls back to all_tasks when the run has none).",
     )
+    parser.add_argument(
+        "--rgcer_source_policy",
+        choices=["all_except_target", "animal56_only"],
+        default="animal56_only",
+        help="Router source policy for Graphormer_rgcer. animal56_only keeps the formal "
+        "animal-to-human claim: human targets draw only on animal endpoints, plus any "
+        "auxiliary endpoint explicitly allowed below. The router always excludes the "
+        "target itself.",
+    )
+    parser.add_argument(
+        "--explicitly_allowed_auxiliary_sources",
+        type=str,
+        default="",
+        help="Comma-separated auxiliary (e.g. shuffled) endpoint names that stay usable "
+        "as router sources under rgcer_source_policy=animal56_only.",
+    )
     parser.add_argument("--experiment_tag", default="full")
 
     parser.add_argument("--weighting", choices=["EW", "UW", "DWA"], default="EW")
@@ -643,6 +680,12 @@ def build_parser():
 def validate_params(params):
     if params.hidden_dim % params.a_heads != 0:
         raise ValueError("hidden_dim must be divisible by a_heads")
+    raw_allowed_sources = str(
+        getattr(params, "explicitly_allowed_auxiliary_sources", "") or ""
+    )
+    params.explicitly_allowed_auxiliary_sources = tuple(
+        name.strip() for name in raw_allowed_sources.split(",") if name.strip()
+    )
     if params.prompt_heads <= 0 or params.hidden_dim % params.prompt_heads != 0:
         raise ValueError("hidden_dim must be divisible by prompt_heads")
     if params.router_dim <= 0 or params.router_top_k < 0 or params.router_temperature <= 0:
