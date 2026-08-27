@@ -33,3 +33,7 @@ __pycache__/
 .tmp/
 .qwen/
 _check*.py
+
+# Cython intermediates and compiler output
+algos/algos.c
+/build/

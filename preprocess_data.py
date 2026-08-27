@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import warnings
 from pathlib import Path
 
 import algos
@@ -96,6 +97,43 @@ def _records_from_dataframe(df: pd.DataFrame) -> tuple[list[dict], list[dict]]:
     return records, errors
 
 
+# The bundled Cython gen_edge_input historically wrote every hop of a
+# shortest path without bounds checks, so callers had to allocate the full
+# molecule diameter and slice.  Builds compiled from the patched algos.pyx
+# expose BOUNDED_EDGE_INPUT and accept max_path_distance directly.
+_BOUNDED_GEN_EDGE_INPUT = bool(getattr(algos, "BOUNDED_EDGE_INPUT", False))
+_UNBOUNDED_WARNED = False
+
+
+def _gen_edge_input_bounded(max_path_distance, path_np, edge_feature_matrix, spatial_pos_np):
+    """Return edge_input with a fixed [N, N, max_path_distance, F] shape."""
+
+    global _UNBOUNDED_WARNED
+    path_np = np.ascontiguousarray(path_np)
+    edge_feature_matrix = np.ascontiguousarray(edge_feature_matrix)
+    if _BOUNDED_GEN_EDGE_INPUT:
+        return np.asarray(
+            algos.gen_edge_input(int(max_path_distance), path_np, edge_feature_matrix)
+        )[
+            :, :, : int(max_path_distance), :
+        ]
+    finite_distances = spatial_pos_np[spatial_pos_np < 510]
+    required_path_distance = int(finite_distances.max()) if finite_distances.size else 0
+    cython_capacity = max(int(max_path_distance), required_path_distance)
+    if not _UNBOUNDED_WARNED:
+        warnings.warn(
+            "algos extension predates the bounded gen_edge_input fix; falling back "
+            "to molecule-diameter allocation (higher peak memory). Rebuild with "
+            "`python setup.py build_ext --inplace` once MSVC Build Tools are available.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        _UNBOUNDED_WARNED = True
+    return np.asarray(
+        algos.gen_edge_input(cython_capacity, path_np, edge_feature_matrix)
+    )[:, :, : int(max_path_distance), :]
+
+
 def _build_edge_tensors(mol: Chem.Mol):
     num_atoms = mol.GetNumAtoms()
     feature_dim = len(BOND_FEATURE_NAMES)
@@ -138,18 +176,9 @@ def _build_graph_feature_record(smiles_string, *, sample_id="inference_sample", 
     atom_matrix = torch.tensor([atom_features(atom) for atom in mol.GetAtoms()], dtype=torch.long)
     adjacency, edge_index, edge_attr, attn_edge_type, edge_feature_matrix = _build_edge_tensors(mol)
     spatial_pos_np, path_np = algos.floyd_warshall(np.ascontiguousarray(adjacency))
-    # The bundled Cython implementation assumes max_dist is at least the
-    # longest finite path and writes without a bounds check.  Call it with a
-    # safe per-molecule capacity, then keep the configured compact prefix.
-    finite_distances = spatial_pos_np[spatial_pos_np < 510]
-    required_path_distance = int(finite_distances.max()) if finite_distances.size else 0
-    cython_path_distance = max(int(max_path_distance), required_path_distance)
-    edge_input_full = algos.gen_edge_input(
-        cython_path_distance,
-        np.ascontiguousarray(path_np),
-        np.ascontiguousarray(edge_feature_matrix),
+    edge_input_np = _gen_edge_input_bounded(
+        int(max_path_distance), path_np, edge_feature_matrix, spatial_pos_np
     )
-    edge_input_np = edge_input_full[:, :, : int(max_path_distance), :]
 
     degree = torch.from_numpy(adjacency.sum(axis=1).astype(np.int64))
     return {
