@@ -160,10 +160,31 @@ class ConformalCalibrator:
         }
 
 
+def resolve_conformal_tasks(scope, all_task_names):
+    """Resolve ``conformal_scope`` against the run's task list (review §20).
+
+    The single source of truth for scope->tasks mapping: split planning,
+    datastore preflight, trainer fitting, and inference must all agree.
+    ``human3`` restricts to the three human TDLo endpoints that participate
+    in the run; ``all_tasks`` covers every task in the run (never an empty
+    list, which the old ad-hoc mapping produced).
+    """
+
+    from architecture.toxacute_tasks import HUMAN_TARGET_TASKS
+
+    names = [str(name) for name in all_task_names]
+    if scope == "human3":
+        return [name for name in HUMAN_TARGET_TASKS if name in names]
+    if scope == "all_tasks":
+        return names
+    raise ValueError(f"Unknown conformal_scope={scope!r}")
+
+
 __all__ = [
     "ConformalCalibrator",
     "InsufficientCalibrationError",
     "TaskConformalState",
     "exchangeability_metadata",
     "minimum_calibration_size",
+    "resolve_conformal_tasks",
 ]

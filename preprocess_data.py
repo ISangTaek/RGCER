@@ -386,12 +386,24 @@ if __name__ == "__main__":
     parser.add_argument("--oversized_eval_fraction", type=float, default=0.5)
     parser.add_argument("--min_priority_eval_count", type=int, default=10)
     args = parser.parse_args()
-    from architecture.toxacute_tasks import HUMAN_TARGET_TASKS
+    from architecture.toxacute_tasks import HUMAN_TARGET_TASKS, TOXACUTE_TASKS
+    from conformal import resolve_conformal_tasks
 
     if args.conformal_scope == "human3":
         default_priority = list(HUMAN_TARGET_TASKS)
     else:
         default_priority = []
+    # Resolve the CLI task list the same way scan_chemistry will, so the
+    # scope mapping below sees the true run task names (review §20).
+    if args.task_list == "all":
+        import pandas as _pd
+
+        _columns = list(_pd.read_csv(args.raw_csv_path, nrows=0).columns[6:])
+        resolved_tasks = _columns or list(TOXACUTE_TASKS)
+    else:
+        resolved_tasks = [item.strip() for item in args.task_list.split(",") if item.strip()]
+    scoped_conformal_tasks = resolve_conformal_tasks(args.conformal_scope, resolved_tasks)
+    print(f"conformal tasks = {len(scoped_conformal_tasks)} ({args.conformal_scope})")
     if args.plan_split_only:
         if args.build_datastore_v2:
             raise SystemExit(
@@ -411,9 +423,7 @@ if __name__ == "__main__":
             conformal_alpha=args.conformal_alpha,
             conformal_scope=args.conformal_scope,
             priority_task_names=default_priority,
-            conformal_task_names=(
-                list(HUMAN_TARGET_TASKS) if args.conformal_scope == "human3" else None
-            ),
+            conformal_task_names=scoped_conformal_tasks,
             num_candidates=args.split_num_candidates,
             oversized_eval_fraction=args.oversized_eval_fraction,
             min_priority_eval_count=args.min_priority_eval_count,
@@ -450,7 +460,7 @@ if __name__ == "__main__":
             conformal_alpha=args.conformal_alpha,
             conformal_scope=args.conformal_scope,
             priority_task_names=default_priority,
-            conformal_task_names=list(HUMAN_TARGET_TASKS) if args.conformal_scope == "human3" else [],
+            conformal_task_names=scoped_conformal_tasks,
             num_candidates=args.split_num_candidates,
             oversized_eval_fraction=args.oversized_eval_fraction,
             min_priority_eval_count=args.min_priority_eval_count,

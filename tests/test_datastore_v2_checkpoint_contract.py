@@ -59,7 +59,7 @@ def test_formal_checkpoint_records_and_validates_datastore_identity(tmp_path):
     source = _trainer(source_args)
     checkpoint_path = source._save_checkpoint(6, "model_best.pt")
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    assert payload["checkpoint_version"] == 5
+    assert payload["checkpoint_version"] == 6
     assert payload["data_config"]["datastore_fingerprint"] == store.fingerprint
     assert payload["data_config"]["max_path_distance"] == 6
 

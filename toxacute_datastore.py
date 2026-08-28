@@ -749,6 +749,7 @@ def _split_report(
     parse_failures: int,
     raw_csv_sha256: str,
     labels_presence: np.ndarray,
+    record_sample_ids: Sequence[str],
     task_names: Sequence[str],
     priority_task_names: Sequence[str],
     conformal_task_names: Sequence[str],
@@ -764,6 +765,16 @@ def _split_report(
 
     from conformal import minimum_calibration_size
     from split_manifest import _MIN_EVAL_TARGET_FOR_DOMINANCE_RULE
+
+    # Review §29: align label presence through sample_id, never by record
+    # position, so a future reorder cannot silently mismatch chemistry and
+    # label matrices.
+    presence_by_sample_id = {
+        str(sample_id): labels_presence[position]
+        for position, sample_id in enumerate(record_sample_ids)
+    }
+    if len(presence_by_sample_id) != len(record_sample_ids):
+        raise ValueError("CSV chemistry scan produced duplicate sample_id entries")
 
     smallest_eval_target = min(
         (float((manifest.get("ratios") or {}).get(name, 0.0)) * num_samples
@@ -792,11 +803,19 @@ def _split_report(
 
     def label_count(split_name: str, task_name: str) -> int:
         column = task_names.index(task_name)
-        return sum(
-            int(labels_presence[position, column])
-            for position, record in enumerate(records)
-            if str(record["split"]) == split_name
-        )
+        total = 0
+        for record in records:
+            if str(record["split"]) != split_name:
+                continue
+            sample_id = str(record["sample_id"])
+            presence_row = presence_by_sample_id.get(sample_id)
+            if presence_row is None:
+                raise ValueError(
+                    f"Manifest sample_id {sample_id!r} is absent from the CSV chemistry scan; "
+                    "label presence cannot be aligned"
+                )
+            total += int(presence_row[column])
+        return total
 
     human3_counts = {
         split_name: {
@@ -937,6 +956,7 @@ def plan_toxacute_split(
         parse_failures=len(scan["errors"]),
         raw_csv_sha256=scan["raw_csv_sha256"],
         labels_presence=scan["label_presence"],
+        record_sample_ids=[str(record["sample_id"]) for record in scan["records"]],
         task_names=scan["tasks"],
         priority_task_names=list(priority_task_names or []),
         conformal_task_names=list(conformal_task_names or []),
@@ -986,8 +1006,47 @@ def _verify_approved_manifest(
             raise ValueError(f"Approved split ratio for {name} does not match requested configuration")
 
     identity_by_id = {str(record["sample_id"]): record for record in records}
+    manifest_entries = list(manifest.get("records", []))
+    manifest_ids = [str(entry.get("sample_id")) for entry in manifest_entries]
+    current_ids = [str(record["sample_id"]) for record in records]
+
+    # Review §26-28: exact record count, no duplicates on either side, and
+    # identical sample-id SEQUENCE — downstream preflight/consumers may use
+    # positional indexing, so order is part of the contract, not just set
+    # membership.  All of this fails before any LMDB write begins.
+    if len(set(manifest_ids)) != len(manifest_ids):
+        duplicates = sorted({sid for sid in manifest_ids if manifest_ids.count(sid) > 1})
+        raise ValueError(
+            "Approved split manifest contains duplicate sample_id entries: "
+            + ", ".join(duplicates[:6])
+        )
+    if len(set(current_ids)) != len(current_ids):
+        duplicates = sorted({sid for sid in current_ids if current_ids.count(sid) > 1})
+        raise ValueError(
+            "CSV chemistry scan produced duplicate sample_id entries: " + ", ".join(duplicates[:6])
+        )
+    if len(manifest_ids) != len(current_ids):
+        manifest_id_set = set(manifest_ids)
+        current_id_set = set(current_ids)
+        missing_from_manifest = [sid for sid in current_ids if sid not in manifest_id_set]
+        extra_in_manifest = [sid for sid in manifest_ids if sid not in current_id_set]
+        raise ValueError(
+            "Approved split manifest record count does not match the CSV: "
+            f"manifest={len(manifest_ids)}, csv={len(current_ids)}; "
+            f"missing_from_manifest={missing_from_manifest[:5]}, "
+            f"extra_in_manifest={extra_in_manifest[:5]}"
+        )
+    if manifest_ids != current_ids:
+        first_mismatch = next(
+            (index for index, (m, c) in enumerate(zip(manifest_ids, current_ids)) if m != c), 0
+        )
+        raise ValueError(
+            "Approved split manifest sample_id sequence does not match the CSV "
+            f"(positional contract): first mismatch at row {first_mismatch}: "
+            f"manifest={manifest_ids[first_mismatch]!r}, csv={current_ids[first_mismatch]!r}"
+        )
     mismatches: list[str] = []
-    for entry in manifest.get("records", []):
+    for entry in manifest_entries:
         sample_id = str(entry.get("sample_id"))
         current = identity_by_id.get(sample_id)
         if current is None:
@@ -1094,6 +1153,7 @@ def build_datastore_v2(
             parse_failures=len(scan["errors"]),
             raw_csv_sha256=raw_sha256,
             labels_presence=scan["label_presence"],
+            record_sample_ids=[str(record["sample_id"]) for record in chemistry_records],
             task_names=tasks,
             priority_task_names=list(priority_task_names or []),
             conformal_task_names=list(conformal_task_names or []),
@@ -1116,6 +1176,7 @@ def build_datastore_v2(
             parse_failures=len(scan["errors"]),
             raw_csv_sha256=raw_sha256,
             labels_presence=scan["label_presence"],
+            record_sample_ids=[str(record["sample_id"]) for record in chemistry_records],
             task_names=tasks,
             priority_task_names=list(priority_task_names or []),
             conformal_task_names=list(conformal_task_names or []),

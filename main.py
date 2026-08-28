@@ -35,6 +35,8 @@ from experiment_config import (
 from metric import ClsMetric, RegMetric
 from loss import BCELoss, MSELoss
 from preprocess_data import convert_to_single_emb_offline, get_graph_data_from_smiles
+from reproducibility import seed_everything, state_dict_sha256
+from conformal import resolve_conformal_tasks
 from trainer import Trainer
 from toxacute_datastore import ToxAcuteDataStore, ToxAcuteTaskDataset
 from utils import calculate_mgkg
@@ -86,11 +88,15 @@ def _write_run_metadata(params, task_names, trainer):
     trainable_parameters = sum(
         parameter.numel() for parameter in trainer.model.parameters() if parameter.requires_grad
     )
+    initial_model_sha256 = getattr(trainer, "initial_model_sha256", None)
+    if initial_model_sha256 is None:
+        initial_model_sha256 = state_dict_sha256(trainer.model)
     lines = [
         f"arch: {params.arch}",
         f"task count: {len(task_names)}",
         f"parameter count: {total_parameters}",
         f"trainable parameter count: {trainable_parameters}",
+        f"initial model sha256: {initial_model_sha256}",
         f"prediction mode: {effective_prediction_mode(params)}",
         f"split mode: {params.splitting}",
         f"seed: {params.seed}",
@@ -113,6 +119,25 @@ def _write_run_metadata(params, task_names, trainer):
     lines.extend(f"{name}: {getattr(params, name, '<unset>')}" for name in RGCER_FLAG_NAMES)
     with (run_path / "architecture_summary.txt").open("w", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
+    # Review-2 §51: structured provenance for multi-seed audit — identical
+    # seeds must regenerate this hash, different seeds must not.  The
+    # reproducibility/worker policy is recorded so formal runs are auditable.
+    data_metadata = getattr(trainer, "data_metadata", None) or {}
+    from reproducibility import PERSISTENT_WORKER_POLICY, SEED_POLICY_VERSION
+
+    _write_json(
+        run_path / "run_metadata.json",
+        {
+            "seed": int(getattr(params, "seed", 42)),
+            "seed_policy_version": SEED_POLICY_VERSION,
+            "num_loader_workers": int(getattr(params, "num_loader_workers", 0)),
+            "persistent_worker_policy": PERSISTENT_WORKER_POLICY,
+            "initial_model_sha256": initial_model_sha256,
+            "manifest_sha256": data_metadata.get("split_manifest_hash"),
+            "datastore_fingerprint": data_metadata.get("datastore_fingerprint"),
+            "checkpoint_version": 6 if data_metadata else 4,
+        },
+    )
     effective = getattr(params, "effective_rgcer_config", None)
     if effective is not None:
         _write_json(run_path / "effective_config.json", effective)
@@ -151,13 +176,7 @@ def _conformal_scope_tasks(params, task_names):
 
     if not getattr(params, "fit_conformal", True):
         return []
-    scope = getattr(params, "conformal_scope", "human3")
-    if scope == "human3":
-        return [name for name in HUMAN_TARGET_TASKS if name in task_names]
-    if scope == "all_tasks":
-        auxiliary = set(getattr(params, "auxiliary_task_names", []) or [])
-        return [name for name in task_names if name not in auxiliary]
-    raise ValueError(f"Unknown conformal_scope: {scope!r}")
+    return resolve_conformal_tasks(getattr(params, "conformal_scope", "human3"), task_names)
 
 
 def task_names_for_params(params):
@@ -290,6 +309,7 @@ def _loaders(params, task_names, collator):
         split_seed=params.split_seed,
         max_nodes_filter=params.max_nodes_filter,
         label_providers=getattr(params, "label_providers", None),
+        loader_seed=params.seed,
     )
     all_loaders = wrapper.get_data_loaders()
     result = {name: {} for name in ("train", "val", "calibration", "test")}
@@ -324,6 +344,19 @@ def _build_model_components(params, task_names, device):
     return encoder_map[params.arch], getattr(architecture_method, params.arch), decoders
 
 
+def _apply_conformal_for_task(params, trainer, task) -> bool:
+    """Conformal applies only where a fitted qhat state exists (review §23).
+
+    Under ``conformal_scope=human3`` checkpoints, animal endpoints have no
+    qhat; requesting conformal there used to raise.  They must still decode
+    as point/raw-quantile outputs instead of crashing.
+    """
+
+    return bool(getattr(params, "fit_conformal", True)) and (
+        task in trainer.conformal_calibrator.states
+    )
+
+
 def _prediction_records(params, trainer, batch, task_names):
     batch = batch.to(trainer.device)
     with torch.no_grad():
@@ -333,8 +366,8 @@ def _prediction_records(params, trainer, batch, task_names):
     batch_smiles = list(getattr(batch, "smiles", [""] * batch.y.size(0)))
     for sample_index, smiles in enumerate(batch_smiles):
         row = {"smiles": smiles}
-        apply_conformal = bool(getattr(params, "fit_conformal", True))
         for task in task_names:
+            apply_conformal = _apply_conformal_for_task(params, trainer, task)
             decoded = trainer.decode_task_output(
                 task,
                 predictions[task][sample_index : sample_index + 1],
@@ -349,6 +382,7 @@ def _prediction_records(params, trainer, batch, task_names):
             row[f"{task}__median_mgkg"] = calculate_mgkg(smiles, median)
             row[f"{task}__lower_mgkg"] = calculate_mgkg(smiles, upper)
             row[f"{task}__upper_mgkg"] = calculate_mgkg(smiles, lower)
+            row[f"{task}__interval_type"] = "conformal" if apply_conformal else "raw_quantile"
             if isinstance(diagnostics, dict) and task in diagnostics:
                 diag = diagnostics[task]
                 row[f"{task}__null_weight"] = float(diag["null_weight"][sample_index, 0].detach().cpu())
@@ -357,6 +391,10 @@ def _prediction_records(params, trainer, batch, task_names):
 
 
 def main(params):
+    # P0 reproducibility gate: the seed must be active before ANY nn.Module
+    # is constructed (review §5) — otherwise decoder initial weights are not
+    # a function of --seed.  Trainer's internal re-seed is defensive only.
+    seed_everything(params.seed)
     _configure_run_identity(params)
     selected_mode = effective_prediction_mode(params)
     if selected_mode != getattr(params, "prediction_mode", selected_mode):
@@ -518,12 +556,15 @@ def main(params):
             predictions = trainer.predict_all_tasks(batch)
         print("--- Predictions ---")
         for task in task_names:
+            apply_conformal = _apply_conformal_for_task(params, trainer, task)
             decoded = trainer.decode_task_output(
-                task, predictions[task], apply_conformal=bool(getattr(params, "fit_conformal", True))
+                task, predictions[task], apply_conformal=apply_conformal
             )
+            interval_type = "conformal" if apply_conformal else "raw_quantile"
             print(
                 f"{task}: median={decoded['median'].item():.6f}, "
                 f"lower={decoded['lower'].item():.6f}, upper={decoded['upper'].item():.6f}, "
+                f"interval_type={interval_type}, "
                 f"median_mgkg={calculate_mgkg(params.smiles, decoded['median'].item()):.6f}, "
                 f"lower_mgkg={calculate_mgkg(params.smiles, decoded['upper'].item()):.6f}, "
                 f"upper_mgkg={calculate_mgkg(params.smiles, decoded['lower'].item()):.6f}"

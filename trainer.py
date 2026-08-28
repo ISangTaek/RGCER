@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch.nn.utils import clip_grad_norm_
 
-from conformal import ConformalCalibrator
+from conformal import ConformalCalibrator, resolve_conformal_tasks
 from architecture.prediction_heads import decode_prediction
 from architecture.toxacute_tasks import ANIMAL_SOURCE_TASKS, HUMAN_TARGET_TASKS
 from loss import QuantileRegressionLoss
@@ -22,6 +22,17 @@ from metric import (
     compute_regression_metrics,
 )
 from molecular_features import FEATURE_SCHEMA_VERSION
+from reproducibility import (
+    EPOCH_SEED_SCHEME,
+    LOADER_SEED_SCHEME,
+    PERSISTENT_WORKER_POLICY,
+    SEED_POLICY_VERSION,
+    reseed_train_loaders,
+    scheduled_batches,
+    seed_everything,
+    stable_seed,
+    state_dict_sha256,
+)
 from split_manifest import load_manifest, manifest_hash
 from utils import count_parameters
 
@@ -98,6 +109,8 @@ class Trainer:
             allowed_auxiliary=self.allowed_auxiliary_sources,
         )
         self._source_mask_by_device: dict[torch.device, torch.Tensor] = {}
+        # Defensive only (review §6): main() seeds before model construction;
+        # this re-seed keeps directly-constructed Trainers deterministic.
         self._set_seed(self.seed)
         self.device = self._resolve_device(args)
         if architecture is None or encoder_class is None:
@@ -117,6 +130,9 @@ class Trainer:
         self.loss_balancer.init_param()
         self.loss_balancer = self.loss_balancer.to(self.device)
         self.optimizer = self._make_optimizer(optim_param)
+        # Review §7: auditable initialization hash — same seed must produce
+        # the same value across fresh processes, different seeds must not.
+        self.initial_model_sha256 = state_dict_sha256(self.model)
         self.task_scalers = {}
         self.conformal_calibrator = ConformalCalibrator(
             alpha=getattr(args, "conformal_alpha", 0.10),
@@ -174,11 +190,7 @@ class Trainer:
 
     @staticmethod
     def _set_seed(seed):
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+        seed_everything(seed)
 
     def _make_optimizer(self, optim_param):
         optim_name = str(optim_param.get("optim", "adamw")).lower()
@@ -260,6 +272,36 @@ class Trainer:
                 task, result["lower"], result["upper"]
             )
         return result
+
+    def _maybe_update_best(self, validation_result, epoch, params_main=None):
+        """Replace the historical best only on a strictly better score.
+
+        Encapsulated so resume tests can verify that a restored
+        ``best_val_score`` guards the selection: after resuming from a
+        ``last.pt`` with a historical best of 10, a validation score of 5
+        must NOT replace it (review-2 §19).
+        """
+
+        if self._eligible_for_best(epoch) and (
+            self._best_state is None or validation_result["selection_score"] > self.best_val_score
+        ):
+            self.best_val_score = validation_result["selection_score"]
+            self._best_state = copy.deepcopy(self.model.state_dict())
+            self.best_epoch = epoch
+            self.best_routing_enabled = self._routing_enabled(epoch)
+            self._best_training_state = {
+                "model_state": copy.deepcopy(self.model.state_dict()),
+                "optimizer_state": copy.deepcopy(self.optimizer.state_dict()),
+                "weighting_state": copy.deepcopy(self.loss_balancer.state_dict()),
+                "train_loss_buffer": self.train_loss_buffer.copy(),
+                "optimizer_updates": int(self.optimizer_updates),
+                "epoch": epoch,
+            }
+            self.best_checkpoint_path = self._save_checkpoint(
+                epoch, f"{getattr(params_main or self.args, 'ckpt_name', 'model')}_best.pt"
+            )
+            return True
+        return False
 
     def _task_schedule(self, dataloaders_dict, epoch):
         """Per-epoch task batch order (review §38-39).
@@ -554,15 +596,45 @@ class Trainer:
     def _train_epoch(self, train_dataloaders_dict, epoch):
         self.model.train()
         self.loss_balancer.train()
+        # Review §32: the epoch's random trajectory (dropout, any training
+        # stochasticity) derives from (base_seed, epoch), never process
+        # history; loader shuffles derive from (base_seed, task, epoch).
+        seed_everything(stable_seed(self.seed, "train_epoch", epoch))
+        reseed_train_loaders(train_dataloaders_dict, self.seed, epoch)
         schedule = self._task_schedule(train_dataloaders_dict, epoch)
         schedule_diagnostics = self._schedule_diagnostics(schedule, train_dataloaders_dict)
         self.schedule_usage = {task: 0 for task in self.task_name}
         self.training_cache = {}
-        iterators = {
-            task: iter(loader)
+        # Review §15: a task may be scheduled for more passes than its
+        # loader provides batches (human_target_floor extra passes).  The
+        # iterator restarts only while scheduled-but-unconsumed batches
+        # remain, so extra passes are really consumed without unbounded
+        # cycling (the old code built one iterator and silently skipped the
+        # exhausted extra pass).
+        planned_passes: dict[str, int] = {}
+        for task in schedule:
+            planned_passes[task] = planned_passes.get(task, 0) + 1
+        usable_loaders = {
+            task: loader
             for task, loader in train_dataloaders_dict.items()
             if loader is not None and len(loader) > 0
         }
+        iterators = {task: iter(loader) for task, loader in usable_loaders.items()}
+        consumed_batches: dict[str, int] = {task: 0 for task in usable_loaders}
+
+        def next_scheduled_batch(task):
+            if task not in iterators:
+                return None
+            batch = next(iterators[task], None)
+            if batch is None and consumed_batches[task] < planned_passes[task]:
+                iterators[task] = iter(usable_loaders[task])
+                batch = next(iterators[task], None)
+            if batch is None:
+                return None
+            consumed_batches[task] += 1
+            return batch
+
+        actual_samples: dict[str, int] = {task: 0 for task in self.task_name}
         buffers = {task: {"pred": [], "label": []} for task in self.task_name}
         losses = {task: [] for task in self.task_name}
         self.loss_balancer.epoch = epoch
@@ -580,7 +652,7 @@ class Trainer:
             active_mask = torch.zeros(self.task_num, dtype=torch.bool, device=self.device)
             bundles = []
             for task in group:
-                batch = next(iterators[task], None)
+                batch = next_scheduled_batch(task)
                 if not self._valid_batch(batch):
                     continue
                 batch = batch.to(self.device)
@@ -611,6 +683,7 @@ class Trainer:
                 final_median = self.decode_task_output(task, bundle["final_raw"].detach(), apply_conformal=False)["median"]
                 buffers[task]["pred"].append(final_median.cpu())
                 buffers[task]["label"].append(bundle["labels"].cpu())
+                actual_samples[task] += int(bundle["labels"].shape[0])
                 losses[task].append(float(bundle["loss"].cpu()))
                 self._record_training_output(bundle)
         result = self._score_buffers(buffers)
@@ -619,6 +692,21 @@ class Trainer:
         result["updates"] = update_count
         result["schedule_usage"] = dict(self.schedule_usage)
         schedule_diagnostics["completed_updates"] = update_count
+        # Review §16: formal reports must quote actual consumption, so the
+        # planned exposure stays alongside the real batch/sample counts.
+        actual_batches = {task: int(count) for task, count in self.schedule_usage.items() if count}
+        actual_total = max(sum(actual_batches.values()), 1)
+        schedule_diagnostics["planned_task_batches"] = dict(schedule_diagnostics.get("task_batches", {}))
+        schedule_diagnostics["actual_task_batches"] = dict(sorted(actual_batches.items()))
+        schedule_diagnostics["actual_task_samples"] = {
+            task: int(count) for task, count in actual_samples.items() if count
+        }
+        schedule_diagnostics["actual_fraction_of_updates"] = {
+            task: round(count / actual_total, 6) for task, count in sorted(actual_batches.items())
+        }
+        human_tasks = [task for task in HUMAN_TARGET_TASKS if task in self.task_name]
+        human_actual = sum(actual_batches.get(task, 0) for task in human_tasks)
+        schedule_diagnostics["human3_actual_fraction"] = round(human_actual / actual_total, 6)
         result["schedule_diagnostics"] = schedule_diagnostics
         result["routing"] = self._routing_summary()
         return result
@@ -934,17 +1022,13 @@ class Trainer:
         Primary conformal evaluation targets the three human endpoints even
         though training/point evaluation cover all 59; interval reports are
         scoped accordingly instead of silently applying qhat everywhere.
+        Scope resolution goes through the shared helper (review §20).
         """
 
-        if self.conformal_scope == "human3":
-            return [
-                task
-                for task in self.task_name
-                if task in HUMAN_TARGET_TASKS and self.task_dict[task].get("fit_conformal", True)
-            ]
+        scoped = resolve_conformal_tasks(self.conformal_scope, self.task_name)
         return [
             task
-            for task in self.task_name
+            for task in scoped
             if self._is_regression(task) and self.task_dict[task].get("fit_conformal", True)
         ]
 
@@ -1115,9 +1199,9 @@ class Trainer:
             "task_names": list(self.task_name),
         }
 
-    def _checkpoint_payload(self, epoch):
-        checkpoint_version = 5 if self.data_metadata is not None else 4
-        return {
+    def _checkpoint_payload(self, epoch, *, include_historical_best=False):
+        checkpoint_version = 6 if self.data_metadata is not None else 4
+        payload = {
             "checkpoint_version": checkpoint_version,
             "model_state": self.model.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
@@ -1148,14 +1232,51 @@ class Trainer:
             # resume.
             "train_loss_buffer": getattr(self, "train_loss_buffer", None),
             "optimizer_updates": int(getattr(self, "optimizer_updates", 0)),
+            # Review-2 §32: the supported resume contract is epoch-boundary
+            # determinism via derived seeds; record the policy so a resume
+            # under a different scheme fails loudly instead of drifting.
+            "reproducibility": {
+                "base_seed": int(self.seed),
+                "seed_policy_version": SEED_POLICY_VERSION,
+                "epoch_seed_scheme": EPOCH_SEED_SCHEME,
+                "loader_seed_scheme": LOADER_SEED_SCHEME,
+                "persistent_worker_policy": PERSISTENT_WORKER_POLICY,
+                "initial_model_sha256": getattr(self, "initial_model_sha256", None),
+            },
+            # Review-2 §15: model-selection continuity — a resumed run must
+            # keep comparing against the historical best, not restart from
+            # -inf.  Every checkpoint records it; *_last.pt additionally
+            # embeds the historical best training state so it alone is a
+            # complete resume artifact (review-2 §16).
+            "selection_state": {
+                "best_val_score": (
+                    float(self.best_val_score) if self.best_val_score is not None else None
+                ),
+                "best_epoch": self.best_epoch,
+                "best_routing_enabled": self.best_routing_enabled,
+                "best_checkpoint_name": (
+                    self.best_checkpoint_path.name if self.best_checkpoint_path else None
+                ),
+            },
         }
+        if include_historical_best and self._best_training_state is not None:
+            payload["best_training_state"] = copy.deepcopy(self._best_training_state)
+            if self._best_state is not None:
+                payload["best_model_state"] = copy.deepcopy(self._best_state)
+        return payload
 
-    def _save_checkpoint(self, epoch, filename):
+    def _save_checkpoint(self, epoch, filename, *, include_historical_best=False):
         if self.save_path is None:
             return None
         self.save_path.mkdir(parents=True, exist_ok=True)
         path = self.save_path / filename
-        torch.save(self._checkpoint_payload(epoch), path)
+        # Review-2 §17: only *_last.pt embeds the historical best state, so
+        # it alone can resume the full selection contract without a copy of
+        # *_best.pt; best.pt must not carry a redundant copy of itself.
+        torch.save(
+            self._checkpoint_payload(epoch, include_historical_best=include_historical_best),
+            path,
+        )
         return path
 
     def load_checkpoint(self, path):
@@ -1166,7 +1287,7 @@ class Trainer:
             raise FileNotFoundError(f"Checkpoint not found: {path}")
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         formal_v2 = self.data_metadata is not None
-        expected_version = 5 if formal_v2 else 4
+        expected_version = 6 if formal_v2 else 4
         required = {
             "checkpoint_version", "model_state", "optimizer_state", "weighting_state", "epoch",
             "configuration", "task_names", "architecture_config", "prediction_mode", "quantile_config",
@@ -1175,6 +1296,10 @@ class Trainer:
         }
         if formal_v2:
             required.update({"data_config", "effective_rgcer_config", "routing_enabled"})
+            # Review-2 §31: formal v6 checkpoints must carry the full
+            # reproducibility and selection contracts — no optional legacy
+            # semantics.
+            required.update({"reproducibility", "selection_state"})
         missing = required.difference(checkpoint)
         if missing or checkpoint["checkpoint_version"] != expected_version:
             raise ValueError(
@@ -1182,6 +1307,18 @@ class Trainer:
             )
         if list(checkpoint["task_names"]) != self.task_name:
             raise ValueError("Checkpoint task_names do not match the current experiment")
+        stored_repro = checkpoint.get("reproducibility")
+        if formal_v2 and stored_repro is None:
+            raise ValueError("Formal v6 checkpoints must embed a reproducibility block")
+        if stored_repro is not None:
+            if int(stored_repro.get("seed_policy_version", -1)) != SEED_POLICY_VERSION:
+                raise ValueError(
+                    "Checkpoint seed policy version "
+                    f"{stored_repro.get('seed_policy_version')!r} does not match the current "
+                    f"policy ({SEED_POLICY_VERSION}); epoch-boundary resume would not be faithful"
+                )
+            if int(stored_repro.get("base_seed", -1)) != int(self.seed):
+                raise ValueError("Checkpoint base_seed does not match the current --seed")
         if checkpoint["prediction_mode"] != self._prediction_mode():
             raise ValueError("Checkpoint prediction mode does not match current configuration")
         stored_quantiles = checkpoint["quantile_config"]
@@ -1276,6 +1413,49 @@ class Trainer:
             self.best_checkpoint_path = path
             self.best_epoch = int(checkpoint["epoch"])
             self.best_routing_enabled = self.loaded_routing_enabled
+        # Review-2 §10/§18: restore the historical best-selection state so a
+        # resumed run keeps comparing against the pre-interruption best
+        # instead of treating any new epoch as an improvement over -inf.
+        selection = checkpoint.get("selection_state")
+        if selection is not None:
+            stored_score = selection.get("best_val_score")
+            self.best_val_score = (
+                float(stored_score) if stored_score is not None else -float("inf")
+            )
+            if selection.get("best_epoch") is not None:
+                self.best_epoch = int(selection["best_epoch"])
+            if selection.get("best_routing_enabled") is not None:
+                self.best_routing_enabled = bool(selection["best_routing_enabled"])
+            if selection.get("best_checkpoint_name"):
+                self.best_checkpoint_path = path.parent / str(selection["best_checkpoint_name"])
+            if path.name.endswith("_best.pt"):
+                # A v6 *_best.pt IS the historical best: its own states are
+                # the best states, so rebuild the restore payload from them.
+                self.best_checkpoint_path = path
+                self._best_state = copy.deepcopy(checkpoint["model_state"])
+                best_buffer = checkpoint.get("train_loss_buffer")
+                self._best_training_state = {
+                    "model_state": copy.deepcopy(checkpoint["model_state"]),
+                    "optimizer_state": copy.deepcopy(checkpoint["optimizer_state"]),
+                    "weighting_state": copy.deepcopy(checkpoint["weighting_state"]),
+                    "train_loss_buffer": (
+                        np.asarray(best_buffer, dtype=float).copy()
+                        if best_buffer is not None
+                        else np.zeros((self.task_num, max(int(checkpoint["epoch"]) + 1, 2)))
+                    ),
+                    "optimizer_updates": int(checkpoint.get("optimizer_updates", 0)),
+                    "epoch": int(checkpoint["epoch"]),
+                }
+        embedded_best = checkpoint.get("best_training_state")
+        if embedded_best is not None:
+            # Review-2 §16: *_last.pt is self-contained — restore the
+            # embedded historical best training state over the current one.
+            self._best_training_state = copy.deepcopy(embedded_best)
+            self._best_state = copy.deepcopy(
+                checkpoint.get("best_model_state") or embedded_best["model_state"]
+            )
+            if selection is None:
+                self.best_val_score = -float("inf")
         if checkpoint.get("train_loss_buffer") is not None:
             self.train_loss_buffer = np.asarray(checkpoint["train_loss_buffer"], dtype=float)
         self.optimizer_updates = int(checkpoint.get("optimizer_updates", 0))
@@ -1327,25 +1507,12 @@ class Trainer:
             # default on ToxAcute), not by the all-task macro score, so an
             # epoch that only improves animal endpoints cannot steal the
             # checkpoint from a better human endpoint epoch.
-            if self._eligible_for_best(epoch) and (
-                self._best_state is None or validation_result["selection_score"] > self.best_val_score
-            ):
-                self.best_val_score = validation_result["selection_score"]
-                self._best_state = copy.deepcopy(self.model.state_dict())
-                self.best_epoch = epoch
-                self.best_routing_enabled = self._routing_enabled(epoch)
-                self._best_training_state = {
-                    "model_state": copy.deepcopy(self.model.state_dict()),
-                    "optimizer_state": copy.deepcopy(self.optimizer.state_dict()),
-                    "weighting_state": copy.deepcopy(self.loss_balancer.state_dict()),
-                    "train_loss_buffer": self.train_loss_buffer.copy(),
-                    "optimizer_updates": int(self.optimizer_updates),
-                    "epoch": epoch,
-                }
-                self.best_checkpoint_path = self._save_checkpoint(
-                    epoch, f"{getattr(params_main or self.args, 'ckpt_name', 'model')}_best.pt"
-                )
-            self._save_checkpoint(epoch, f"{getattr(params_main or self.args, 'ckpt_name', 'model')}_last.pt")
+            self._maybe_update_best(validation_result, epoch, params_main=params_main)
+            self._save_checkpoint(
+                epoch,
+                f"{getattr(params_main or self.args, 'ckpt_name', 'model')}_last.pt",
+                include_historical_best=True,
+            )
         if self._is_rgcer and bool(getattr(self.args, "routing_enabled", True)) and self._best_state is None:
             raise ValueError("Full RGCER requires at least one validation epoch after HPS warm-up")
         if self._best_training_state is not None:

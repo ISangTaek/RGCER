@@ -158,7 +158,7 @@ def test_train_retains_final_test_result():
     trainer.model = nn.Linear(1, 1)
     trainer.loss_balancer = nn.Identity()
     trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.01)
-    trainer._save_checkpoint = lambda epoch, filename: None
+    trainer._save_checkpoint = lambda epoch, filename, **kwargs: None
 
     train_result = {"tasks": {"task": {"RMSE": 1.0}}, "score": 1.0, "loss": {"task": 1.0}}
     validation_result = {

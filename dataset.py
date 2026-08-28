@@ -12,6 +12,7 @@ from torch_geometric.data import Data
 
 from split_manifest import load_manifest
 from molecular_features import BOND_FEATURE_NAMES
+from reproducibility import loader_generator
 from toxacute_datastore import ToxAcuteDataStore, ToxAcuteTaskDataset
 
 
@@ -221,6 +222,7 @@ class DataloaderWrapper:
         data_store=None,
         max_nodes_filter=None,
         label_providers=None,
+        loader_seed=None,
     ):
         if data_store is None and isinstance(preprocessed_data_base_dir, ToxAcuteDataStore):
             data_store = preprocessed_data_base_dir
@@ -251,6 +253,12 @@ class DataloaderWrapper:
         )
         self.max_nodes_filter = max_nodes_filter
         self.label_providers = dict(label_providers or {})
+        # Review §8-9: train shuffling must draw from a per-task generator
+        # derived from the base seed (never the global RNG), so paired-seed
+        # runs see identical batch orders regardless of model-init RNG use.
+        # ``loader_seed`` defaults to split_seed so legacy callers stay
+        # reproducible too.
+        self.loader_seed = int(loader_seed) if loader_seed is not None else self.split_seed
 
         if self.data_store is None and self.preprocessed_data_base_dir is None:
             raise ValueError("Either data_store or preprocessed_data_base_dir is required")
@@ -292,8 +300,11 @@ class DataloaderWrapper:
         return {record["sample_id"]: record["split"] for record in manifest["records"]}
 
     @staticmethod
-    def _loader(dataset, indices, split_name, batch_size, num_workers, collate_fn):
+    def _loader(dataset, indices, split_name, batch_size, num_workers, collate_fn, task_name=None, loader_seed=None):
         subset = Subset(dataset, list(indices))
+        generator = None
+        if split_name == "train" and len(indices) > 0:
+            generator = loader_generator(int(loader_seed or 42), task_name or "", 0)
         return DataLoader(
             subset,
             batch_size=batch_size,
@@ -302,9 +313,10 @@ class DataloaderWrapper:
             pin_memory=False,
             collate_fn=collate_fn,
             drop_last=False,
+            generator=generator,
         )
 
-    def _build_task_loaders(self, dataset, split_lookup):
+    def _build_task_loaders(self, dataset, split_lookup, task_name=None):
         split_indices = {name: [] for name in ("train", "validation", "calibration", "test")}
         for index in range(len(dataset)):
             sample_id = dataset.get_sample_id(index)
@@ -313,7 +325,7 @@ class DataloaderWrapper:
             split_indices[split_lookup[sample_id]].append(index)
         return {
             "train": self._loader(
-                dataset, split_indices["train"], "train", self.batch_size, self.num_workers, self.collate_fn_for_loader
+                dataset, split_indices["train"], "train", self.batch_size, self.num_workers, self.collate_fn_for_loader, task_name=task_name, loader_seed=self.loader_seed
             ),
             "val": self._loader(
                 dataset,
@@ -336,7 +348,10 @@ class DataloaderWrapper:
             ),
         }
 
-    def _v2_loader(self, dataset, split_name):
+    def _v2_loader(self, dataset, split_name, task_name=None):
+        generator = None
+        if split_name == "train" and len(dataset) > 0:
+            generator = loader_generator(self.loader_seed, task_name or "", 0)
         return DataLoader(
             dataset,
             batch_size=self.batch_size,
@@ -345,7 +360,12 @@ class DataloaderWrapper:
             pin_memory=False,
             collate_fn=self.collate_fn_for_loader,
             drop_last=False,
-            persistent_workers=self.num_workers > 0,
+            # Review-2 §27 (plan A): persistent workers make iteration order
+            # depend on worker lifecycle, breaking epoch-boundary resume
+            # determinism when num_workers > 0.  Formal runs also pin
+            # --num_loader_workers 0.
+            persistent_workers=False,
+            generator=generator,
         )
 
     def _get_v2_data_loaders(self):
@@ -379,7 +399,7 @@ class DataloaderWrapper:
                 for split in ("train", "validation", "calibration", "test")
             }
             all_task_loaders[task_name] = {
-                "train": self._v2_loader(datasets["train"], "train"),
+                "train": self._v2_loader(datasets["train"], "train", task_name=task_name),
                 "val": self._v2_loader(datasets["validation"], "validation"),
                 "calibration": self._v2_loader(datasets["calibration"], "calibration"),
                 "test": self._v2_loader(datasets["test"], "test"),
@@ -396,7 +416,7 @@ class DataloaderWrapper:
         for task_name in self.task_list:
             task_dir = self.preprocessed_data_base_dir / task_name
             dataset = PreprocessedDatasetWrapper(task_dir)
-            all_task_loaders[task_name] = self._build_task_loaders(dataset, split_lookup)
+            all_task_loaders[task_name] = self._build_task_loaders(dataset, split_lookup, task_name=task_name)
             counts = {name: len(loader.dataset) for name, loader in all_task_loaders[task_name].items()}
             print(f"{task_name} split counts: {counts}")
         return all_task_loaders
@@ -415,12 +435,11 @@ class DataloaderWrapper:
                 for split in ("train", "validation", "calibration", "test")
             }
             return (
-                self._v2_loader(datasets["train"], "train"),
+                self._v2_loader(datasets["train"], "train", task_name=task_name),
                 self._v2_loader(datasets["validation"], "validation"),
                 self._v2_loader(datasets["calibration"], "calibration"),
                 self._v2_loader(datasets["test"], "test"),
             )
-        del task_name
         split_lookup = self._load_split_lookup()
-        loaders = self._build_task_loaders(dataset, split_lookup)
+        loaders = self._build_task_loaders(dataset, split_lookup, task_name=task_name)
         return loaders["train"], loaders["val"], loaders["calibration"], loaders["test"]

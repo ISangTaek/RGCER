@@ -208,8 +208,47 @@ pytest tests/
   enabled (`--routing_enabled`). Exposure is data-proportional by default
   (`--task_sampling proportional`); `human_target_floor` adds one extra
   full pass of each human loader per epoch for ablations, and every epoch
-  records `schedule_diagnostics` (per-task batches, update fractions,
-  human3 fraction) in the history/metrics output.
+  records `schedule_diagnostics` in the history/metrics output with BOTH
+  planned (`planned_task_batches`, `fraction_of_updates`, `human3_fraction`)
+  and actual (`actual_task_batches`, `actual_task_samples`,
+  `actual_fraction_of_updates`, `human3_actual_fraction`) consumption —
+  formal reports must quote the actual numbers.
+- **Reproducibility contract** (`reproducibility.py`, seed policy version 2):
+  `main()` calls `seed_everything(params.seed)` before ANY `nn.Module`
+  construction; `Trainer._set_seed` is defensive only. Every epoch reseeds
+  the global RNG with `stable_seed(base_seed, "train_epoch", epoch)` and each
+  train loader's dedicated `torch.Generator` with
+  `stable_seed(base_seed, task, "train", epoch)` — batch order is a pure
+  function of (seed, task, epoch), so HPS/RGCER paired-seed runs see
+  identical sample orders despite different model-init RNG consumption
+  (never use Python `hash()`; use `stable_seed`). Supported resume mode is
+  epoch-boundary determinism covering BOTH the training trajectory and the
+  model-selection trajectory: checkpoints carry mandatory (formal v6)
+  `reproducibility` (base seed, policy version, seed schemes,
+  persistent-worker policy, `initial_model_sha256`) and `selection_state`
+  (`best_val_score`, `best_epoch`, `best_routing_enabled`, best checkpoint
+  identity) blocks; `load_checkpoint` restores the historical best state and
+  rejects a mismatched policy version or base seed. Persistent DataLoader
+  workers are always disabled (they break resume iteration order when
+  `num_workers > 0`); formal runs pin `--num_loader_workers 0`. Each run
+  writes `run_metadata.json` (seed, seed policy version, loader worker
+  count/policy, `initial_model_sha256`, manifest hash, datastore
+  fingerprint, checkpoint version).
+  `scripts/hash_initial_model.py` prints the initialization hash of a fresh
+  process: same seed → same SHA256, different seed → different SHA256.
+- **Conformal scope resolution** is centralized in
+  `conformal.resolve_conformal_tasks(scope, task_names)`; split planning,
+  preflight, trainer fitting, and inference must all use it (`all_tasks`
+  resolves to every task, never an empty list). Inference gates conformal
+  per task: only `task in conformal_calibrator.states` applies qhat and is
+  labelled `conformal`; endpoints without a fitted state decode as
+  `raw_quantile` and must not crash.
+- **Manifest provenance (pre-LMDB)**: `_verify_approved_manifest` enforces
+  manifest version, split algorithm, `source_csv_sha256`, splitting, seed,
+  ratios, exact record count, no duplicate `sample_id` on either side, exact
+  sample-id sequence (order is contract), and per-record
+  row_index/canonical_smiles/scaffold identity — all before any LMDB write.
+  Label presence is aligned by `sample_id` mapping, never by position.
 - RDKit app logging is disabled globally in `main.py`.
 - `data/`, `artifacts/`, `processed_graph_data/` contents are git-ignored —
   large data files never go into git.

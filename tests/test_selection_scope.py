@@ -92,7 +92,7 @@ def _make_trainer(selection_scope):
     trainer.model = nn.Linear(1, 1)
     trainer.loss_balancer = nn.Identity()
     trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.01)
-    trainer._save_checkpoint = lambda epoch, filename: f"ckpt_epoch{epoch}_{filename}"
+    trainer._save_checkpoint = lambda epoch, filename, **kwargs: f"ckpt_epoch{epoch}_{filename}"
     trainer._train_epoch = lambda loaders, epoch: {
         "tasks": {task: {"RMSE": 1.0} for task in TASK_NAMES},
         "score": 1.0,
