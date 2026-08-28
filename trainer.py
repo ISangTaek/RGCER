@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import random
 import warnings
 from pathlib import Path
@@ -13,6 +14,7 @@ from torch.nn.utils import clip_grad_norm_
 
 from conformal import ConformalCalibrator
 from architecture.prediction_heads import decode_prediction
+from architecture.toxacute_tasks import ANIMAL_SOURCE_TASKS, HUMAN_TARGET_TASKS
 from loss import QuantileRegressionLoss
 from metric import (
     compute_classification_metrics,
@@ -22,6 +24,36 @@ from metric import (
 from molecular_features import FEATURE_SCHEMA_VERSION
 from split_manifest import load_manifest, manifest_hash
 from utils import count_parameters
+
+
+SOURCE_POLICY_CHOICES = ("all_except_target", "animal56_only")
+DEFAULT_SOURCE_POLICY = "animal56_only"
+
+
+def build_source_policy_mask(task_names, *, policy, allowed_auxiliary=()):
+    """Return the router-source allow-list implied by the source policy.
+
+    ``animal56_only`` keeps the animal→human claim honest: for a human
+    target only animal endpoints may act as sources.  The router still
+    excludes the target itself; shuffled auxiliary stress endpoints stay
+    usable only when they are explicitly allowed by name.
+    """
+
+    if policy not in SOURCE_POLICY_CHOICES:
+        raise ValueError(f"Unknown rgcer_source_policy: {policy!r}")
+    allowed_auxiliary = [str(name) for name in (allowed_auxiliary or [])]
+    unknown = [name for name in allowed_auxiliary if name not in task_names]
+    if unknown:
+        raise ValueError(
+            f"explicitly_allowed_auxiliary_sources references tasks outside this run: {unknown}"
+        )
+    mask = []
+    for name in task_names:
+        if policy == "all_except_target":
+            mask.append(True)
+        else:
+            mask.append((name in ANIMAL_SOURCE_TASKS) or (name in set(allowed_auxiliary)))
+    return mask
 
 
 class Trainer:
@@ -48,6 +80,24 @@ class Trainer:
         self.load_path = load_path
         self.kwargs = kwargs
         self.seed = int(getattr(args, "seed", 42))
+        self.selection_scope = str(getattr(args, "selection_scope", "human3"))
+        self.conformal_scope = str(getattr(args, "conformal_scope", "human3"))
+        if self.conformal_scope not in {"human3", "all_tasks"}:
+            raise ValueError(f"Unknown conformal_scope: {self.conformal_scope!r}")
+        self.conformal_fit_report: list[dict] = []
+        self.source_policy = str(getattr(args, "rgcer_source_policy", DEFAULT_SOURCE_POLICY))
+        if self.source_policy not in SOURCE_POLICY_CHOICES:
+            raise ValueError(f"Unknown rgcer_source_policy: {self.source_policy!r}")
+        self.allowed_auxiliary_sources = tuple(
+            str(name)
+            for name in (getattr(args, "explicitly_allowed_auxiliary_sources", None) or ())
+        )
+        build_source_policy_mask(
+            self.task_name,
+            policy=self.source_policy,
+            allowed_auxiliary=self.allowed_auxiliary_sources,
+        )
+        self._source_mask_by_device: dict[torch.device, torch.Tensor] = {}
         self._set_seed(self.seed)
         self.device = self._resolve_device(args)
         if architecture is None or encoder_class is None:
@@ -93,16 +143,27 @@ class Trainer:
         self.schedule_usage = {}
         self.optimizer_updates = 0
         self.training_cache = {}
-        self._is_rgcer = hasattr(getattr(self.model, "encoder", None), "task_conditioner") and hasattr(
-            getattr(getattr(self.model, "encoder", None), "task_conditioner", None), "router"
-        ) and hasattr(
-            getattr(getattr(getattr(self.model, "encoder", None), "task_conditioner", None), "router", None),
-            "response_encoder",
+        self._is_rgcer = bool(getattr(self.model, "is_rgcer", False))
+        self.data_metadata = getattr(args, "datastore_metadata", None)
+        if self.data_metadata is None:
+            data_store_dir = getattr(args, "data_store_dir", None)
+            if data_store_dir:
+                try:
+                    from toxacute_datastore import ToxAcuteDataStore
+
+                    store = ToxAcuteDataStore.resolve(data_store_dir)
+                    self.data_metadata = store.metadata
+                    store.close()
+                except (FileNotFoundError, ValueError):
+                    # Non-ToxAcute unit callers may retain a placeholder path.
+                    self.data_metadata = None
+        self.max_path_distance = int(
+            (self.data_metadata or {}).get("max_path_distance", getattr(args, "max_path_distance", 8) or 8)
         )
         if load_path is not None:
             self.load_checkpoint(load_path)
         elif getattr(args, "mode", "train") in {"test", "batch_inference", "single_inference"}:
-            raise FileNotFoundError("test/inference mode requires --load_path to a strict v4 checkpoint")
+            raise FileNotFoundError("test/inference mode requires --load_path to a strict checkpoint")
         count_parameters(self.model)
 
     @staticmethod
@@ -188,21 +249,71 @@ class Trainer:
             "upper": self._denormalize_tensor(task, decoded.upper),
         }
         if apply_conformal and mode == "quantile":
-            if task in self.conformal_calibrator.states:
-                result["lower"], result["upper"] = self.conformal_calibrator.apply(
-                    task, result["lower"], result["upper"]
+            if task not in self.conformal_calibrator.states:
+                # Fail fast instead of silently reporting uncalibrated bands
+                # as conformal intervals (e.g. --no-fit_conformal runs).
+                raise ValueError(
+                    f"No conformal state fitted for task {task!r}; re-run with "
+                    "--fit_conformal or request apply_conformal=False."
                 )
+            result["lower"], result["upper"] = self.conformal_calibrator.apply(
+                task, result["lower"], result["upper"]
+            )
         return result
 
     def _task_schedule(self, dataloaders_dict, epoch):
+        """Per-epoch task batch order (review §38-39).
+
+        Default ``proportional`` keeps the historical data-proportional
+        exposure so every baseline trains under the same schedule; the
+        recorded diagnostics make that bias visible instead of silent.
+        ``human_target_floor`` (ablation-only) additionally appends one full
+        extra pass of each human target loader.
+        """
+
         schedule = []
         for task in self.task_name:
             loader = dataloaders_dict.get(task)
             if loader is not None:
                 schedule.extend([task] * len(loader))
+        sampling = str(getattr(self.args, "task_sampling", "proportional") or "proportional")
+        if sampling == "human_target_floor":
+            for task in HUMAN_TARGET_TASKS:
+                if task not in self.task_name:
+                    continue
+                loader = dataloaders_dict.get(task)
+                if loader is not None and len(loader) > 0:
+                    schedule.extend([task] * len(loader))
+        elif sampling != "proportional":
+            raise ValueError(f"Unknown --task_sampling: {sampling!r}")
         rng = np.random.default_rng(self.seed + int(epoch))
         rng.shuffle(schedule)
         return list(schedule)
+
+    def _schedule_diagnostics(self, schedule, dataloaders_dict):
+        """Per-epoch exposure report so data-proportionality stays auditable."""
+
+        human_tasks = [task for task in HUMAN_TARGET_TASKS if task in self.task_name]
+        batches: dict[str, int] = {}
+        for task in schedule:
+            batches[task] = batches.get(task, 0) + 1
+        total_updates = max(len(schedule), 1)
+        fractions = {task: round(count / total_updates, 6) for task, count in sorted(batches.items())}
+        dataset_batches = {
+            task: len(loader)
+            for task in self.task_name
+            for loader in [dataloaders_dict.get(task)]
+            if loader is not None
+        }
+        human_batches = sum(batches.get(task, 0) for task in human_tasks)
+        return {
+            "task_batches": dict(sorted(batches.items())),
+            "loader_batches_per_pass": dataset_batches,
+            "fraction_of_updates": fractions,
+            "human3_fraction": round(human_batches / total_updates, 6),
+            "total_updates": total_updates,
+            "task_sampling": str(getattr(self.args, "task_sampling", "proportional")),
+        }
 
     def _loss(self, task, prediction, labels):
         loss_fn = self.task_dict[task]["loss_fn"]
@@ -247,6 +358,48 @@ class Trainer:
             return True
         return epoch >= getattr(self.args, "hps_warmup_epochs", 0)
 
+    def source_policy_mask(self, device=None):
+        """Default router-source mask for the current task list and policy.
+
+        Returns ``None`` unless this instance was fully constructed with a
+        source policy: minimally wired fixtures keep the previous behaviour
+        of passing no mask at all.
+        """
+
+        if not self._is_rgcer:
+            return None
+        if not getattr(self, "source_policy", None) or not getattr(self, "task_name", None):
+            return None
+        target_device = device if device is not None else getattr(
+            self, "device", torch.device("cpu")
+        )
+        cached = self._source_mask_by_device.get(target_device)
+        if cached is None:
+            mask = build_source_policy_mask(
+                self.task_name,
+                policy=self.source_policy,
+                allowed_auxiliary=self.allowed_auxiliary_sources,
+            )
+            cached = torch.tensor(mask, dtype=torch.bool, device=target_device)
+            self._source_mask_by_device[target_device] = cached
+        return cached
+
+    def effective_source_mask(self, source_mask, device=None):
+        """Explicit masks win; otherwise the configured policy applies."""
+
+        if source_mask is not None:
+            return source_mask
+        return self.source_policy_mask(device)
+
+    def _eligible_for_best(self, epoch: int) -> bool:
+        """Only routed Full RGCER epochs may define its best checkpoint."""
+
+        if not self._is_rgcer:
+            return True
+        if not bool(getattr(self.args, "routing_enabled", True)):
+            return True
+        return int(epoch) >= int(getattr(self.args, "hps_warmup_epochs", 0))
+
     def _forward_task(self, batch, task, epoch, return_aux=True, routing_enabled_override=None):
         if self._is_rgcer:
             result = self.model(
@@ -254,12 +407,34 @@ class Trainer:
                 task_name=task,
                 return_aux=return_aux,
                 routing_enabled=self._routing_enabled(epoch, routing_enabled_override),
+                source_mask=self.effective_source_mask(None),
             )
         else:
             result = self.model(batch, task_name=task, return_aux=return_aux)
         if return_aux and isinstance(result, tuple):
             return result[0], self._diagnostics_dict(result[1])
         return result, {}
+
+    @torch.no_grad()
+    def predict_all_tasks(self, batch, *, return_aux=False, source_mask=None):
+        """Run inference with the configured source policy applied by default."""
+
+        self.model.eval()
+        default_mask = self.effective_source_mask(source_mask)
+        if self._is_rgcer:
+            return self.model(
+                batch,
+                return_all_tasks=True,
+                return_aux=return_aux,
+                source_mask=default_mask,
+                routing_enabled=self._routing_enabled(None),
+            )
+        return self.model(
+            batch,
+            return_all_tasks=True,
+            return_aux=return_aux,
+            source_mask=default_mask,
+        )
 
     def _training_step(self, batch, task, epoch):
         labels = batch.y.reshape(-1, 1).float()
@@ -289,9 +464,9 @@ class Trainer:
 
     def _record_training_output(self, bundle):
         task = bundle["task"]
-        final = self.decode_task_output(task, bundle["final_raw"].detach(), apply_conformal=False)["median"]
-        base = self.decode_task_output(task, bundle["base_raw"].detach(), apply_conformal=False)["median"]
-        route = self.decode_task_output(task, bundle["route_raw"].detach(), apply_conformal=False)["median"]
+        final = self.decode_task_output(task, bundle["final_raw"].detach(), apply_conformal=False)["median"].cpu()
+        base = self.decode_task_output(task, bundle["base_raw"].detach(), apply_conformal=False)["median"].cpu()
+        route = self.decode_task_output(task, bundle["route_raw"].detach(), apply_conformal=False)["median"].cpu()
         diagnostics = bundle["diagnostics"]
         self.training_cache.setdefault(
             task,
@@ -304,6 +479,7 @@ class Trainer:
                 "final_regret": [],
                 "null": [],
                 "source_weights": [],
+                "joint_source_weights": [],
                 "entropy": [],
             },
         )
@@ -321,6 +497,8 @@ class Trainer:
             cache["null"].append(diagnostics["null_weight"].detach().cpu())
         if "source_weights" in diagnostics:
             cache["source_weights"].append(diagnostics["source_weights"].detach().cpu())
+        if "joint_source_weights" in diagnostics:
+            cache["joint_source_weights"].append(diagnostics["joint_source_weights"].detach().cpu())
         if "routing_entropy" in diagnostics:
             cache["entropy"].append(diagnostics["routing_entropy"].detach().cpu())
 
@@ -347,6 +525,16 @@ class Trainer:
                         "mean_null_weight": float(null.mean()),
                         "mean_null": float(null.mean()),
                         "std_null": float(null.std(unbiased=False)),
+                        "mean_transfer_mass": float((1.0 - null).mean()),
+                    }
+                )
+            if cache.get("joint_source_weights"):
+                joint = torch.cat(cache["joint_source_weights"])
+                total_source_mass = joint.sum(dim=-1)
+                result.update(
+                    {
+                        "mean_joint_source_mass": float(total_source_mass.mean()),
+                        "routing_variance_joint": float(joint.var(dim=0, unbiased=False).mean()),
                     }
                 )
             if cache["source_weights"]:
@@ -367,6 +555,7 @@ class Trainer:
         self.model.train()
         self.loss_balancer.train()
         schedule = self._task_schedule(train_dataloaders_dict, epoch)
+        schedule_diagnostics = self._schedule_diagnostics(schedule, train_dataloaders_dict)
         self.schedule_usage = {task: 0 for task in self.task_name}
         self.training_cache = {}
         iterators = {
@@ -429,12 +618,32 @@ class Trainer:
         self.optimizer_updates += update_count
         result["updates"] = update_count
         result["schedule_usage"] = dict(self.schedule_usage)
+        schedule_diagnostics["completed_updates"] = update_count
+        result["schedule_diagnostics"] = schedule_diagnostics
         result["routing"] = self._routing_summary()
         return result
+
+    def _selection_tasks(self):
+        """Return ``(tasks, effective_scope)`` used for best-checkpoint selection.
+
+        ``human3`` selects the three human target endpoints, which are the
+        endpoints the model is meant to serve.  When the current run contains
+        none of them (e.g. an animal56 task scope or a non-ToxAcute dataset)
+        the selection falls back to every task of the run.
+        """
+        if self.selection_scope == "human3":
+            selected = [task for task in self.task_name if task in HUMAN_TARGET_TASKS]
+            if selected:
+                return selected, "human3"
+        return list(self.task_name), "all_tasks"
 
     def _score_buffers(self, buffers):
         task_scores = {}
         primary_values = []
+        regression_values = []
+        human3_values = []
+        selection_tasks, effective_scope = self._selection_tasks()
+        selection_values = []
         for task in self.task_name:
             pred = buffers[task]["pred"]
             labels = buffers[task]["label"]
@@ -446,14 +655,37 @@ class Trainer:
             values = compute_regression_metrics(pred_array, label_array) if self._is_regression(task) else compute_classification_metrics(pred_array, label_array)
             task_scores[task] = {name: values.get(name, np.nan) for name in self.task_dict[task]["metrics"]}
             primary = task_scores[task][self.task_dict[task]["metrics"][0]]
-            if np.isfinite(primary):
-                primary_values.append(self.task_dict[task]["weight"][0] * primary)
-        return {"tasks": task_scores, "score": float(np.mean(primary_values)) if primary_values else -float("inf")}
+            weighted = self.task_dict[task]["weight"][0] * primary
+            if self.task_dict[task].get("include_in_macro", True) and np.isfinite(primary):
+                primary_values.append(weighted)
+                if self._is_regression(task):
+                    regression_values.append(primary)
+            if task in HUMAN_TARGET_TASKS and np.isfinite(primary):
+                human3_values.append(primary)
+            if task in selection_tasks and np.isfinite(primary):
+                selection_values.append(weighted)
+        return {
+            "tasks": task_scores,
+            "score": float(np.mean(primary_values)) if primary_values else -float("inf"),
+            "selection_score": float(np.mean(selection_values)) if selection_values else -float("inf"),
+            "selection_scope": effective_scope,
+            "selection_tasks": list(selection_tasks),
+            "human3_macro_rmse": float(np.mean(human3_values)) if human3_values else np.nan,
+            "all_task_macro_rmse": float(np.mean(regression_values)) if regression_values else np.nan,
+        }
 
     @staticmethod
     def _print_metrics(mode, epoch, result):
         prefix = mode if epoch is None else f"{mode} epoch={epoch:03d}"
         pieces = [f"{prefix}: score={result['score']:.6f}"]
+        if "selection_score" in result:
+            pieces.append(
+                f"selection[{result.get('selection_scope', '<unset>')}]={result['selection_score']:.6f}"
+            )
+            for key in ("human3_macro_rmse", "all_task_macro_rmse"):
+                value = result.get(key, np.nan)
+                if np.isfinite(value):
+                    pieces.append(f"{key}={value:.6f}")
         for task, values in result["tasks"].items():
             pieces.append(f"{task}[{', '.join(f'{key}={value:.6f}' for key, value in values.items())}]")
         print(" | ".join(pieces))
@@ -480,6 +712,7 @@ class Trainer:
                 "target": [],
                 "null": [],
                 "source_weights": [],
+                "joint_source_weights": [],
                 "route_regret": [],
                 "final_regret": [],
                 "entropy": [],
@@ -503,7 +736,14 @@ class Trainer:
                         routing_enabled_override=routing_enabled_override,
                     )
                     final_raw = output[task]
-                    final_decoded = self.decode_task_output(task, final_raw, apply_conformal=apply_conformal)
+                    # Per-task conformal gating (§23): point metrics cover the
+                    # full task list, but qhat is only applied where a state
+                    # exists — never labelling uncalibrated animal intervals
+                    # as conformal.
+                    apply_task_conformal = (
+                        apply_conformal and task in self.conformal_calibrator.states
+                    )
+                    final_decoded = self.decode_task_output(task, final_raw, apply_conformal=apply_task_conformal)
                     target = batch.y.reshape(-1, 1).float()
                     buffers[task]["pred"].append(final_decoded["median"].cpu())
                     buffers[task]["label"].append(target.cpu())
@@ -525,6 +765,10 @@ class Trainer:
                         route_records[task]["null"].append(diagnostics["null_weight"].cpu())
                     if "source_weights" in diagnostics:
                         route_records[task]["source_weights"].append(diagnostics["source_weights"].cpu())
+                    if "joint_source_weights" in diagnostics:
+                        route_records[task]["joint_source_weights"].append(
+                            diagnostics["joint_source_weights"].cpu()
+                        )
                     if "routing_entropy" in diagnostics:
                         route_records[task]["entropy"].append(diagnostics["routing_entropy"].cpu())
         return buffers, records, route_records
@@ -533,24 +777,39 @@ class Trainer:
         buffers, records, route_records = self._collect_predictions(
             dataloaders_dict,
             epoch=epoch,
-            apply_conformal=mode == "test",
+            apply_conformal=(mode == "test" and bool(getattr(self.args, "fit_conformal", True))),
             routing_enabled_override=routing_enabled_override,
         )
         result = self._score_buffers(buffers)
         if self._prediction_mode() == "quantile":
-            interval_values = []
-            for task in self.task_name:
-                if not self._is_regression(task) or not records[task]["target"]:
+            scoped_tasks = self._conformal_tasks()
+            task_interval_metrics = {}
+            for task in scoped_tasks:
+                if not records[task]["target"]:
                     continue
                 lower = torch.cat(records[task]["lower"])
                 upper = torch.cat(records[task]["upper"])
                 target = torch.cat(records[task]["target"])
                 if mode == "test" and task in self.conformal_calibrator.states:
                     lower, upper = self.conformal_calibrator.apply(task, lower, upper)
-                interval_values.append(compute_interval_metrics(lower, upper, target, self.args.conformal_alpha))
-            if interval_values:
+                # Interval reports keep the per-task view even when the
+                # split carries few samples; macro alone would hide which
+                # human endpoint is actually covered.
+                task_interval_metrics[task] = compute_interval_metrics(
+                    lower, upper, target, self.args.conformal_alpha
+                )
+            if task_interval_metrics:
+                macro_values = list(task_interval_metrics.values())
                 result["interval"] = {
-                    key: float(np.nanmean([value[key] for value in interval_values])) for key in interval_values[0]
+                    "scope": self.conformal_scope,
+                    "tasks": {
+                        task: {key: float(value) for key, value in values.items()}
+                        for task, values in task_interval_metrics.items()
+                    },
+                    "macro": {
+                        key: float(np.nanmean([value[key] for value in macro_values]))
+                        for key in macro_values[0]
+                    },
                 }
         result["routing"] = self._evaluation_routing_summary(route_records)
         self._print_metrics(mode, epoch if mode == "validation" else None, result)
@@ -627,6 +886,7 @@ class Trainer:
                 values["mean_null_weight"] = float(null.mean())
                 values["mean_null"] = float(null.mean())
                 values["std_null"] = float(null.std(unbiased=False))
+                values["mean_transfer_mass"] = float((1.0 - null).mean())
                 null_values = null.detach().cpu().numpy().reshape(-1)
                 route_regret_values = regret.detach().cpu().numpy().reshape(-1)
                 harmful_route = route_regret_values > 0
@@ -635,6 +895,10 @@ class Trainer:
                 values["null_weight_route_regret_spearman"] = cls._safe_spearman(
                     null_values, route_regret_values
                 )
+            if record.get("joint_source_weights"):
+                joint = torch.cat(record["joint_source_weights"])
+                values["mean_joint_source_mass"] = float(joint.sum(dim=-1).mean())
+                values["routing_variance_joint"] = float(joint.var(dim=0, unbiased=False).mean())
             if record["source_weights"]:
                 weights = torch.cat(record["source_weights"])
                 values["mean_active_sources"] = float((weights > 0).sum(dim=-1).float().mean())
@@ -664,6 +928,26 @@ class Trainer:
             aggregate[key] = float(np.nanmean(values)) if values else float("nan")
         return aggregate
 
+    def _conformal_tasks(self):
+        """Tasks that receive CQR states, per ``--conformal_scope``.
+
+        Primary conformal evaluation targets the three human endpoints even
+        though training/point evaluation cover all 59; interval reports are
+        scoped accordingly instead of silently applying qhat everywhere.
+        """
+
+        if self.conformal_scope == "human3":
+            return [
+                task
+                for task in self.task_name
+                if task in HUMAN_TARGET_TASKS and self.task_dict[task].get("fit_conformal", True)
+            ]
+        return [
+            task
+            for task in self.task_name
+            if self._is_regression(task) and self.task_dict[task].get("fit_conformal", True)
+        ]
+
     def _fit_conformal(self, calibration_dataloaders_dict, routing_enabled_override=None):
         if self._prediction_mode() != "quantile" or not getattr(self.args, "fit_conformal", True):
             return
@@ -673,19 +957,63 @@ class Trainer:
             apply_conformal=False,
             routing_enabled_override=routing_enabled_override,
         )
-        for task in self.task_name:
-            if not self._is_regression(task):
-                continue
+        splitting = getattr(self.args, "splitting", None)
+        if splitting == "scaffold":
+            warnings.warn(
+                "Standard split-conformal finite-sample coverage assumes exchangeability; "
+                "scaffold-split coverage is reported empirically under structural shift.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        self.conformal_fit_report = []
+        for task in self._conformal_tasks():
             if not records[task]["target"]:
                 raise ValueError(f"No calibration samples for {task}.")
-            self.conformal_calibrator.fit_task(
+            state = self.conformal_calibrator.fit_task(
                 task,
                 torch.cat(records[task]["lower"]),
                 torch.cat(records[task]["upper"]),
                 torch.cat(records[task]["target"]),
             )
+            from conformal import minimum_calibration_size
+
+            required_minimum = minimum_calibration_size(self.conformal_calibrator.alpha)
+            entry = {
+                "task": task,
+                "alpha": float(self.conformal_calibrator.alpha),
+                "calibration_count": int(state.count),
+                "required_minimum": int(required_minimum),
+                "stability_threshold": int(self.conformal_calibrator.min_calibration_size),
+                "qhat": float(state.qhat),
+                "status": (
+                    "OK"
+                    if state.count >= self.conformal_calibrator.min_calibration_size
+                    else "LOW_CALIBRATION_STABILITY"
+                ),
+            }
+            self.conformal_fit_report.append(entry)
+            print(
+                "[conformal] "
+                + json.dumps(
+                    {key: entry[key] for key in entry if key != "status"}
+                    | {"status": entry["status"]}
+                )
+            )
+
+    def _conformal_validity(self):
+        """Coverage-claim metadata: method, alpha, and split-type assumptions."""
+
+        from conformal import exchangeability_metadata
+
+        return {
+            "conformal_method": "taskwise_cqr" if self._prediction_mode() == "quantile" else None,
+            "conformal_alpha": float(getattr(self.args, "conformal_alpha", 0.10)),
+            **exchangeability_metadata(getattr(self.args, "splitting", None)),
+        }
 
     def _manifest_hash(self):
+        if self.data_metadata is not None:
+            return self.data_metadata.get("split_manifest_hash")
         directory = getattr(self.args, "preprocessed_data_dir", None)
         if not directory:
             return None
@@ -701,6 +1029,21 @@ class Trainer:
             "task_names": list(self.task_name),
             "prediction_mode": self._prediction_mode(),
             "edge_bias_mode": getattr(self.args, "edge_bias_mode", "path"),
+            "spatial_pos_max_clip": getattr(
+                self.args, "spatial_pos_clip", getattr(self.args, "spatial_pos_max_clip", 20)
+            ),
+            # §42 provenance: behaviour-affecting sizes/rates that a
+            # state_dict alone cannot reveal on resume.
+            "hidden_dim": int(getattr(self.args, "hidden_dim", 0) or 0),
+            "a_layers": int(getattr(self.args, "a_layers", 0) or 0),
+            "a_heads": int(getattr(self.args, "a_heads", 0) or 0),
+            "mid_dim": int(getattr(self.args, "mid_dim", 0) or 0),
+            "head_hidden_dim": int(getattr(self.args, "head_hidden_dim", 0) or 0),
+            "head_dropout": float(getattr(self.args, "head_dropout", 0.0)),
+            "adapter_ratio": float(getattr(self.args, "adapter_ratio", 0.25)),
+            "response_hidden_dim": int(getattr(self.args, "response_hidden_dim", 0) or 0),
+            "task_sampling": str(getattr(self.args, "task_sampling", "proportional")),
+            "conformal_scope": self.conformal_scope,
             "router_top_k": getattr(self.args, "router_top_k", 0),
             "router_temperature": getattr(self.args, "router_temperature", 1.0),
             "exclude_target_from_sources": getattr(self.args, "exclude_target_from_sources", True),
@@ -713,21 +1056,27 @@ class Trainer:
 
     def _rgcer_config(self):
         architecture_config = self._architecture_config()
+        resolved = getattr(self.args, "effective_rgcer_config", None)
+        effective = resolved.get("effective", {}) if isinstance(resolved, dict) else {}
+
+        def _value(name, default):
+            return effective.get(name, getattr(self.args, name, default))
+
         return {
-            "rgcer_use_source_response": getattr(self.args, "rgcer_use_source_response", True),
-            "rgcer_use_target_response": getattr(self.args, "rgcer_use_target_response", True),
-            "rgcer_use_molecule_query": getattr(self.args, "rgcer_use_molecule_query", True),
-            "rgcer_use_sparse_routing": getattr(self.args, "rgcer_use_sparse_routing", True),
-            "rgcer_use_null_route": getattr(self.args, "rgcer_use_null_route", True),
-            "rgcer_use_film": getattr(self.args, "rgcer_use_film", True),
-            "rgcer_use_adapter": getattr(self.args, "rgcer_use_adapter", True),
-            "rgcer_use_base_aux_loss": getattr(self.args, "rgcer_use_base_aux_loss", True),
-            "rgcer_fallback_space": getattr(self.args, "rgcer_fallback_space", "prediction"),
-            "rgcer_transfer_mechanism": getattr(
-                self.args, "rgcer_transfer_mechanism", "endpoint_router"
-            ),
-            "router_top_k": getattr(self.args, "router_top_k", 0),
-            "router_temperature": getattr(self.args, "router_temperature", 1.0),
+            "rgcer_use_source_response": _value("rgcer_use_source_response", True),
+            "rgcer_use_target_response": _value("rgcer_use_target_response", True),
+            "rgcer_use_molecule_query": _value("rgcer_use_molecule_query", True),
+            "rgcer_use_sparse_routing": _value("rgcer_use_sparse_routing", True),
+            "rgcer_use_null_route": _value("rgcer_use_null_route", True),
+            "rgcer_use_film": _value("rgcer_use_film", True),
+            "rgcer_use_adapter": _value("rgcer_use_adapter", True),
+            "rgcer_use_base_aux_loss": _value("rgcer_use_base_aux_loss", True),
+            "rgcer_fallback_space": _value("rgcer_fallback_space", "prediction"),
+            "rgcer_transfer_mechanism": _value("rgcer_transfer_mechanism", "endpoint_router"),
+            "router_top_k": _value("router_top_k", 0),
+            "router_temperature": _value("router_temperature", 1.0),
+            "rgcer_source_policy": self.source_policy,
+            "allowed_auxiliary_sources": list(self.allowed_auxiliary_sources),
             "exclude_target_from_sources": getattr(self.args, "exclude_target_from_sources", True),
             "use_factorized_prompt": architecture_config["use_factorized_prompt"],
             "prediction_mode": self._prediction_mode(),
@@ -735,11 +1084,41 @@ class Trainer:
             "lambda_base": getattr(self.args, "lambda_base", 0.0),
             "lambda_quantile": getattr(self.args, "lambda_quantile", 1.0),
             "routing_enabled": getattr(self.args, "routing_enabled", True),
+            "effective": getattr(self.args, "effective_rgcer_config", None),
+        }
+
+    def _data_config(self):
+        metadata = self.data_metadata or {}
+        return {
+            "datastore_format_version": metadata.get("format_version"),
+            "datastore_build_id": metadata.get("build_id"),
+            "datastore_fingerprint": metadata.get("datastore_fingerprint"),
+            "raw_csv_sha256": metadata.get("raw_csv_sha256"),
+            "feature_schema_version": metadata.get("feature_schema_version", FEATURE_SCHEMA_VERSION),
+            "max_path_distance": int(metadata.get("max_path_distance", self.max_path_distance)),
+            "splitting": metadata.get("splitting", getattr(self.args, "splitting", None)),
+            "split_seed": metadata.get("split_seed", getattr(self.args, "split_seed", None)),
+            "split_ratios": metadata.get(
+                "split_ratios",
+                {
+                    "train": 1.0
+                    - getattr(self.args, "vs", 0.1)
+                    - getattr(self.args, "calibration_size", 0.1)
+                    - getattr(self.args, "ts", 0.1),
+                    "validation": getattr(self.args, "vs", 0.1),
+                    "calibration": getattr(self.args, "calibration_size", 0.1),
+                    "test": getattr(self.args, "ts", 0.1),
+                },
+            ),
+            "split_manifest_hash": metadata.get("split_manifest_hash", self._manifest_hash()),
+            "max_nodes_filter": getattr(self.args, "max_nodes_filter", None),
+            "task_names": list(self.task_name),
         }
 
     def _checkpoint_payload(self, epoch):
+        checkpoint_version = 5 if self.data_metadata is not None else 4
         return {
-            "checkpoint_version": 4,
+            "checkpoint_version": checkpoint_version,
             "model_state": self.model.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
             "weighting_state": self.loss_balancer.state_dict(),
@@ -753,13 +1132,17 @@ class Trainer:
                 "upper": getattr(self.args, "upper_quantile", 0.95),
             },
             "conformal_state": self.conformal_calibrator.state_dict(),
+            "conformal_validity": self._conformal_validity(),
+            "conformal_report": list(self.conformal_fit_report),
             "hps_warmup_epochs": getattr(self.args, "hps_warmup_epochs", 0),
             "routing_enabled": self._routing_enabled(epoch),
             "rgcer_config": self._rgcer_config(),
+            "effective_rgcer_config": getattr(self.args, "effective_rgcer_config", None),
             "task_metadata": self._architecture_config().get("task_metadata", []),
             "task_scalers": self.task_scalers,
             "split_manifest_hash": self._manifest_hash(),
             "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            "data_config": self._data_config(),
             # These fields are optional when loading an older v3 checkpoint;
             # new checkpoints retain enough optimizer history for a faithful
             # resume.
@@ -782,15 +1165,21 @@ class Trainer:
         if not path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {path}")
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        formal_v2 = self.data_metadata is not None
+        expected_version = 5 if formal_v2 else 4
         required = {
             "checkpoint_version", "model_state", "optimizer_state", "weighting_state", "epoch",
             "configuration", "task_names", "architecture_config", "prediction_mode", "quantile_config",
             "conformal_state", "hps_warmup_epochs", "rgcer_config", "task_metadata", "task_scalers",
             "split_manifest_hash", "feature_schema_version",
         }
+        if formal_v2:
+            required.update({"data_config", "effective_rgcer_config", "routing_enabled"})
         missing = required.difference(checkpoint)
-        if missing or checkpoint["checkpoint_version"] != 4:
-            raise ValueError(f"Checkpoint is not a strict v4 checkpoint; missing={sorted(missing)}")
+        if missing or checkpoint["checkpoint_version"] != expected_version:
+            raise ValueError(
+                f"Checkpoint is not a strict v{expected_version} checkpoint; missing={sorted(missing)}"
+            )
         if list(checkpoint["task_names"]) != self.task_name:
             raise ValueError("Checkpoint task_names do not match the current experiment")
         if checkpoint["prediction_mode"] != self._prediction_mode():
@@ -819,6 +1208,19 @@ class Trainer:
             "router_temperature",
             "exclude_target_from_sources",
             "use_factorized_prompt",
+            "spatial_pos_max_clip",
+            # §42 provenance: silent-training-behaviour knobs that would not
+            # surface as state_dict shape mismatches on resume.
+            "hidden_dim",
+            "a_layers",
+            "a_heads",
+            "mid_dim",
+            "head_hidden_dim",
+            "head_dropout",
+            "adapter_ratio",
+            "response_hidden_dim",
+            "task_sampling",
+            "conformal_scope",
             "task_metadata",
         ):
             if stored_architecture.get(name) != current_config.get(name):
@@ -830,6 +1232,11 @@ class Trainer:
         if not isinstance(stored_rgcer, dict):
             raise ValueError("Checkpoint rgcer_config is invalid")
         for name, value in current_rgcer.items():
+            if name == "fit_conformal":
+                # Provenance-only runtime switch: a checkpoint trained with or
+                # without CQR stays usable either way; requesting intervals
+                # without fitted states fails at decode time below.
+                continue
             if stored_rgcer.get(name) != value:
                 raise ValueError(f"Checkpoint RGCER setting {name!r} does not match current configuration")
         current_manifest_hash = self._manifest_hash()
@@ -837,6 +1244,24 @@ class Trainer:
             raise ValueError("Checkpoint split manifest does not match the current experiment")
         if checkpoint["feature_schema_version"] != FEATURE_SCHEMA_VERSION:
             raise ValueError("Checkpoint feature schema does not match current code")
+        if formal_v2:
+            stored_data = checkpoint["data_config"]
+            current_data = self._data_config()
+            if not isinstance(stored_data, dict):
+                raise ValueError("Checkpoint data_config is invalid")
+            for name in (
+                "datastore_format_version",
+                "datastore_fingerprint",
+                "feature_schema_version",
+                "max_path_distance",
+                "split_manifest_hash",
+                "task_names",
+                "max_nodes_filter",
+            ):
+                if stored_data.get(name) != current_data.get(name):
+                    raise ValueError(f"Checkpoint data contract field {name!r} does not match current DataStore")
+            if stored_data.get("datastore_format_version") != 2:
+                raise ValueError("Checkpoint data_config is not a DataStore V2 contract")
         self.model.load_state_dict(checkpoint["model_state"], strict=True)
         self.loss_balancer.load_state_dict(checkpoint["weighting_state"], strict=True)
         self.optimizer.load_state_dict(checkpoint["optimizer_state"])
@@ -855,7 +1280,7 @@ class Trainer:
             self.train_loss_buffer = np.asarray(checkpoint["train_loss_buffer"], dtype=float)
         self.optimizer_updates = int(checkpoint.get("optimizer_updates", 0))
         self.load_path = str(path)
-        print(f"Loaded strict v4 checkpoint: {path}")
+        print(f"Loaded strict v{expected_version} checkpoint: {path}")
 
     def train(
         self,
@@ -898,8 +1323,14 @@ class Trainer:
             self._print_metrics("train", epoch, train_result)
             validation_result = self._evaluate(val_dataloaders_dict, mode="validation", epoch=epoch)
             history.append({"epoch": epoch, "train": train_result, "validation": validation_result})
-            if self._best_state is None or validation_result["score"] > self.best_val_score:
-                self.best_val_score = validation_result["score"]
+            # The best checkpoint is chosen by the selection scope (human3 by
+            # default on ToxAcute), not by the all-task macro score, so an
+            # epoch that only improves animal endpoints cannot steal the
+            # checkpoint from a better human endpoint epoch.
+            if self._eligible_for_best(epoch) and (
+                self._best_state is None or validation_result["selection_score"] > self.best_val_score
+            ):
+                self.best_val_score = validation_result["selection_score"]
                 self._best_state = copy.deepcopy(self.model.state_dict())
                 self.best_epoch = epoch
                 self.best_routing_enabled = self._routing_enabled(epoch)
@@ -915,6 +1346,8 @@ class Trainer:
                     epoch, f"{getattr(params_main or self.args, 'ckpt_name', 'model')}_best.pt"
                 )
             self._save_checkpoint(epoch, f"{getattr(params_main or self.args, 'ckpt_name', 'model')}_last.pt")
+        if self._is_rgcer and bool(getattr(self.args, "routing_enabled", True)) and self._best_state is None:
+            raise ValueError("Full RGCER requires at least one validation epoch after HPS warm-up")
         if self._best_training_state is not None:
             self.model.load_state_dict(self._best_training_state["model_state"], strict=True)
             self.optimizer.load_state_dict(self._best_training_state["optimizer_state"])

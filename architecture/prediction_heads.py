@@ -21,7 +21,13 @@ class DecodedPrediction:
 
 
 class TaskPredictionHead(nn.Module):
-    """A fair, task-independent point or median/width prediction head."""
+    """A fair, task-independent point or median/width prediction head.
+
+    ``forward(..., deterministic=True)`` suppresses the hidden dropout for
+    that single call — used by the RGCER response profile so the router sees
+    stable preliminary responses in train mode. The default call keeps
+    ordinary supervised dropout behaviour untouched.
+    """
 
     VALID_MODES = {"point", "quantile"}
 
@@ -44,6 +50,7 @@ class TaskPredictionHead(nn.Module):
         if head_hidden_dim is None:
             self.network = nn.Linear(hidden_dim, output_dim)
             final_layer = self.network
+            self.dropout_probability = 0.0
         else:
             self.network = nn.Sequential(
                 nn.LayerNorm(hidden_dim),
@@ -53,6 +60,7 @@ class TaskPredictionHead(nn.Module):
                 nn.Linear(head_hidden_dim, output_dim),
             )
             final_layer = self.network[-1]
+            self.dropout_probability = float(dropout)
         if mode == "quantile":
             nn.init.constant_(final_layer.bias[1:], -1.0)
 
@@ -60,10 +68,21 @@ class TaskPredictionHead(nn.Module):
     def output_dim(self) -> int:
         return 1 if self.mode == "point" else 3
 
-    def forward(self, representation: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        representation: torch.Tensor,
+        *,
+        deterministic: bool = False,
+    ) -> torch.Tensor:
         if representation.ndim != 2:
             raise ValueError("representation must have shape [B, D]")
-        return self.network(representation)
+        if not deterministic or self.dropout_probability <= 0:
+            return self.network(representation)
+        # Functional replay of the Sequential with the hidden dropout layer
+        # pinned off for this single call (train mode included).
+        stem = nn.Sequential(*list(self.network)[:3])
+        final = self.network[-1]
+        return final(stem(representation))
 
 
 def point_from_raw(raw: torch.Tensor, mode: str) -> torch.Tensor:

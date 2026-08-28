@@ -117,9 +117,16 @@ def source_deletion_analysis(
     model.eval()
     if device is not None:
         batch = batch.to(device)
-    baseline_predictions, baseline_diagnostics = _unpack(
-        model(batch, task_name=target_task, return_aux=True)
-    )
+    if trainer is not None:
+        baseline_all = trainer.predict_all_tasks(batch, return_aux=True)
+        baseline_predictions, baseline_diagnostics = _unpack(baseline_all)
+        baseline_predictions = {target_task: baseline_predictions[target_task]}
+        if isinstance(baseline_diagnostics, dict):
+            baseline_diagnostics = baseline_diagnostics.get(target_task, baseline_diagnostics)
+    else:
+        baseline_predictions, baseline_diagnostics = _unpack(
+            model(batch, task_name=target_task, return_aux=True)
+        )
     raw = baseline_predictions[target_task]
     baseline_median, baseline_lower, baseline_upper = _decoded_interval(
         raw,
@@ -144,8 +151,12 @@ def source_deletion_analysis(
     rows = []
     for strategy, (mask, deleted_indices) in masks.items():
         intervened_predictions, intervened_diagnostics = _unpack(
-            model(batch, task_name=target_task, return_aux=True, source_mask=mask)
+            trainer.predict_all_tasks(batch, return_aux=True, source_mask=mask)
+            if trainer is not None
+            else model(batch, task_name=target_task, return_aux=True, source_mask=mask)
         )
+        if trainer is not None:
+            intervened_diagnostics = intervened_diagnostics.get(target_task, intervened_diagnostics)
         intervention_median, intervention_lower, intervention_upper = _decoded_interval(
             intervened_predictions[target_task],
             target_task,
@@ -155,6 +166,24 @@ def source_deletion_analysis(
             apply_conformal=apply_conformal,
         )
         intervention_null = _diag(intervened_diagnostics, "null_weight", baseline_null)
+        baseline_base_raw = _diag(baseline_diagnostics, "base_raw", raw)
+        baseline_route_raw = _diag(baseline_diagnostics, "route_raw", raw)
+        hps_base_median, hps_base_lower, hps_base_upper = _decoded_interval(
+            baseline_base_raw,
+            target_task,
+            prediction_mode,
+            trainer=trainer,
+            decode_fn=decode_fn,
+            apply_conformal=False,
+        )
+        route_median, _, _ = _decoded_interval(
+            baseline_route_raw,
+            target_task,
+            prediction_mode,
+            trainer=trainer,
+            decode_fn=decode_fn,
+            apply_conformal=False,
+        )
         for row in range(raw.size(0)):
             target_value = None if target is None else float(target[row, 0].cpu())
             baseline_error = None if target is None else abs(float(baseline_median[row, 0].cpu()) - target_value)
@@ -168,17 +197,38 @@ def source_deletion_analysis(
                     "deleted_source_index": deleted_index,
                     "deleted_source_task": task_names[deleted_index] if deleted_index >= 0 else None,
                     "target": target_value,
-                    "base_prediction": float(baseline_median[row, 0].cpu()),
-                    "intervention_prediction": float(intervention_median[row, 0].cpu()),
+                    "hps_base_prediction": float(hps_base_median[row, 0].cpu()),
+                    "baseline_final_prediction": float(baseline_median[row, 0].cpu()),
+                    "route_prediction": float(route_median[row, 0].cpu()),
+                    "intervention_final_prediction": float(intervention_median[row, 0].cpu()),
                     "delta_prediction": float(intervention_median[row, 0].cpu() - baseline_median[row, 0].cpu()),
-                    "base_abs_error": baseline_error,
-                    "intervention_abs_error": intervention_error,
+                    "baseline_final_abs_error": baseline_error,
+                    "intervention_final_abs_error": intervention_error,
                     "delta_abs_error": None
                     if baseline_error is None
                     else intervention_error - baseline_error,
                     "base_null_weight": float(baseline_null[row, 0].cpu()),
                     "intervention_null_weight": float(intervention_null[row, 0].cpu()),
                     "delta_null_weight": float(intervention_null[row, 0].cpu() - baseline_null[row, 0].cpu()),
+                    "hps_base_interval_width": float((hps_base_upper[row, 0] - hps_base_lower[row, 0]).cpu()),
+                    "baseline_final_interval_lower": float(baseline_lower[row, 0].cpu()),
+                    "baseline_final_interval_upper": float(baseline_upper[row, 0].cpu()),
+                    "baseline_final_interval_width": float((baseline_upper[row, 0] - baseline_lower[row, 0]).cpu()),
+                    "intervention_final_interval_lower": float(intervention_lower[row, 0].cpu()),
+                    "intervention_final_interval_upper": float(intervention_upper[row, 0].cpu()),
+                    "intervention_final_interval_width": float(
+                        (intervention_upper[row, 0] - intervention_lower[row, 0]).cpu()
+                    ),
+                    "delta_interval_width": float(
+                        (intervention_upper[row, 0] - intervention_lower[row, 0]).cpu()
+                        - (baseline_upper[row, 0] - baseline_lower[row, 0]).cpu()
+                    ),
+                    # Legacy aliases remain readable but now explicitly refer
+                    # to the unmodified final baseline intervention state.
+                    "base_prediction": float(baseline_median[row, 0].cpu()),
+                    "intervention_prediction": float(intervention_median[row, 0].cpu()),
+                    "base_abs_error": baseline_error,
+                    "intervention_abs_error": intervention_error,
                     "base_interval_width": float((baseline_upper[row, 0] - baseline_lower[row, 0]).cpu()),
                     "interval_lower": float(baseline_lower[row, 0].cpu()),
                     "interval_upper": float(baseline_upper[row, 0].cpu()),
@@ -187,10 +237,6 @@ def source_deletion_analysis(
                     "intervention_interval_upper": float(intervention_upper[row, 0].cpu()),
                     "intervention_interval_width": float(
                         (intervention_upper[row, 0] - intervention_lower[row, 0]).cpu()
-                    ),
-                    "delta_interval_width": float(
-                        (intervention_upper[row, 0] - intervention_lower[row, 0]).cpu()
-                        - (baseline_upper[row, 0] - baseline_lower[row, 0]).cpu()
                     ),
                 }
             )

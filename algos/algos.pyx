@@ -6,6 +6,12 @@ import cython
 cimport numpy as cnp
 import numpy
 
+# Sentinel for callers: builds compiled from this source bound their
+# per-pair write loop at max_dist (see gen_edge_input), so consumers may
+# request exactly max_path_distance instead of over-allocating to the
+# molecule diameter.  Binaries compiled before the fix lack this attribute.
+BOUNDED_EDGE_INPUT = 1
+
 def floyd_warshall(adjacency_matrix):
 
     (nrows, ncols) = adjacency_matrix.shape
@@ -76,7 +82,7 @@ def gen_edge_input(max_dist, path, edge_feat):
     assert edge_feat_copy.flags['C_CONTIGUOUS']
 
     cdef cnp.ndarray[cnp.int64_t, ndim=4, mode='c'] edge_fea_all = -1 * numpy.ones([n, n, max_dist_copy, edge_feat.shape[-1]], dtype=numpy.int64)
-    cdef unsigned int i, j, k, num_path, cur
+    cdef unsigned int i, j, k, num_path, path_limit
 
     for i in range(n):
         for j in range(n):
@@ -86,7 +92,13 @@ def gen_edge_input(max_dist, path, edge_feat):
                 continue
             path = [i] + get_all_edges(path_copy, i, j) + [j]
             num_path = len(path) - 1
-            for k in range(num_path):
+            # Only the first max_dist hops fit into edge_fea_all; writing the
+            # remaining hops of a longer shortest path used to overflow the
+            # buffer (crash/corruption on long chains).  Truncate to max_dist.
+            path_limit = num_path
+            if path_limit > max_dist_copy:
+                path_limit = max_dist_copy
+            for k in range(path_limit):
                 edge_fea_all[i, j, k, :] = edge_feat_copy[path[k], path[k+1], :]
 
     return edge_fea_all

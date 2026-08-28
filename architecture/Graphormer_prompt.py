@@ -57,6 +57,8 @@ class Encoder(nn.Module):
         router_temperature=1.0,
         exclude_target_from_sources=True,
         edge_bias_mode="path",
+        spatial_pos_max_clip=20,
+        metadata_overrides=None,
     ):
         super().__init__()
         del atoms_input_dropout_rate, atoms_reshape_dim, task_layers, device
@@ -70,7 +72,7 @@ class Encoder(nn.Module):
             num_layers=atoms_embedders_num,
             ffn_dim=atoms_ffn_dim,
             dropout=max(float(atoms_dropout_rate), float(atoms_attention_dropout_rate)),
-            spatial_pos_max_clip=20,
+            spatial_pos_max_clip=spatial_pos_max_clip,
             edge_bias_mode=edge_bias_mode,
         )
         self.task_conditioner = MoleculeAdaptiveTaskConditioner(
@@ -89,6 +91,7 @@ class Encoder(nn.Module):
             exclude_target_from_sources=exclude_target_from_sources,
             adapter_ratio=adapter_ratio,
             gate_init=prompt_gate_init,
+            metadata_overrides=metadata_overrides,
         )
 
     def encode_backbone(self, batch):
@@ -154,6 +157,10 @@ class Graphormer_prompt(AbsArchitecture):
             router_temperature=getattr(args, "router_temperature", 1.0),
             exclude_target_from_sources=getattr(args, "exclude_target_from_sources", True),
             edge_bias_mode=getattr(args, "edge_bias_mode", "path"),
+            spatial_pos_max_clip=kwargs.get(
+                "spatial_pos_max_clip", getattr(args, "spatial_pos_clip", 20)
+            ),
+            metadata_overrides=getattr(args, "auxiliary_metadata_overrides", None),
         )
 
     def forward(

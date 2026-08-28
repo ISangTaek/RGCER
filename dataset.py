@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import warnings
 
 import numpy as np
 import torch
@@ -11,10 +12,16 @@ from torch_geometric.data import Data
 
 from split_manifest import load_manifest
 from molecular_features import BOND_FEATURE_NAMES
+from toxacute_datastore import ToxAcuteDataStore, ToxAcuteTaskDataset
 
 
 class PreprocessedDatasetWrapper(Dataset):
     def __init__(self, task_data_dir):
+        warnings.warn(
+            "PreprocessedDatasetWrapper is legacy V1 storage; use ToxAcuteDataStore for formal runs.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.task_data_dir = Path(task_data_dir)
         if not self.task_data_dir.is_dir():
             raise FileNotFoundError(f"Preprocessed data directory not found: {self.task_data_dir}")
@@ -165,7 +172,11 @@ class DataCollator:
         for batch_index, item in enumerate(data_list):
             node_count = item.x.size(0)
             padding_mask[batch_index, :node_count] = False
-            long_distance = item.spatial_pos >= self.spatial_pos_max_clip
+            # ``spatial_pos_max_clip`` is the largest *visible* hop: distances
+            # at the clip (and its clamped representation in the embedding
+            # index) still attend. Only strictly farther hops — including the
+            # 510 marker for disconnected pairs — are masked out.
+            long_distance = item.spatial_pos > self.spatial_pos_max_clip
             attn_bias[batch_index, 1 : node_count + 1, 1 : node_count + 1][long_distance] = float("-inf")
             if node_count < max_nodes:
                 # Valid queries cannot attend to padded keys. Padded query rows
@@ -196,22 +207,32 @@ class DataloaderWrapper:
     def __init__(
         self,
         task_list,
-        preprocessed_data_base_dir,
-        batch_size,
-        splitting,
-        valid_size,
-        test_size,
+        preprocessed_data_base_dir=None,
+        batch_size=64,
+        splitting="scaffold",
+        valid_size=0.1,
+        test_size=0.1,
         num_workers=0,
         collate_fn_for_loader=None,
         calibration_size=0.1,
         split_seed=42,
         manifest_path=None,
+        *,
+        data_store=None,
+        max_nodes_filter=None,
+        label_providers=None,
     ):
+        if data_store is None and isinstance(preprocessed_data_base_dir, ToxAcuteDataStore):
+            data_store = preprocessed_data_base_dir
+            preprocessed_data_base_dir = None
+        if data_store is not None and not isinstance(data_store, ToxAcuteDataStore):
+            data_store = ToxAcuteDataStore.resolve(data_store)
+        self.data_store = data_store
         if splitting not in {"random", "scaffold"}:
             raise ValueError(f"Unsupported splitting type: {splitting}")
         self.task_list = list(task_list)
         self.batch_size = int(batch_size)
-        self.preprocessed_data_base_dir = Path(preprocessed_data_base_dir)
+        self.preprocessed_data_base_dir = Path(preprocessed_data_base_dir) if preprocessed_data_base_dir else None
         self.splitting = splitting
         self.valid_size = float(valid_size)
         self.calibration_size = float(calibration_size)
@@ -223,9 +244,24 @@ class DataloaderWrapper:
         self.num_workers = int(num_workers)
         self.collate_fn_for_loader = collate_fn_for_loader
         self.split_seed = int(split_seed)
-        self.manifest_path = Path(manifest_path) if manifest_path else self.preprocessed_data_base_dir / "split_manifest.json"
+        self.manifest_path = (
+            Path(manifest_path)
+            if manifest_path
+            else (self.preprocessed_data_base_dir / "split_manifest.json" if self.preprocessed_data_base_dir else None)
+        )
+        self.max_nodes_filter = max_nodes_filter
+        self.label_providers = dict(label_providers or {})
+
+        if self.data_store is None and self.preprocessed_data_base_dir is None:
+            raise ValueError("Either data_store or preprocessed_data_base_dir is required")
+
+    @property
+    def is_v2(self):
+        return self.data_store is not None
 
     def _load_split_lookup(self):
+        if self.manifest_path is None:
+            raise ValueError("A legacy split manifest path is required for V1 data")
         if not self.manifest_path.exists():
             raise FileNotFoundError(
                 f"Global split manifest not found: {self.manifest_path}. "
@@ -300,7 +336,61 @@ class DataloaderWrapper:
             ),
         }
 
+    def _v2_loader(self, dataset, split_name):
+        return DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=split_name == "train" and len(dataset) > 0,
+            num_workers=self.num_workers,
+            pin_memory=False,
+            collate_fn=self.collate_fn_for_loader,
+            drop_last=False,
+            persistent_workers=self.num_workers > 0,
+        )
+
+    def _get_v2_data_loaders(self):
+        real_tasks = [task for task in self.task_list if task in self.data_store.task_names]
+        self.data_store.validate(strict=False, expected_task_names=real_tasks)
+        metadata = self.data_store.metadata
+        if metadata.get("splitting") != self.splitting:
+            raise ValueError("DataStore splitting does not match requested splitting")
+        if int(metadata.get("split_seed")) != self.split_seed:
+            raise ValueError("DataStore split_seed does not match requested split_seed")
+        expected_ratios = {
+            "train": 1.0 - self.valid_size - self.calibration_size - self.test_size,
+            "validation": self.valid_size,
+            "calibration": self.calibration_size,
+            "test": self.test_size,
+        }
+        actual_ratios = metadata.get("split_ratios", {})
+        for name, expected in expected_ratios.items():
+            if not np.isclose(float(actual_ratios.get(name, np.nan)), expected):
+                raise ValueError(f"DataStore split ratio for {name!r} does not match requested configuration")
+        all_task_loaders = {}
+        for task_name in self.task_list:
+            datasets = {
+                split: ToxAcuteTaskDataset(
+                    self.data_store,
+                    task_name,
+                    split=None if split == "all" else split,
+                    max_nodes=self.max_nodes_filter,
+                    label_provider=self.label_providers.get(task_name),
+                )
+                for split in ("train", "validation", "calibration", "test")
+            }
+            all_task_loaders[task_name] = {
+                "train": self._v2_loader(datasets["train"], "train"),
+                "val": self._v2_loader(datasets["validation"], "validation"),
+                "calibration": self._v2_loader(datasets["calibration"], "calibration"),
+                "test": self._v2_loader(datasets["test"], "test"),
+            }
+            counts = {name: len(loader.dataset) for name, loader in all_task_loaders[task_name].items()}
+            print(f"{task_name} split counts: {counts}")
+        return all_task_loaders
+
     def get_data_loaders(self):
+        if self.is_v2:
+            return self._get_v2_data_loaders()
         split_lookup = self._load_split_lookup()
         all_task_loaders = {}
         for task_name in self.task_list:
@@ -312,6 +402,24 @@ class DataloaderWrapper:
         return all_task_loaders
 
     def get_train_validation_data_loaders(self, dataset, task_name):
+        if self.is_v2:
+            del dataset
+            datasets = {
+                split: ToxAcuteTaskDataset(
+                    self.data_store,
+                    task_name,
+                    split=split,
+                    max_nodes=self.max_nodes_filter,
+                    label_provider=self.label_providers.get(task_name),
+                )
+                for split in ("train", "validation", "calibration", "test")
+            }
+            return (
+                self._v2_loader(datasets["train"], "train"),
+                self._v2_loader(datasets["validation"], "validation"),
+                self._v2_loader(datasets["calibration"], "calibration"),
+                self._v2_loader(datasets["test"], "test"),
+            )
         del task_name
         split_lookup = self._load_split_lookup()
         loaders = self._build_task_loaders(dataset, split_lookup)

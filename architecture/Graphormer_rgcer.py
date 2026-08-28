@@ -70,6 +70,8 @@ class Encoder(nn.Module):
         use_film=True,
         use_adapter=True,
         transfer_mechanism="endpoint_router",
+        spatial_pos_max_clip=20,
+        metadata_overrides=None,
     ):
         super().__init__()
         del atoms_input_dropout_rate, atoms_reshape_dim, task_layers, device
@@ -83,7 +85,7 @@ class Encoder(nn.Module):
             num_layers=atoms_embedders_num,
             ffn_dim=atoms_ffn_dim,
             dropout=max(float(atoms_dropout_rate), float(atoms_attention_dropout_rate)),
-            spatial_pos_max_clip=20,
+            spatial_pos_max_clip=spatial_pos_max_clip,
             edge_bias_mode=edge_bias_mode,
         )
         self.task_conditioner = RGCERTaskConditioner(
@@ -91,6 +93,7 @@ class Encoder(nn.Module):
             hidden_dim=moles_hidden_dim,
             use_factorized_prompt=_infer_factorized_prompt(self.task_name, use_factorized_prompt),
             task_residual_scale=task_residual_scale,
+            metadata_overrides=metadata_overrides,
             router_dim=router_dim,
             router_top_k=router_top_k,
             router_temperature=router_temperature,
@@ -114,6 +117,8 @@ class Encoder(nn.Module):
 
 class Graphormer_rgcer(AbsArchitecture):
     """RGCER model with prediction-space HPS fallback and shared task heads."""
+
+    is_rgcer = True
 
     def __init__(self, task_name, encoder_class, decoders, device, args, **kwargs):
         super().__init__(task_name, encoder_class, decoders, device, **kwargs)
@@ -158,18 +163,27 @@ class Graphormer_rgcer(AbsArchitecture):
             use_film=getattr(args, "rgcer_use_film", True),
             use_adapter=getattr(args, "rgcer_use_adapter", True),
             transfer_mechanism=self.rgcer_transfer_mechanism,
+            spatial_pos_max_clip=kwargs.get(
+                "spatial_pos_max_clip", getattr(args, "spatial_pos_clip", 20)
+            ),
+            metadata_overrides=getattr(args, "auxiliary_metadata_overrides", None),
         )
 
     def _head_mode(self, task):
         return getattr(self.decoders[task], "mode", self.prediction_mode)
 
     def _response_profile(self, h):
-        detached_h = h.detach()
-        responses = []
-        for task in self.task_name:
-            raw = self.decoders[task](detached_h)
-            responses.append(point_from_raw(raw, self._head_mode(task)).detach())
-        return torch.stack(responses, dim=1)
+        # Review §25-28: the router consumes these preliminary responses as
+        # routing evidence, so they must be deterministic even in train mode
+        # (heads called with deterministic=True pin their dropout off) and
+        # must never feed gradients back into the source heads or backbone.
+        with torch.no_grad():
+            detached_h = h.detach()
+            responses = []
+            for task in self.task_name:
+                raw = self.decoders[task](detached_h, deterministic=True)
+                responses.append(point_from_raw(raw, self._head_mode(task)))
+            return torch.stack(responses, dim=1)
 
     @staticmethod
     def _decoded_diagnostics(base_decoded, route_decoded, final_decoded):

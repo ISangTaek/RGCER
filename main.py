@@ -22,9 +22,10 @@ from architecture.Graphormer_prompt import Encoder as Encoder_Graphormer_prompt
 from architecture.Graphormer_rgcer import Encoder as Encoder_Graphormer_rgcer
 from architecture.prediction_heads import TaskPredictionHead
 from architecture.toxacute_tasks import ANIMAL_SOURCE_TASKS, HUMAN_TARGET_TASKS, TOXACUTE_TASKS
-from config import prepare_args
+from config import prepare_args, resolve_effective_rgcer_config
 from dataset import DataCollator, DataloaderWrapper, PreprocessedDatasetWrapper, SubsetSequentialSampler
 from experiment_config import (
+    TOXACUTE_DATASTORE_DIR,
     TOXACUTE_MAIN_RUN_DIR,
     TOXACUTE_PHASE0_CHECKPOINT_NAME,
     TOXACUTE_PREPROCESSED_DIR,
@@ -35,6 +36,7 @@ from metric import ClsMetric, RegMetric
 from loss import BCELoss, MSELoss
 from preprocess_data import convert_to_single_emb_offline, get_graph_data_from_smiles
 from trainer import Trainer
+from toxacute_datastore import ToxAcuteDataStore, ToxAcuteTaskDataset
 from utils import calculate_mgkg
 
 RDLogger.DisableLog("rdApp.*")
@@ -54,6 +56,7 @@ RGCER_FLAG_NAMES = (
     "rgcer_use_base_aux_loss",
     "rgcer_fallback_space",
     "rgcer_transfer_mechanism",
+    "rgcer_source_policy",
 )
 
 
@@ -92,10 +95,27 @@ def _write_run_metadata(params, task_names, trainer):
         f"split mode: {params.splitting}",
         f"seed: {params.seed}",
         f"experiment tag: {getattr(params, 'experiment_tag', 'full')}",
+        f"split seed: {getattr(params, 'split_seed', '<unset>')}",
+        f"selection scope: {getattr(params, 'selection_scope', 'human3')}",
     ]
+    data_metadata = getattr(trainer, "data_metadata", None)
+    if data_metadata:
+        lines.extend(
+            [
+                f"datastore build id: {data_metadata.get('build_id', '<unset>')}",
+                f"datastore fingerprint: {data_metadata.get('datastore_fingerprint', '<unset>')}",
+                f"raw csv sha256: {data_metadata.get('raw_csv_sha256', '<unset>')}",
+                f"split manifest hash: {data_metadata.get('split_manifest_hash', '<unset>')}",
+                f"feature schema version: {data_metadata.get('feature_schema_version', '<unset>')}",
+                f"max path distance: {data_metadata.get('max_path_distance', '<unset>')}",
+            ]
+        )
     lines.extend(f"{name}: {getattr(params, name, '<unset>')}" for name in RGCER_FLAG_NAMES)
     with (run_path / "architecture_summary.txt").open("w", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
+    effective = getattr(params, "effective_rgcer_config", None)
+    if effective is not None:
+        _write_json(run_path / "effective_config.json", effective)
 
 
 def _write_json(path, payload):
@@ -116,6 +136,28 @@ def effective_prediction_mode(params):
     if getattr(params, "dataset", None) in CLASSIFICATION_DATASETS and requested == "quantile":
         return "point"
     return requested
+
+
+def _priority_tasks(params, task_names):
+    """Endpoints the formal split/preflight must cover with human floors."""
+
+    if getattr(params, "conformal_scope", "human3") == "human3":
+        return [name for name in HUMAN_TARGET_TASKS if name in task_names]
+    return []
+
+
+def _conformal_scope_tasks(params, task_names):
+    """Endpoints that must reach the conformal finite-rank calibration floor."""
+
+    if not getattr(params, "fit_conformal", True):
+        return []
+    scope = getattr(params, "conformal_scope", "human3")
+    if scope == "human3":
+        return [name for name in HUMAN_TARGET_TASKS if name in task_names]
+    if scope == "all_tasks":
+        auxiliary = set(getattr(params, "auxiliary_task_names", []) or [])
+        return [name for name in task_names if name not in auxiliary]
+    raise ValueError(f"Unknown conformal_scope: {scope!r}")
 
 
 def task_names_for_params(params):
@@ -144,14 +186,19 @@ def task_names_for_params(params):
 
 def build_task_dict(params, task_names):
     if params.dataset in CLASSIFICATION_DATASETS:
-        return {
+        task_dict = {
             task: {"metrics": ["AUROC", "AUPRC"], "metrics_fn": ClsMetric(), "loss_fn": BCELoss(), "weight": [1, 1]}
             for task in task_names
         }
-    return {
-        task: {"metrics": ["RMSE", "R2"], "metrics_fn": RegMetric(), "loss_fn": MSELoss(), "weight": [-1, 1]}
-        for task in task_names
-    }
+    else:
+        task_dict = {
+            task: {"metrics": ["RMSE", "R2"], "metrics_fn": RegMetric(), "loss_fn": MSELoss(), "weight": [-1, 1]}
+            for task in task_names
+        }
+    for task_name, spec in getattr(params, "auxiliary_task_specs", {}).items():
+        if task_name in task_dict:
+            task_dict[task_name].update(spec)
+    return task_dict
 
 
 def _device_from_params(params):
@@ -162,10 +209,77 @@ def _device_from_params(params):
     return torch.device("cpu")
 
 
+def _resolve_data_store(params, task_names, *, required=False):
+    """Resolve the formal V2 root while retaining a deprecated V1 alias."""
+
+    if getattr(params, "dataset", None) != "toxacute":
+        return None
+    requested = getattr(params, "data_store_dir", None)
+    legacy = getattr(params, "preprocessed_data_dir", None)
+    default_root = str(TOXACUTE_DATASTORE_DIR)
+    if legacy:
+        if requested and str(requested) not in {default_root, str(legacy)}:
+            raise ValueError("--data_store_dir and --preprocessed_data_dir point to different roots")
+        warnings.warn(
+            "--preprocessed_data_dir is a legacy alias; use --data_store_dir for DataStore V2.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        requested = legacy
+    if not requested:
+        if required:
+            raise ValueError("--data_store_dir is required for ToxAcute train/test/data_check")
+        return None
+    store = ToxAcuteDataStore.resolve(requested)
+    expected_max_path = getattr(params, "max_path_distance", None)
+    auxiliary_names = set(getattr(params, "auxiliary_task_names", []))
+    expected_tasks = [task for task in task_names if task not in auxiliary_names]
+    store.validate(
+        strict=False,
+        expected_task_names=expected_tasks,
+        expected_max_path_distance=expected_max_path,
+    )
+    params.data_store_dir = str(requested)
+    params.preprocessed_data_dir = None
+    params.max_path_distance = int(store.metadata["max_path_distance"])
+    params.datastore_metadata = store.metadata
+    params.datastore_context = store.context
+    return store
+
+
+def _attach_shuffled_endpoint(params, store, task_names):
+    source_task = getattr(params, "shuffled_endpoint_source", None)
+    if not source_task:
+        return list(task_names)
+    from auxiliary_labels import ShuffledEndpointOverlay
+
+    overlay = ShuffledEndpointOverlay(
+        store,
+        source_task,
+        seed=getattr(params, "shuffled_endpoint_seed", 42),
+    )
+    params.label_providers = {overlay.task_name: overlay}
+    params.auxiliary_metadata_overrides = {
+        overlay.task_name: overlay.metadata_override()
+    }
+    if getattr(params, "use_factorized_prompt", None) is None:
+        params.use_factorized_prompt = True
+    params.auxiliary_task_specs = {
+        overlay.task_name: {
+            "include_in_macro": False,
+            "fit_conformal": False,
+            "auxiliary_only": True,
+        }
+    }
+    params.auxiliary_task_names = [overlay.task_name]
+    return list(task_names) + [overlay.task_name]
+
+
 def _loaders(params, task_names, collator):
+    store = _resolve_data_store(params, task_names, required=True)
     wrapper = DataloaderWrapper(
         task_list=task_names,
-        preprocessed_data_base_dir=params.preprocessed_data_dir,
+        data_store=store,
         batch_size=params.bs,
         splitting=params.splitting,
         valid_size=params.vs,
@@ -173,7 +287,9 @@ def _loaders(params, task_names, collator):
         test_size=params.ts,
         num_workers=params.num_loader_workers,
         collate_fn_for_loader=collator,
-        split_seed=params.seed,
+        split_seed=params.split_seed,
+        max_nodes_filter=params.max_nodes_filter,
+        label_providers=getattr(params, "label_providers", None),
     )
     all_loaders = wrapper.get_data_loaders()
     result = {name: {} for name in ("train", "val", "calibration", "test")}
@@ -211,14 +327,19 @@ def _build_model_components(params, task_names, device):
 def _prediction_records(params, trainer, batch, task_names):
     batch = batch.to(trainer.device)
     with torch.no_grad():
-        result = trainer.model(batch, return_all_tasks=True, return_aux=True)
+        result = trainer.predict_all_tasks(batch, return_aux=True)
     predictions, diagnostics = result if isinstance(result, tuple) else (result, None)
     rows = []
     batch_smiles = list(getattr(batch, "smiles", [""] * batch.y.size(0)))
     for sample_index, smiles in enumerate(batch_smiles):
         row = {"smiles": smiles}
+        apply_conformal = bool(getattr(params, "fit_conformal", True))
         for task in task_names:
-            decoded = trainer.decode_task_output(task, predictions[task][sample_index : sample_index + 1])
+            decoded = trainer.decode_task_output(
+                task,
+                predictions[task][sample_index : sample_index + 1],
+                apply_conformal=apply_conformal,
+            )
             median = float(decoded["median"].item())
             lower = float(decoded["lower"].item())
             upper = float(decoded["upper"].item())
@@ -246,13 +367,80 @@ def main(params):
         )
         params.prediction_mode = selected_mode
     task_names = task_names_for_params(params)
+    formal_task_names = list(task_names)
+    params.effective_rgcer_config = resolve_effective_rgcer_config(params)
+    if params.mode == "data_check":
+        store = _resolve_data_store(params, formal_task_names, required=True)
+        from data_preflight import run_datastore_preflight
+
+        report = run_datastore_preflight(
+            store,
+            formal_task_names,
+            max_nodes_filter=params.max_nodes_filter,
+            min_calibration_size=params.min_calibration_size,
+            require_calibration=bool(params.fit_conformal and effective_prediction_mode(params) == "quantile"),
+            conformal_alpha=(
+                params.conformal_alpha if params.fit_conformal else None
+            ),
+            conformal_task_names=_conformal_scope_tasks(params, formal_task_names),
+            priority_task_names=_priority_tasks(params, formal_task_names),
+        )
+        output_root = Path(params.save_path or ".")
+        output_root.mkdir(parents=True, exist_ok=True)
+        _write_json(output_root / "data_preflight.json", report)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+    if params.mode in {"train", "test", "batch_inference"}:
+        store = _resolve_data_store(params, formal_task_names, required=True)
+        task_names = _attach_shuffled_endpoint(params, store, task_names)
+        if getattr(params, "explicitly_allowed_auxiliary_sources", None):
+            unknown = [
+                name
+                for name in params.explicitly_allowed_auxiliary_sources
+                if name not in task_names
+            ]
+            if unknown:
+                raise ValueError(
+                    "--explicitly_allowed_auxiliary_sources names tasks outside this run: "
+                    f"{unknown}; available={task_names}"
+                )
+        if params.arch == "Graphormer_rgcer" and task_names:
+            # Fail before any training I/O when the policy contradicts the run.
+            from trainer import build_source_policy_mask
+
+            build_source_policy_mask(
+                task_names,
+                policy=params.rgcer_source_policy,
+                allowed_auxiliary=params.explicitly_allowed_auxiliary_sources,
+            )
+        if params.mode in {"train", "test"}:
+            from data_preflight import run_datastore_preflight
+
+            preflight = run_datastore_preflight(
+                store,
+                formal_task_names,
+                max_nodes_filter=params.max_nodes_filter,
+                min_calibration_size=params.min_calibration_size,
+                require_calibration=bool(
+                    params.fit_conformal and effective_prediction_mode(params) == "quantile"
+                ),
+                conformal_alpha=(
+                    params.conformal_alpha if params.fit_conformal else None
+                ),
+                conformal_task_names=_conformal_scope_tasks(params, formal_task_names),
+                priority_task_names=_priority_tasks(params, formal_task_names),
+            )
+            if params.save_path:
+                _write_json(Path(params.save_path) / "data_preflight.json", preflight)
     task_dict = build_task_dict(params, task_names)
     device = _device_from_params(params)
     kwargs, optim_param = prepare_args(params)
     encoder_class, architecture_class, decoders = _build_model_components(params, task_names, device)
     collator = DataCollator(
         spatial_pos_max_clip=params.spatial_pos_clip,
-        max_node_filter=params.max_nodes_filter,
+        # V2 applies max_nodes_filter while constructing task indices.  The
+        # collator keeps the legacy option only for direct compatibility tests.
+        max_node_filter=None,
     )
     trainer = Trainer(
         task_dict=task_dict,
@@ -270,8 +458,6 @@ def main(params):
     print(f"Using device: {trainer.device}; tasks={len(task_names)}; architecture={params.arch}")
 
     if params.mode in {"train", "test"}:
-        if not params.preprocessed_data_dir:
-            raise ValueError("--preprocessed_data_dir is required for train/test")
         loaders = _loaders(params, task_names, collator)
         if params.mode == "train":
             history = trainer.train(
@@ -284,6 +470,7 @@ def main(params):
             )
             if params.save_path:
                 metrics_payload = {"history": history}
+                metrics_payload["conformal"] = trainer._conformal_validity()
                 if trainer.final_test_result is not None:
                     metrics_payload["test"] = trainer.final_test_result
                 _write_json(Path(params.save_path) / "metrics.json", metrics_payload)
@@ -303,7 +490,10 @@ def main(params):
         else:
             result = trainer.test(loaders["test"])
             if params.save_path:
-                _write_json(Path(params.save_path) / "metrics.json", {"test": result})
+                _write_json(
+                    Path(params.save_path) / "metrics.json",
+                    {"test": result, "conformal": trainer._conformal_validity()},
+                )
                 _write_json(
                     Path(params.save_path) / "routing_summary.json",
                     {
@@ -321,14 +511,16 @@ def main(params):
             0.0,
             convert_to_single_emb_offline,
             task_name=None,
+            max_path_distance=getattr(trainer, "max_path_distance", getattr(params, "max_path_distance", 8) or 8),
         )
         batch = collator([graph]).to(trainer.device)
-        trainer.model.eval()
         with torch.no_grad():
-            predictions = trainer.model(batch, return_all_tasks=True)
+            predictions = trainer.predict_all_tasks(batch)
         print("--- Predictions ---")
         for task in task_names:
-            decoded = trainer.decode_task_output(task, predictions[task])
+            decoded = trainer.decode_task_output(
+                task, predictions[task], apply_conformal=bool(getattr(params, "fit_conformal", True))
+            )
             print(
                 f"{task}: median={decoded['median'].item():.6f}, "
                 f"lower={decoded['lower'].item():.6f}, upper={decoded['upper'].item():.6f}, "
@@ -339,15 +531,23 @@ def main(params):
         return
 
     if params.mode == "batch_inference":
-        if not params.preprocessed_data_dir or not params.inference_task:
-            raise ValueError("--preprocessed_data_dir and --inference_task are required")
-        dataset = PreprocessedDatasetWrapper(Path(params.preprocessed_data_dir) / params.inference_task)
+        if not params.inference_task:
+            raise ValueError("--inference_task is required")
+        store = _resolve_data_store(params, task_names, required=True)
+        dataset = ToxAcuteTaskDataset(
+            store,
+            params.inference_task,
+            split=params.inference_split,
+            max_nodes=params.max_nodes_filter,
+            label_provider=getattr(params, "label_providers", {}).get(params.inference_task),
+        )
         loader = DataLoader(
             dataset,
             batch_size=params.bs,
-            sampler=SubsetSequentialSampler(list(range(len(dataset)))),
+            shuffle=False,
             num_workers=params.num_loader_workers,
             collate_fn=collator,
+            persistent_workers=params.num_loader_workers > 0,
         )
         rows = []
         trainer.model.eval()
@@ -364,17 +564,26 @@ def main(params):
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Multitask molecular Graphormer framework")
-    parser.add_argument("--mode", choices=["train", "test", "single_inference", "batch_inference"], default="train")
+    parser.add_argument(
+        "--mode",
+        choices=["train", "test", "single_inference", "batch_inference", "data_check"],
+        default="train",
+    )
     parser.add_argument("--gpu_id", default="0")
     parser.add_argument("--save_path", default=TOXACUTE_MAIN_RUN_DIR)
     parser.add_argument("--load_path", default=None)
     parser.add_argument("--ckpt_name", default="toxacute_rgcer")
-    parser.add_argument("--preprocessed_data_dir", default=TOXACUTE_PREPROCESSED_DIR)
+    parser.add_argument("--data_store_dir", default=TOXACUTE_DATASTORE_DIR)
+    parser.add_argument("--preprocessed_data_dir", default=None)
     parser.add_argument("--num_loader_workers", type=int, default=0)
     parser.add_argument("--spatial_pos_clip", type=int, default=20)
+    parser.add_argument("--max_path_distance", type=int, default=None)
     parser.add_argument("--max_nodes_filter", type=int, default=512)
     parser.add_argument("--smiles", default=None)
     parser.add_argument("--inference_task", default="human_oral_TDLo")
+    parser.add_argument("--inference_split", choices=["train", "validation", "calibration", "test"], default=None)
+    parser.add_argument("--shuffled_endpoint_source", default=None)
+    parser.add_argument("--shuffled_endpoint_seed", type=int, default=42)
     parser.add_argument("--inference_output_path", default="./artifacts/results/toxacute_predictions.csv")
 
     parser.add_argument("--arch", choices=["Graphormer", "Graphormer_prompt", "Graphormer_rgcer"], default="Graphormer_rgcer")
@@ -470,6 +679,47 @@ def build_parser():
     parser.add_argument("--tasks_per_update", type=int, default=1)
     parser.add_argument("--routing_enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--toxacute_task_scope", choices=["human3", "animal56", "all59"], default="all59")
+    parser.add_argument(
+        "--selection_scope",
+        choices=["human3", "all_tasks"],
+        default="human3",
+        help="Task scope for best-checkpoint selection. human3 selects on the three "
+        "human target endpoints (falls back to all_tasks when the run has none).",
+    )
+    parser.add_argument(
+        "--conformal_scope",
+        choices=["human3", "all_tasks"],
+        default="human3",
+        help="Which regression tasks receive CQR states: primary conformal "
+        "evaluation targets the human endpoints while point metrics still cover "
+        "every task.",
+    )
+    parser.add_argument(
+        "--task_sampling",
+        choices=["proportional", "human_target_floor"],
+        default="proportional",
+        help="Schedule exposure (review §39). proportional keeps the historical "
+        "data-proportional mix for every model; human_target_floor adds one "
+        "full extra pass of each human target loader per epoch and is meant "
+        "for ablations only. Per-epoch exposure is recorded in "
+        "schedule_diagnostics either way.",
+    )
+    parser.add_argument(
+        "--rgcer_source_policy",
+        choices=["all_except_target", "animal56_only"],
+        default="animal56_only",
+        help="Router source policy for Graphormer_rgcer. animal56_only keeps the formal "
+        "animal-to-human claim: human targets draw only on animal endpoints, plus any "
+        "auxiliary endpoint explicitly allowed below. The router always excludes the "
+        "target itself.",
+    )
+    parser.add_argument(
+        "--explicitly_allowed_auxiliary_sources",
+        type=str,
+        default="",
+        help="Comma-separated auxiliary (e.g. shuffled) endpoint names that stay usable "
+        "as router sources under rgcer_source_policy=animal56_only.",
+    )
     parser.add_argument("--experiment_tag", default="full")
 
     parser.add_argument("--weighting", choices=["EW", "UW", "DWA"], default="EW")
@@ -483,6 +733,7 @@ def build_parser():
     parser.add_argument("--bs", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--split_seed", type=int, default=42)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     return parser
 
@@ -490,6 +741,12 @@ def build_parser():
 def validate_params(params):
     if params.hidden_dim % params.a_heads != 0:
         raise ValueError("hidden_dim must be divisible by a_heads")
+    raw_allowed_sources = str(
+        getattr(params, "explicitly_allowed_auxiliary_sources", "") or ""
+    )
+    params.explicitly_allowed_auxiliary_sources = tuple(
+        name.strip() for name in raw_allowed_sources.split(",") if name.strip()
+    )
     if params.prompt_heads <= 0 or params.hidden_dim % params.prompt_heads != 0:
         raise ValueError("hidden_dim must be divisible by prompt_heads")
     if params.router_dim <= 0 or params.router_top_k < 0 or params.router_temperature <= 0:
@@ -502,6 +759,8 @@ def validate_params(params):
         raise ValueError("DWA requires tasks_per_update > 1")
     if params.vs + params.calibration_size + params.ts >= 1.0:
         raise ValueError("validation + calibration + test ratios must be less than 1")
+    if params.split_seed is None:
+        raise ValueError("split_seed must be an integer")
     if not 0.0 < params.adapter_ratio <= 1.0:
         raise ValueError("adapter_ratio must be in (0, 1]")
     if params.arch == "Graphormer_rgcer" and params.router_mode != "dynamic":
@@ -531,6 +790,7 @@ def validate_params(params):
                 RuntimeWarning,
                 stacklevel=2,
             )
+    params.effective_rgcer_config = resolve_effective_rgcer_config(params)
 
 
 if __name__ == "__main__":

@@ -52,9 +52,10 @@ def _args(tmp_path, *, use_null=True):
     )
 
 
-def _trainer(tmp_path, *, use_null=True, load_path=None):
+def _trainer(tmp_path, *, use_null=True, load_path=None, fit_conformal=True):
     args = _args(tmp_path, use_null=use_null)
     args.load_path = load_path
+    args.fit_conformal = fit_conformal
     task_dict = {"task": {"metrics": ["RMSE"], "loss_fn": MSELoss(), "weight": [-1, 1]}}
     return Trainer(
         task_dict=task_dict,
@@ -80,3 +81,24 @@ def test_checkpoint_v4_records_and_rejects_changed_rgcer_flags(tmp_path):
 
     with pytest.raises(ValueError, match="rgcer_use_null_route"):
         _trainer(tmp_path / "changed", use_null=False, load_path=checkpoint_path)
+
+
+def test_fit_conformal_flag_stays_load_compatible_but_decode_fails_fast(tmp_path):
+    """fit_conformal is provenance-only in v5 contracts; missing qhat states
+    must raise at decode instead of silently emitting uncalibrated bands."""
+
+    source = _trainer(tmp_path / "source", use_null=True)
+    source.conformal_calibrator.states = {}  # no CQR fitted for this run
+    checkpoint_path = source._save_checkpoint(0, "model_best.pt")
+
+    consumer = _trainer(
+        tmp_path / "consumer", use_null=True, load_path=checkpoint_path, fit_conformal=False
+    )
+    # Loading succeeded despite the flipped runtime switch: source stored
+    # fit_conformal=True while this consumer requests False.
+    assert consumer.args.fit_conformal is False
+
+    # Switch to the quantile path so decoding requests calibrated bands.
+    consumer.args.prediction_mode = "quantile"
+    with pytest.raises(ValueError, match="No conformal state fitted"):
+        consumer.decode_task_output("task", torch.zeros(1, 3), apply_conformal=True)

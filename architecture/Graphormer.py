@@ -31,6 +31,7 @@ class Encoder(nn.Module):
         atoms_readout_dim,
         device,
         edge_bias_mode="path",
+        spatial_pos_max_clip=20,
     ):
         super().__init__()
         del task_name, atoms_input_dropout_rate, atoms_reshape_dim, device
@@ -40,7 +41,7 @@ class Encoder(nn.Module):
             num_layers=atoms_embedders_num,
             ffn_dim=atoms_ffn_dim,
             dropout=max(float(atoms_dropout_rate), float(atoms_attention_dropout_rate)),
-            spatial_pos_max_clip=20,
+            spatial_pos_max_clip=spatial_pos_max_clip,
             edge_bias_mode=edge_bias_mode,
         )
         if atoms_readout_dim != atoms_hidden_dim:
@@ -71,6 +72,9 @@ class Graphormer(AbsArchitecture):
             atoms_readout_dim=args.hidden_dim,
             device=device,
             edge_bias_mode=getattr(args, "edge_bias_mode", "path"),
+            spatial_pos_max_clip=kwargs.get(
+                "spatial_pos_max_clip", getattr(args, "spatial_pos_clip", 20)
+            ),
         )
 
     def forward(

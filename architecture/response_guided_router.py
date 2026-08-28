@@ -242,20 +242,29 @@ class SharedFiLMAdapter(nn.Module):
         self.use_film = bool(use_film)
         self.use_adapter = bool(use_adapter)
         self.bottleneck_dim = max(1, int(round(hidden_dim * adapter_ratio)))
-        self.film_head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim * 2))
-        self.condition_norm = nn.LayerNorm(hidden_dim)
-        self.adapter_down = nn.Linear(hidden_dim, self.bottleneck_dim)
-        self.adapter_up = nn.Linear(self.bottleneck_dim, hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-        nn.init.normal_(self.film_head[-1].weight, mean=0.0, std=1e-3)
-        nn.init.zeros_(self.film_head[-1].bias)
-        nn.init.xavier_uniform_(self.adapter_down.weight)
-        nn.init.zeros_(self.adapter_down.bias)
-        nn.init.normal_(self.adapter_up.weight, mean=0.0, std=1e-3)
-        nn.init.zeros_(self.adapter_up.bias)
+        self.film_head = (
+            nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim * 2))
+            if self.use_film
+            else None
+        )
+        self.condition_norm = nn.LayerNorm(hidden_dim) if self.use_film else None
+        self.adapter_down = nn.Linear(hidden_dim, self.bottleneck_dim) if self.use_adapter else None
+        self.adapter_up = nn.Linear(self.bottleneck_dim, hidden_dim) if self.use_adapter else None
+        self.dropout = nn.Dropout(dropout) if self.use_adapter else None
+        if self.film_head is not None:
+            nn.init.normal_(self.film_head[-1].weight, mean=0.0, std=1e-3)
+            nn.init.zeros_(self.film_head[-1].bias)
+        if self.adapter_down is not None:
+            nn.init.xavier_uniform_(self.adapter_down.weight)
+            nn.init.zeros_(self.adapter_down.bias)
+        if self.adapter_up is not None:
+            nn.init.normal_(self.adapter_up.weight, mean=0.0, std=1e-3)
+            nn.init.zeros_(self.adapter_up.bias)
 
     def forward(self, h: torch.Tensor, task_context: torch.Tensor):
         if self.use_film:
+            if self.film_head is None or self.condition_norm is None:
+                raise RuntimeError("FiLM is enabled but its parameters are not initialized")
             raw_gamma, beta = self.film_head(task_context).chunk(2, dim=-1)
             gamma = torch.tanh(raw_gamma)
             conditioned = self.condition_norm((1.0 + gamma) * h + beta)
@@ -265,6 +274,8 @@ class SharedFiLMAdapter(nn.Module):
             conditioned = h
 
         if self.use_adapter:
+            if self.adapter_down is None or self.adapter_up is None or self.dropout is None:
+                raise RuntimeError("Adapter is enabled but its parameters are not initialized")
             adapter_output = self.adapter_up(self.dropout(F.gelu(self.adapter_down(conditioned))))
             route_representation = h + adapter_output
         else:
@@ -339,6 +350,7 @@ class RGCERTaskConditioner(nn.Module):
         use_film: bool = True,
         use_adapter: bool = True,
         transfer_mechanism: str = "endpoint_router",
+        metadata_overrides: dict | None = None,
     ):
         super().__init__()
         if not task_names or len(set(task_names)) != len(task_names):
@@ -361,20 +373,25 @@ class RGCERTaskConditioner(nn.Module):
             hidden_dim,
             use_factorized_prompt=use_factorized_prompt,
             task_residual_scale=task_residual_scale,
+            metadata_overrides=metadata_overrides,
         )
-        self.router = ResponseGuidedEndpointRouter(
-            hidden_dim=hidden_dim,
-            router_dim=router_dim,
-            top_k=router_top_k,
-            temperature=router_temperature,
-            exclude_target=exclude_target_from_sources,
-            dropout=dropout,
-            response_hidden_dim=response_hidden_dim,
-            use_source_response=self.use_source_response,
-            use_target_response=self.use_target_response,
-            use_molecule_query=self.use_molecule_query,
-            use_sparse_routing=self.use_sparse_routing,
-            use_null_route=self.use_null_route,
+        self.router = (
+            ResponseGuidedEndpointRouter(
+                hidden_dim=hidden_dim,
+                router_dim=router_dim,
+                top_k=router_top_k,
+                temperature=router_temperature,
+                exclude_target=exclude_target_from_sources,
+                dropout=dropout,
+                response_hidden_dim=response_hidden_dim,
+                use_source_response=self.use_source_response,
+                use_target_response=self.use_target_response,
+                use_molecule_query=self.use_molecule_query,
+                use_sparse_routing=self.use_sparse_routing,
+                use_null_route=self.use_null_route,
+            )
+            if transfer_mechanism == "endpoint_router"
+            else None
         )
         self.adapter = SharedFiLMAdapter(
             hidden_dim,
@@ -406,6 +423,8 @@ class RGCERTaskConditioner(nn.Module):
         prompts = self.prompt_bank()
         batch_size = h.size(0)
         if self.transfer_mechanism == "endpoint_router":
+            if self.router is None:
+                raise RuntimeError("endpoint_router mechanism has no router module")
             task_context, source_weights, joint_source_weights, null_weight, entropy = self.router(
                 h,
                 prompts,
