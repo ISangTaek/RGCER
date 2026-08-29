@@ -132,6 +132,7 @@ def _write_run_metadata(params, task_names, trainer):
             "seed_policy_version": SEED_POLICY_VERSION,
             "num_loader_workers": int(getattr(params, "num_loader_workers", 0)),
             "persistent_worker_policy": PERSISTENT_WORKER_POLICY,
+            "train_eval_scope": getattr(params, "train_eval_scope", "full"),
             "initial_model_sha256": initial_model_sha256,
             "manifest_sha256": data_metadata.get("split_manifest_hash"),
             "datastore_fingerprint": data_metadata.get("datastore_fingerprint"),
@@ -292,6 +293,19 @@ def _attach_shuffled_endpoint(params, store, task_names):
     }
     params.auxiliary_task_names = [overlay.task_name]
     return list(task_names) + [overlay.task_name]
+
+
+def _scoped_loader_dicts(loaders, train_eval_scope):
+    """Plan §5.2: which loader dicts reach ``Trainer.train`` for this scope.
+
+    ``validation_only`` must hand over only train+validation; calibration and
+    test are passed as ``None`` so the trainer can neither fit CQR on them nor
+    evaluate them.
+    """
+
+    if train_eval_scope == "validation_only":
+        return loaders["train"], loaders["val"], None, None
+    return loaders["train"], loaders["val"], loaders["calibration"], loaders["test"]
 
 
 def _loaders(params, task_names, collator):
@@ -497,12 +511,33 @@ def main(params):
 
     if params.mode in {"train", "test"}:
         loaders = _loaders(params, task_names, collator)
+        if store is not None:
+            # Per-sample diagnostics need the DataStore sample_id -> raw CSV row
+            # mapping; batch indices alone cannot be aligned across runs.
+            trainer.sample_row_index = {
+                str(sample_id): int(row_index)
+                for sample_id, row_index in zip(
+                    store.sample_ids.tolist(), store.row_indices.tolist()
+                )
+            }
         if params.mode == "train":
+            eval_scope = getattr(params, "train_eval_scope", "full")
+            if eval_scope == "validation_only" and bool(getattr(params, "fit_conformal", True)):
+                warnings.warn(
+                    "--train_eval_scope validation_only never passes calibration to the "
+                    "trainer, so CQR will not be fitted; pass --no-fit_conformal to make "
+                    "this explicit.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            train_loaders, val_loaders, calibration_loaders, test_loaders = _scoped_loader_dicts(
+                loaders, eval_scope
+            )
             history = trainer.train(
-                train_dataloaders_dict=loaders["train"],
-                val_dataloaders_dict=loaders["val"],
-                calibration_dataloaders_dict=loaders["calibration"],
-                test_dataloaders_dict=loaders["test"],
+                train_dataloaders_dict=train_loaders,
+                val_dataloaders_dict=val_loaders,
+                calibration_dataloaders_dict=calibration_loaders,
+                test_dataloaders_dict=test_loaders,
                 epochs=params.epochs,
                 params_main=params,
             )
@@ -726,6 +761,23 @@ def build_parser():
         default="human3",
         help="Task scope for best-checkpoint selection. human3 selects on the three "
         "human target endpoints (falls back to all_tasks when the run has none).",
+    )
+    parser.add_argument(
+        "--train_eval_scope",
+        choices=["validation_only", "full"],
+        default="full",
+        help="Diagnostic-phase data hygiene (plan §5): validation_only hands the "
+        "Trainer only train+validation loaders — calibration/test are never "
+        "passed in, CQR is not fitted, and no test evaluation runs. Keep the "
+        "default full for formal runs.",
+    )
+    parser.add_argument(
+        "--diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write read-only per-epoch diagnostic artifacts (path metrics, "
+        "routing aggregates, gradient norms, best-epoch per-sample CSVs) under "
+        "<save_path>/diagnostics. Never changes model math.",
     )
     parser.add_argument(
         "--conformal_scope",

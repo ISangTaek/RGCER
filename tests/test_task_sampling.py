@@ -81,6 +81,8 @@ def _make_trainer(task_names, sampling):
             "route_raw": trainer.model(torch.ones(1, 1)),
             "diagnostics": {},
             "loss": torch.tensor(1.0),
+            "final_loss": torch.tensor(0.75),
+            "base_loss": torch.tensor(0.5),
         },
     )
     return trainer

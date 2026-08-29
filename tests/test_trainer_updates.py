@@ -80,6 +80,8 @@ def test_duplicate_task_batches_are_aggregated_and_one_update_is_counted():
             "route_raw": raw,
             "diagnostics": {},
             "loss": loss.detach(),
+            "final_loss": loss.detach(),
+            "base_loss": loss.detach(),
         }
 
     trainer._training_step = training_step

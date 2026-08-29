@@ -159,6 +159,10 @@ class Trainer:
         self.schedule_usage = {}
         self.optimizer_updates = 0
         self.training_cache = {}
+        # Diagnostic-plan §6-§9: read-only per-epoch logging, instantiated by
+        # train(); kept None here so unit-level callers never touch it.
+        self._diagnostics = None
+        self.sample_row_index = {}
         self._is_rgcer = bool(getattr(self.model, "is_rgcer", False))
         self.data_metadata = getattr(args, "datastore_metadata", None)
         if self.data_metadata is None:
@@ -502,6 +506,7 @@ class Trainer:
             "diagnostics": diagnostics,
             "loss": total_loss.detach(),
             "base_loss": base_loss.detach(),
+            "final_loss": final_loss.detach(),
         }
 
     def _record_training_output(self, bundle):
@@ -637,6 +642,8 @@ class Trainer:
         actual_samples: dict[str, int] = {task: 0 for task in self.task_name}
         buffers = {task: {"pred": [], "label": []} for task in self.task_name}
         losses = {task: [] for task in self.task_name}
+        final_losses = {task: [] for task in self.task_name}
+        base_losses = {task: [] for task in self.task_name}
         self.loss_balancer.epoch = epoch
         max_history = max(epoch + 1, 2)
         self.loss_balancer.train_loss_buffer = getattr(
@@ -673,6 +680,8 @@ class Trainer:
                 if task_losses:
                     loss_vector[self.task_name.index(task)] = torch.stack(task_losses).mean()
             self.loss_balancer.backward(loss_vector, active_mask=active_mask)
+            if getattr(self, "_diagnostics", None) is not None:
+                self._diagnostics.record_gradients(self.model)
             clip_value = getattr(self.args, "grad_clip", 1.0)
             if clip_value is not None and float(clip_value) > 0:
                 clip_grad_norm_(list(self.model.parameters()) + list(self.loss_balancer.parameters()), float(clip_value))
@@ -685,9 +694,17 @@ class Trainer:
                 buffers[task]["label"].append(bundle["labels"].cpu())
                 actual_samples[task] += int(bundle["labels"].shape[0])
                 losses[task].append(float(bundle["loss"].cpu()))
+                final_losses[task].append(float(bundle["final_loss"].cpu()))
+                base_losses[task].append(float(bundle["base_loss"].cpu()))
                 self._record_training_output(bundle)
         result = self._score_buffers(buffers)
         result["loss"] = {task: float(np.mean(losses[task])) if losses[task] else np.nan for task in self.task_name}
+        result["final_loss"] = {
+            task: float(np.mean(final_losses[task])) if final_losses[task] else np.nan for task in self.task_name
+        }
+        result["base_loss"] = {
+            task: float(np.mean(base_losses[task])) if base_losses[task] else np.nan for task in self.task_name
+        }
         self.optimizer_updates += update_count
         result["updates"] = update_count
         result["schedule_usage"] = dict(self.schedule_usage)
@@ -794,6 +811,7 @@ class Trainer:
         records = {task: {"lower": [], "upper": [], "target": []} for task in self.task_name}
         route_records = {
             task: {
+                "sample_id": [],
                 "base": [],
                 "route": [],
                 "final": [],
@@ -849,6 +867,11 @@ class Trainer:
                     route_records[task]["target"].append(target.cpu())
                     route_records[task]["route_regret"].append(rr)
                     route_records[task]["final_regret"].append(fr)
+                    # DataStore sample identity for per-sample diagnostic dumps;
+                    # batch index alone cannot be aligned across runs (plan §10).
+                    route_records[task]["sample_id"].extend(
+                        str(value) for value in (getattr(batch, "sample_id", None) or [])
+                    )
                     if "null_weight" in diagnostics:
                         route_records[task]["null"].append(diagnostics["null_weight"].cpu())
                     if "source_weights" in diagnostics:
@@ -868,6 +891,9 @@ class Trainer:
             apply_conformal=(mode == "test" and bool(getattr(self.args, "fit_conformal", True))),
             routing_enabled_override=routing_enabled_override,
         )
+        # Kept for the per-epoch diagnostic writer; the summary below stays the
+        # single source of truth for reported routing aggregates.
+        self._last_route_records = route_records
         result = self._score_buffers(buffers)
         if self._prediction_mode() == "quantile":
             scoped_tasks = self._conformal_tasks()
@@ -1486,6 +1512,7 @@ class Trainer:
         total_epochs = int(epochs)
         if total_epochs < 0:
             raise ValueError("epochs must be non-negative")
+        self._diagnostics = self._make_diagnostics_writer()
         buffer_size = max(total_epochs, start_epoch + 1, 2)
         existing_buffer = getattr(self, "train_loss_buffer", None)
         if existing_buffer is None or existing_buffer.shape[0] != self.task_num:
@@ -1507,7 +1534,21 @@ class Trainer:
             # default on ToxAcute), not by the all-task macro score, so an
             # epoch that only improves animal endpoints cannot steal the
             # checkpoint from a better human endpoint epoch.
-            self._maybe_update_best(validation_result, epoch, params_main=params_main)
+            best_updated = self._maybe_update_best(validation_result, epoch, params_main=params_main)
+            if self._diagnostics is not None:
+                # Plan §6-§9/§18: log every epoch, including warm-up epochs
+                # (routing_enabled=False) so the collapse trajectory is visible.
+                route_records = getattr(self, "_last_route_records", None)
+                if best_updated:
+                    self._diagnostics.note_best_epoch(epoch, route_records)
+                self._diagnostics.log_epoch(
+                    epoch,
+                    train_result,
+                    validation_result,
+                    route_records=route_records,
+                    routing_enabled=self._routing_enabled(epoch),
+                    is_best=bool(best_updated),
+                )
             self._save_checkpoint(
                 epoch,
                 f"{getattr(params_main or self.args, 'ckpt_name', 'model')}_last.pt",
@@ -1543,7 +1584,25 @@ class Trainer:
                 epoch=None,
                 routing_enabled_override=routing_state,
             )
+        if self._diagnostics is not None and self.best_epoch is not None:
+            self._diagnostics.write_best_artifacts(self.best_epoch)
         return history
+
+    def _make_diagnostics_writer(self):
+        """Build the read-only diagnostic writer when the run requests one."""
+
+        if not bool(getattr(self.args, "diagnostics", True)):
+            return None
+        save_path = getattr(self, "save_path", None)
+        if save_path is None:
+            return None
+        from run_diagnostics import RunDiagnosticsWriter
+
+        return RunDiagnosticsWriter(
+            output_dir=Path(save_path) / "diagnostics",
+            task_names=list(self.task_name),
+            sample_row_index=getattr(self, "sample_row_index", None),
+        )
 
     def test(self, dataloaders_dict, epoch=None, mode="test"):
         if not self.task_scalers:
