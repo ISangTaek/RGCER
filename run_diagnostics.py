@@ -288,12 +288,11 @@ class RunDiagnosticsWriter:
             collected[task] = per_path
         return collected
 
-    @staticmethod
-    def _human3_macro(epoch_path, path, metric):
+    def _human3_macro(self, epoch_path, path, metric):
         values = [
             per_path[path][metric]
-            for per_path in epoch_path.values()
-            if math.isfinite(per_path[path][metric])
+            for task, per_path in epoch_path.items()
+            if task in set(self.human_tasks) and math.isfinite(per_path[path][metric])
         ]
         return float(np.mean(values)) if values else float("nan")
 
