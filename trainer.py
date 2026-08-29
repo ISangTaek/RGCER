@@ -808,6 +808,7 @@ class Trainer:
     ):
         self.model.eval()
         buffers = {task: {"pred": [], "label": []} for task in self.task_name}
+        representation_records = {task: {"sample_id": [], "metrics": []} for task in self.task_name}
         records = {task: {"lower": [], "upper": [], "target": []} for task in self.task_name}
         route_records = {
             task: {
@@ -872,6 +873,19 @@ class Trainer:
                     route_records[task]["sample_id"].extend(
                         str(value) for value in (getattr(batch, "sample_id", None) or [])
                     )
+                    # D3 representation-path audit (plan §5-§13): read-only norms
+                    # computed from the forward diagnostics already in hand.
+                    if getattr(diagnostics, "get", None) is not None or isinstance(diagnostics, dict):
+                        if diagnostics:
+                            from representation_audit import compute_representation_metrics
+
+                            rep = compute_representation_metrics(self.model, task, diagnostics)
+                            if rep:
+                                representation_records[task]["sample_id"].extend(
+                                    str(value)
+                                    for value in (getattr(batch, "sample_id", None) or [])
+                                )
+                                representation_records[task]["metrics"].append(rep)
                     if "null_weight" in diagnostics:
                         route_records[task]["null"].append(diagnostics["null_weight"].cpu())
                     if "source_weights" in diagnostics:
@@ -882,6 +896,9 @@ class Trainer:
                         )
                     if "routing_entropy" in diagnostics:
                         route_records[task]["entropy"].append(diagnostics["routing_entropy"].cpu())
+        # D3 representation audit: stashed alongside route records for the
+        # per-epoch writer and best-epoch dumps.
+        self._representation_records = representation_records
         return buffers, records, route_records
 
     def _evaluate(self, dataloaders_dict, mode="validation", epoch=0, routing_enabled_override=None):
@@ -1539,8 +1556,11 @@ class Trainer:
                 # Plan §6-§9/§18: log every epoch, including warm-up epochs
                 # (routing_enabled=False) so the collapse trajectory is visible.
                 route_records = getattr(self, "_last_route_records", None)
+                representation_records = getattr(self, "_representation_records", None)
                 if best_updated:
-                    self._diagnostics.note_best_epoch(epoch, route_records)
+                    self._diagnostics.note_best_epoch(
+                        epoch, route_records, representation_records=representation_records
+                    )
                 self._diagnostics.log_epoch(
                     epoch,
                     train_result,
@@ -1548,6 +1568,7 @@ class Trainer:
                     route_records=route_records,
                     routing_enabled=self._routing_enabled(epoch),
                     is_best=bool(best_updated),
+                    representation_records=representation_records,
                 )
             self._save_checkpoint(
                 epoch,

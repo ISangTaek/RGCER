@@ -19,6 +19,10 @@ import numpy as np
 import torch
 
 from architecture.toxacute_tasks import HUMAN_TARGET_TASKS
+from representation_audit import (
+    REPRESENTATION_AGGREGATE_FIELDS,
+    REPRESENTATION_METRIC_FIELDS,
+)
 
 
 # Parameter-name prefixes per diagnostic group (plan §6.6).  Groups missing
@@ -176,10 +180,12 @@ class RunDiagnosticsWriter:
         self.path_rows: list[dict] = []
         self.routing_rows: list[dict] = []
         self.gradient_rows: list[dict] = []
+        self.representation_rows: list[dict] = []
         self._grad_steps: list[dict] = []
         self._path_by_epoch: dict[int, dict[str, dict]] = {}
         self._predictions_by_epoch: dict[int, list[dict]] = {}
         self._routing_by_epoch: dict[int, list[dict]] = {}
+        self._representation_by_epoch: dict[int, list[dict]] = {}
         self.best_epoch: int | None = None
 
     # ------------------------------------------------------------------
@@ -226,8 +232,9 @@ class RunDiagnosticsWriter:
         *,
         routing_enabled,
         is_best,
+        representation_records=None,
     ):
-        """Append one epoch's summary/path/routing/gradient rows."""
+        """Append one epoch's summary/path/routing/gradient/representation rows."""
 
         self._flush_gradients(epoch)
         routing = validation_result.get("routing", {}) or {}
@@ -235,6 +242,14 @@ class RunDiagnosticsWriter:
             self.routing_rows.append(
                 {"epoch": epoch, "task": task, **{field: _float(values.get(field)) for field in ROUTING_FIELDS}}
             )
+
+        # D3 §27: per-epoch representation-path aggregates for the human3 tasks.
+        representation_rows = self._collect_representation_aggregates(representation_records)
+        self._representation_by_epoch[epoch] = self._collect_human3_representation(
+            representation_records
+        )
+        for row in representation_rows:
+            self.representation_rows.append({"epoch": epoch, **row})
 
         epoch_path = self._collect_path_metrics(route_records)
         self._path_by_epoch[epoch] = epoch_path
@@ -273,6 +288,55 @@ class RunDiagnosticsWriter:
     # ------------------------------------------------------------------
     # Path metrics and per-sample caches
     # ------------------------------------------------------------------
+    def _collect_representation_aggregates(self, representation_records):
+        if not representation_records:
+            return []
+        aggregates = []
+        for task in self.task_names:
+            record = representation_records.get(task)
+            if not record or not record["metrics"]:
+                continue
+            stacked = {
+                key: torch.cat([entry[key] for entry in record["metrics"]])
+                for key in record["metrics"][0]
+            }
+            row = {"task": task}
+            for field in REPRESENTATION_METRIC_FIELDS:
+                values = stacked.get(field)
+                row[f"{field}_mean"] = (
+                    float(values.float().mean()) if values is not None and values.numel() else float("nan")
+                )
+            aggregates.append(row)
+        return aggregates
+
+    def _collect_human3_representation(self, representation_records):
+        if not representation_records:
+            return []
+        rows = []
+        for task in self.human_tasks:
+            record = representation_records.get(task)
+            if not record or not record["metrics"]:
+                continue
+            stacked = {
+                key: torch.cat([entry[key] for entry in record["metrics"]])
+                for key in record["metrics"][0]
+            }
+            sample_ids = list(record["sample_id"])
+            count = len(sample_ids)
+            for index in range(count):
+                row = {
+                    "sample_id": sample_ids[index],
+                    "row_index": self.sample_row_index.get(str(sample_ids[index]), ""),
+                    "task": task,
+                }
+                for field in REPRESENTATION_METRIC_FIELDS:
+                    values = stacked.get(field)
+                    row[field] = (
+                        float(values[index]) if values is not None and index < values.numel() else float("nan")
+                    )
+                rows.append(row)
+        return rows
+
     def _collect_path_metrics(self, route_records):
         if not route_records:
             return {}
@@ -394,7 +458,7 @@ class RunDiagnosticsWriter:
     # ------------------------------------------------------------------
     # Final artifacts
     # ------------------------------------------------------------------
-    def note_best_epoch(self, epoch, route_records):
+    def note_best_epoch(self, epoch, route_records, representation_records=None):
         """Cache the current epoch's per-sample rows when it becomes best."""
 
         if route_records is None:
@@ -402,6 +466,10 @@ class RunDiagnosticsWriter:
         predictions, routing = self._collect_human3_samples(route_records)
         self._predictions_by_epoch[epoch] = predictions
         self._routing_by_epoch[epoch] = routing
+        if representation_records is not None:
+            self._representation_by_epoch[epoch] = self._collect_human3_representation(
+                representation_records
+            )
 
     def write_best_artifacts(self, best_epoch):
         """Write best-validation per-sample CSVs and source frequencies."""
@@ -424,6 +492,47 @@ class RunDiagnosticsWriter:
             routing_fields += ["routing_entropy"]
             _write_csv(self.output_dir / "best_validation_human3_routing.csv", routing_fields, routing)
             self._write_source_frequency(routing)
+        representation = self._representation_by_epoch.get(best_epoch, [])
+        if representation:
+            summary_rows = []
+            for task in self.human_tasks:
+                rows = [row for row in representation if row["task"] == task]
+                if not rows:
+                    continue
+                summary = {"epoch": best_epoch, "task": task, "n": len(rows)}
+                summary.update(
+                    {
+                        f"{field}_mean": RunDiagnosticsWriter._finite_mean_values(
+                            [row[field] for row in rows]
+                        )
+                        for field in REPRESENTATION_METRIC_FIELDS
+                    }
+                )
+                # Plan §11: route-minus-base prediction magnitude alongside the
+                # representation chain, joined from the best-epoch predictions.
+                prediction_rows = self._predictions_by_epoch.get(best_epoch, [])
+                deltas = [
+                    abs(float(pred["route_prediction"]) - float(pred["base_prediction"]))
+                    for pred in prediction_rows
+                    if pred["task"] == task
+                    and math.isfinite(float(pred["route_prediction"]))
+                    and math.isfinite(float(pred["base_prediction"]))
+                ]
+                summary["route_minus_base_abs_mean"] = RunDiagnosticsWriter._finite_mean_values(deltas)
+                summary_rows.append(summary)
+            if summary_rows:
+                _write_csv(
+                    self.output_dir / "representation_path_summary.csv",
+                    ("epoch", "task", "n")
+                    + tuple(f"{field}_mean" for field in REPRESENTATION_METRIC_FIELDS)
+                    + ("route_minus_base_abs_mean",),
+                    summary_rows,
+                )
+
+    @staticmethod
+    def _finite_mean_values(values):
+        finite = [value for value in values if math.isfinite(value)]
+        return sum(finite) / len(finite) if finite else float("nan")
 
     def _write_source_frequency(self, routing_rows):
         frequency = {}
@@ -458,3 +567,5 @@ class RunDiagnosticsWriter:
         _write_csv(self.output_dir / "routing_epoch.csv", routing_fields, self.routing_rows)
         gradient_fields = ("epoch", "group", "mean", "max", "last", "steps")
         _write_csv(self.output_dir / "gradient_norms.csv", gradient_fields, self.gradient_rows)
+        representation_fields = ("epoch", "task") + REPRESENTATION_AGGREGATE_FIELDS
+        _write_csv(self.output_dir / "representation_epoch.csv", representation_fields, self.representation_rows)

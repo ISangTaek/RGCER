@@ -76,6 +76,21 @@ def _configure_run_identity(params):
     Path(params.save_path).mkdir(parents=True, exist_ok=True)
 
 
+def _git_commit_hash() -> str:
+    import subprocess
+
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout.strip()
+    except Exception:
+        return "<unknown>"
+
+
 def _write_run_metadata(params, task_names, trainer):
     if not getattr(params, "save_path", None):
         return
@@ -133,6 +148,8 @@ def _write_run_metadata(params, task_names, trainer):
             "num_loader_workers": int(getattr(params, "num_loader_workers", 0)),
             "persistent_worker_policy": PERSISTENT_WORKER_POLICY,
             "train_eval_scope": getattr(params, "train_eval_scope", "full"),
+            "evaluation_scope": getattr(params, "train_eval_scope", "full"),
+            "git_commit": _git_commit_hash(),
             "initial_model_sha256": initial_model_sha256,
             "manifest_sha256": data_metadata.get("split_manifest_hash"),
             "datastore_fingerprint": data_metadata.get("datastore_fingerprint"),
