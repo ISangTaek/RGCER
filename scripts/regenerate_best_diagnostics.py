@@ -18,8 +18,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import sys
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 
@@ -57,8 +63,6 @@ def main() -> None:
 
     best_summary = run_dir / "diagnostics" / "epoch_summary.csv"
     best_epoch = None
-    import csv
-
     with best_summary.open(newline="", encoding="utf-8") as handle:
         best_rows = [row for row in csv.DictReader(handle) if row["is_best"] == "True"]
     if best_rows:
