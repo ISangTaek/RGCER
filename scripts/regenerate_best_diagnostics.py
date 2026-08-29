@@ -35,6 +35,7 @@ from main import (
     _build_model_components,
     _device_from_params,
     _loaders,
+    _resolve_data_store,
     build_task_dict,
     build_parser,
     task_names_for_params,
