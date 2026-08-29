@@ -322,8 +322,20 @@ class RunDiagnosticsWriter:
             final_regret = _stack(record.get("final_regret"))
             null = _stack(record.get("null"))
             entropy = _stack(record.get("entropy"))
+            # source/joint weights arrive as one [batch, task] tensor per batch;
+            # concatenate once so per-sample indexing below is global.
             source_weights = record.get("source_weights") or []
             joint_weights = record.get("joint_source_weights") or []
+            conditional_all = (
+                torch.cat([torch.as_tensor(tensor) for tensor in source_weights])
+                if source_weights
+                else torch.empty((0, len(self.task_names)))
+            )
+            joint_all = (
+                torch.cat([torch.as_tensor(tensor) for tensor in joint_weights])
+                if joint_weights
+                else torch.empty((0, len(self.task_names)))
+            )
             sample_ids = list(record.get("sample_id") or [])
             count = targets.size
             if sample_ids and len(sample_ids) != count:
@@ -352,16 +364,8 @@ class RunDiagnosticsWriter:
                         "final_regret": float(final_regret[index]) if index < final_regret.size else float("nan"),
                     }
                 )
-                conditional = (
-                    torch.as_tensor(source_weights[index]).reshape(-1)
-                    if index < len(source_weights)
-                    else torch.empty(0)
-                )
-                joint = (
-                    torch.as_tensor(joint_weights[index]).reshape(-1)
-                    if index < len(joint_weights)
-                    else torch.empty(0)
-                )
+                conditional = conditional_all[index] if index < conditional_all.size(0) else torch.empty(0)
+                joint = joint_all[index] if index < joint_all.size(0) else torch.empty(0)
                 row = {
                     "sample_id": sample_id,
                     "row_index": self.sample_row_index.get(str(sample_id), ""),

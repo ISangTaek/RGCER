@@ -225,12 +225,17 @@ def _route_record(values, with_sources=True):
         "entropy": tensor([0.7 for _ in values]),
     }
     if with_sources:
-        record["null"] = tensor([0.2 for _ in values])
+        # One [batch, task] tensor per validation batch — the writer must
+        # concatenate before indexing samples globally (regression guard for
+        # the flattened-column bug that produced "column_496" style names).
+        record["null"] = [torch.tensor([[0.2]]), torch.tensor([[0.3]])]
         record["source_weights"] = [
-            torch.tensor([0.6, 0.4, 0.0]) for _ in values
+            torch.tensor([[0.6, 0.4, 0.0]]),
+            torch.tensor([[0.3, 0.7, 0.0]]),
         ]
         record["joint_source_weights"] = [
-            torch.tensor([0.48, 0.32, 0.0]) for _ in values
+            torch.tensor([[0.48, 0.32, 0.0]]),
+            torch.tensor([[0.2, 0.6, 0.0]]),
         ]
     return record
 
@@ -302,10 +307,19 @@ def test_diagnostics_writer_writes_epoch_and_best_artifacts(tmp_path):
     with (tmp_path / "diagnostics" / "best_validation_human3_routing.csv").open() as handle:
         routing_rows = list(csv.DictReader(handle))
     assert len(routing_rows) == 6
-    assert routing_rows[0]["top1_source"] == HUMAN_TASKS[0]
-    assert float(routing_rows[0]["top1_conditional_weight"]) == pytest.approx(0.6)
-    assert float(routing_rows[0]["top1_joint_weight"]) == pytest.approx(0.48)
-    assert float(routing_rows[0]["transfer_mass"]) == pytest.approx(0.8)
+    by_sample = {(row["task"], row["sample_id"]): row for row in routing_rows}
+    first = by_sample[(HUMAN_TASKS[0], "s_1")]
+    assert first["top1_source"] == HUMAN_TASKS[0]
+    assert float(first["top1_conditional_weight"]) == pytest.approx(0.6)
+    assert float(first["top1_joint_weight"]) == pytest.approx(0.48)
+    assert float(first["transfer_mass"]) == pytest.approx(0.8)
+    # The second sample lives in the second validation batch: its top-1 source
+    # must resolve through the concatenated weights, not batch-relative ones.
+    second = by_sample[(HUMAN_TASKS[0], "s_2")]
+    assert second["top1_source"] == HUMAN_TASKS[1]
+    assert float(second["top1_conditional_weight"]) == pytest.approx(0.7)
+    assert float(second["top1_joint_weight"]) == pytest.approx(0.6)
+    assert float(second["transfer_mass"]) == pytest.approx(0.7)
 
     frequency = json.loads(
         (tmp_path / "diagnostics" / "routing_source_frequency.json").read_text()
@@ -313,8 +327,9 @@ def test_diagnostics_writer_writes_epoch_and_best_artifacts(tmp_path):
     for task in HUMAN_TASKS:
         entry = frequency["tasks"][task]
         assert entry["samples"] == 2
-        assert entry["unique_top1_sources"] == 1
-        assert entry["top1_source_counts"][HUMAN_TASKS[0]] == 2
+        assert entry["unique_top1_sources"] == 2
+        assert entry["top1_source_counts"][HUMAN_TASKS[0]] == 1
+        assert entry["top1_source_counts"][HUMAN_TASKS[1]] == 1
 
     with (tmp_path / "diagnostics" / "gradient_norms.csv").open() as handle:
         gradient_rows = list(csv.DictReader(handle))
