@@ -275,7 +275,7 @@ def main() -> None:
 
     rows = []
     for mechanism, rel_root in MECHANISMS.items():
-        mech_root = Path(args.runs_root) / mechanism
+        mech_root = Path(rel_root)
         for seed in args.seeds:
             run_dir = mech_root / f"seed_{seed}"
             if not run_dir.exists():
