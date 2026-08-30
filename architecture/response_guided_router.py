@@ -127,6 +127,10 @@ class ResponseGuidedEndpointRouter(nn.Module):
         nn.init.normal_(self.null_token, mean=0.0, std=0.02)
         self.null_key_projection = nn.Linear(hidden_dim, router_dim, bias=False)
         self.context_norm = nn.LayerNorm(hidden_dim)
+        # D4-0 inference-only intervention hook (plan §66): None during all
+        # training runs.  When set, it receives the freshly computed routing
+        # tensors and returns replacements before source-context fusion.
+        self.intervention = None
 
     def forward(
         self,
@@ -218,9 +222,17 @@ class ResponseGuidedEndpointRouter(nn.Module):
             null_weight = torch.zeros(batch_size, 1, device=logits.device, dtype=logits.dtype)
             joint_source_weights = conditional_weights
             entropy_weights = conditional_weights
+        entropy = -(entropy_weights * entropy_weights.clamp_min(1e-12).log()).sum(dim=-1)
+        if self.intervention is not None:
+            conditional_weights, joint_source_weights, null_weight, entropy = self.intervention(
+                conditional_weights=conditional_weights,
+                joint_source_weights=joint_source_weights,
+                null_weight=null_weight,
+                entropy=entropy,
+                allowed=allowed,
+            )
         source_context = torch.bmm(conditional_weights.unsqueeze(1), values).squeeze(1)
         task_context = self.context_norm(target_prompt + source_context)
-        entropy = -(entropy_weights * entropy_weights.clamp_min(1e-12).log()).sum(dim=-1)
         return task_context, conditional_weights, joint_source_weights, null_weight, entropy
 
 
