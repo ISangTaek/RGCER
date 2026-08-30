@@ -332,11 +332,65 @@ def _prior_top_sources(prior_rows: list[dict], seeds: list[int]) -> list[dict]:
     return top_rows
 
 
+def _summarize_hps_reference(seed: int, run_dir: Path) -> tuple[dict, list[dict]]:
+    """Recover per-endpoint HPS reference metrics from a formal run's metrics.json.
+
+    The frozen HPS 42/43/44 runs predate the per-epoch diagnostics CSVs but
+    their metrics.json history carries the identical validation numbers.
+    """
+
+    metrics_path = run_dir / "metrics.json"
+    if not metrics_path.exists():
+        return (
+            {"model": "hps", "seed": seed, "source": "frozen_reference", "status": "MISSING_METRICS_JSON"},
+            [],
+        )
+    history = json.loads(metrics_path.read_text(encoding="utf-8")).get("history", [])
+    validation_epochs = [entry for entry in history if "validation" in entry]
+    if not validation_epochs:
+        return (
+            {"model": "hps", "seed": seed, "source": "frozen_reference", "status": "MISSING_HISTORY"},
+            [],
+        )
+    best = min(
+        validation_epochs,
+        key=lambda entry: entry["validation"].get("human3_macro_rmse", float("inf")),
+    )
+    tasks = best["validation"]["tasks"]
+    best_val = float(best["validation"]["human3_macro_rmse"])
+    row = {
+        "model": "hps",
+        "seed": seed,
+        "source": "formal_hps_100e",
+        "best_epoch": int(best["epoch"]),
+        "human3_rmse": best_val,
+        "man_rmse": float(tasks.get(HUMAN_TASKS[0], {}).get("RMSE", float("nan"))),
+        "women_rmse": float(tasks.get(HUMAN_TASKS[1], {}).get("RMSE", float("nan"))),
+        "human_rmse": float(tasks.get(HUMAN_TASKS[2], {}).get("RMSE", float("nan"))),
+        "all59_macro_rmse": float(best["validation"].get("all_task_macro_rmse", float("nan"))),
+        "status": "OK",
+    }
+    endpoint_rows = [
+        {
+            "model": "hps",
+            "seed": seed,
+            "task": task,
+            "rmse": float(tasks.get(task, {}).get("RMSE", float("nan"))),
+            "mae": float("nan"),
+            "r2": float(tasks.get(task, {}).get("R2", float("nan"))),
+            "n": 0,
+        }
+        for task in HUMAN_TASKS
+    ]
+    return row, endpoint_rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--d4_task_root", default="artifacts/runs/d4_task_only_100e/d4_task_only_e100")
     parser.add_argument("--d3_task_root", default="artifacts/runs/d3_mechanisms/task_only_router/d3_task_only_router_e40")
     parser.add_argument("--hps_root", default="artifacts/runs/d4_hps_100e/d4_hps_e100")
+    parser.add_argument("--formal_hps_root", default="artifacts/runs/formal_hps/formal")
     parser.add_argument("--prior_csv", default="d4_0_prior_vectors.csv")
     parser.add_argument("--output_dir", default=".")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44, 45, 46])
@@ -375,15 +429,13 @@ def main() -> None:
         summary_rows.append(row)
         endpoint_rows.extend(endpoint_section)
     for seed in (42, 43, 44):
-        summary_rows.append(
-            {
-                "model": "hps",
-                "seed": seed,
-                "source": "frozen_reference",
-                "human3_rmse": HPS_REFERENCE_HUMAN3_RMSE[seed],
-                "status": "OK",
-            }
+        reference_row, reference_endpoints = _summarize_hps_reference(
+            seed, Path(args.formal_hps_root) / f"seed_{seed}"
         )
+        if "human3_rmse" not in reference_row:
+            reference_row["human3_rmse"] = HPS_REFERENCE_HUMAN3_RMSE[seed]
+        summary_rows.append(reference_row)
+        endpoint_rows.extend(reference_endpoints)
 
     # Paired comparison over the shared seeds (§62-§63).
     task_only_by_seed = {
