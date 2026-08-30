@@ -36,9 +36,12 @@ def compute_representation_metrics(model, task_name: str, diagnostics: dict) -> 
     """Per-sample representation-path metrics for one task's forward batch.
 
     Returns 1-D tensors (length = batch size) keyed by metric name, or an
-    empty dict when the batch carries no RGCER diagnostics.
+    empty dict when the batch carries no RGCER diagnostics (e.g. the plain
+    Graphormer HPS model, which emits its own diagnostics flavour).
     """
 
+    if not getattr(model, "is_rgcer", False):
+        return {}
     h = diagnostics.get("base_representation")
     if h is None:
         return {}
