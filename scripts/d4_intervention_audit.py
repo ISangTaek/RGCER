@@ -125,7 +125,11 @@ def make_uniform(learned_null, keep_null: bool):
         mask = allowed.to(conditional_weights.dtype)
         count = mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
         uniform = mask / count
-        null = learned_null.expand_as(null_weight) if keep_null else torch.zeros_like(null_weight)
+        null = (
+            learned_null.to(null_weight.device, null_weight.dtype).expand_as(null_weight)
+            if keep_null
+            else torch.zeros_like(null_weight)
+        )
         joint = torch.cat((null, uniform * (1.0 - null)), dim=-1)
         return uniform, joint, null, _joint_entropy(joint)
 
@@ -140,11 +144,13 @@ def make_permutation(learned_conditional: torch.Tensor, learned_allowed: torch.T
     permutation = active[torch.randperm(active.numel(), generator=generator)]
 
     def hook(*, conditional_weights, joint_source_weights, null_weight, entropy, allowed):
-        weights = learned_conditional.reshape(-1).clone()
+        weights = learned_conditional.reshape(-1).to(conditional_weights.device, conditional_weights.dtype)
+        active_local = active.to(weights.device)
+        permutation_local = permutation.to(weights.device)
         permuted = weights.clone()
-        permuted[active] = weights[permutation]
+        permuted[active_local] = weights[permutation_local]
         permuted = permuted.unsqueeze(0).expand_as(conditional_weights).contiguous()
-        null = learned_null.expand_as(null_weight)
+        null = learned_null.to(null_weight.device, null_weight.dtype).expand_as(null_weight)
         joint = torch.cat((null, permuted * (1.0 - null)), dim=-1)
         return permuted, joint, null, _joint_entropy(joint)
 
@@ -152,10 +158,9 @@ def make_permutation(learned_conditional: torch.Tensor, learned_allowed: torch.T
 
 
 def make_deletion(learned_conditional: torch.Tensor, learned_allowed: torch.Tensor, learned_null, delete_index: int | None, intervention_seed: int | None):
-    weights_vector = learned_conditional.reshape(-1)
-
     def hook(*, conditional_weights, joint_source_weights, null_weight, entropy, allowed):
-        active = allowed.reshape(-1).nonzero().reshape(-1)
+        weights_vector = learned_conditional.reshape(-1).to(conditional_weights.device, conditional_weights.dtype)
+        active = allowed[0].nonzero().reshape(-1)
         if delete_index is not None:
             victim = int(delete_index)
         else:
@@ -168,7 +173,7 @@ def make_deletion(learned_conditional: torch.Tensor, learned_allowed: torch.Tens
         total = (deleted * active_mask).sum().clamp_min(1e-12)
         renormalised = (deleted * active_mask) / total
         renormalised = renormalised.unsqueeze(0).expand_as(conditional_weights).contiguous()
-        null = learned_null.expand_as(null_weight)
+        null = learned_null.to(null_weight.device, null_weight.dtype).expand_as(null_weight)
         joint = torch.cat((null, renormalised * (1.0 - null)), dim=-1)
         return renormalised, joint, null, _joint_entropy(joint)
 
