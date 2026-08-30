@@ -57,6 +57,8 @@ def _model_with_router():
             self.task_conditioner = _Conditioner()
 
     class _Model(nn.Module):
+        is_rgcer = True
+
         def __init__(self):
             super().__init__()
             self.encoder = _Encoder()
