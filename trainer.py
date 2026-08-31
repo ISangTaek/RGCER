@@ -133,6 +133,7 @@ class Trainer:
         # Review §7: auditable initialization hash — same seed must produce
         # the same value across fresh processes, different seeds must not.
         self.initial_model_sha256 = state_dict_sha256(self.model)
+        self._persist_initial_state()
         self.task_scalers = {}
         self.conformal_calibrator = ConformalCalibrator(
             alpha=getattr(args, "conformal_alpha", 0.10),
@@ -1196,6 +1197,36 @@ class Trainer:
                 for item in getattr(prompt_bank, "metadata", [])
             ],
         }
+
+    def _persist_initial_state(self):
+        """D6 P0-4 root fix (smoke gate 2026-08-31): persist the TRUE initial
+        model state so counterfactual tooling can load it bitwise.
+
+        A fresh rebuild cannot reproduce a real run's initialisation: the
+        decoders are constructed in main() BEFORE this trainer re-seeds, so
+        the RNG lineage depends on the entire pre-model pipeline.  Every run
+        therefore records ``initial_model.pt`` next to its checkpoints; a
+        resume must never overwrite the original snapshot.
+        """
+        if getattr(self, "load_path", None):
+            return
+        if self.save_path is None:
+            return
+        self.save_path.mkdir(parents=True, exist_ok=True)
+        snapshot_path = self.save_path / "initial_model.pt"
+        if snapshot_path.exists():
+            return
+        torch.save(
+            {
+                "model_state": {
+                    key: value.detach().cpu().clone()
+                    for key, value in self.model.state_dict().items()
+                },
+                "initial_model_sha256": self.initial_model_sha256,
+                "seed": int(self.seed),
+            },
+            snapshot_path,
+        )
 
     def _rgcer_config(self):
         architecture_config = self._architecture_config()

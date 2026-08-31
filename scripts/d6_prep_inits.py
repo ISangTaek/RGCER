@@ -528,7 +528,12 @@ def _write_provenance(output: Path, provenance: dict) -> Path:
     provenance["output"] = str(output)
     provenance["output_sha256"] = _sha256_file(output)
     sidecar = output.with_name(output.name + ".provenance.json")
-    sidecar.write_text(json.dumps(provenance, indent=2, sort_keys=True), encoding="utf-8")
+    # teacher_configuration comes from the checkpoint's vars(args) snapshot
+    # and can contain non-JSON-native runtime objects — serialise them
+    # losslessly-for-audit via str() instead of crashing (smoke gate b1).
+    sidecar.write_text(
+        json.dumps(provenance, indent=2, sort_keys=True, default=str), encoding="utf-8"
+    )
     print(f"wrote {sidecar}")
     return sidecar
 
@@ -569,34 +574,67 @@ def apply_b1(theta0: dict, real: dict) -> dict:
     return merged
 
 
-def _regenerate_teacher_anchor(human_seed: int, template_config: dict | None, expected_initial_model_sha256: str):
-    """Review P0-4 (§19): rebuild the teachers' true common starting point.
+def _state_dict_sha256(state: dict) -> str:
+    """Content hash of a raw state dict (same algorithm as
+    reproducibility.state_dict_sha256, which consumes a module)."""
 
-    The Animal56 teacher construction consumes a different amount of RNG than
-    the human3 construction (56 vs 3 decoders first), so a same-seed human3
-    model does NOT share the teacher backbone coordinate.  This helper
-    reproduces the teacher's initial model exactly and fails loudly when the
-    reproduction is imperfect.
+    import hashlib
+
+    hasher = hashlib.sha256()
+    for key in sorted(state):
+        tensor = state[key].detach().cpu().contiguous()
+        hasher.update(key.encode("utf-8"))
+        hasher.update(str(tuple(tensor.shape)).encode("utf-8"))
+        hasher.update(tensor.numpy().tobytes())
+    return hasher.hexdigest()
+
+
+def _load_teacher_anchor_state(real_dir: Path, expected_initial_model_sha256: str) -> dict:
+    """D6 P0-4 root fix (smoke gate 2026-08-31): load the teacher run's
+    recorded initial-state snapshot.
+
+    A fresh rebuild cannot bitwise-reproduce a real run's initialisation —
+    the decoders are constructed in main() BEFORE the trainer re-seeds, so
+    the RNG lineage depends on the whole pre-model pipeline.  Every formal
+    run therefore persists ``initial_model.pt`` at trainer construction; the
+    snapshot is verified against BOTH the payload's recorded hash and the
+    actual weights before it may anchor a counterfactual.
     """
 
-    animal_init_model, _, _ = _build_model(human_seed, "animal56", torch.device("cpu"), template_config)
-    observed_hash = state_dict_sha256(animal_init_model)
-    if observed_hash != expected_initial_model_sha256:
+    real_dir = Path(real_dir)
+    snapshot_path = real_dir / "initial_model.pt"
+    if not snapshot_path.is_file():
         raise SystemExit(
-            "Could not reproduce teacher initial model exactly "
-            f"(expected {expected_initial_model_sha256}, observed {observed_hash})"
+            "teacher run is missing initial_model.pt (initial-state snapshot); "
+            "teachers must be trained with the snapshot-enabled trainer — "
+            f"looked for {snapshot_path}"
         )
-    return animal_init_model
+    payload = torch.load(snapshot_path, map_location="cpu", weights_only=False)
+    recorded = payload.get("initial_model_sha256")
+    state = payload.get("model_state")
+    if not recorded or state is None:
+        raise SystemExit(f"initial-state snapshot {snapshot_path} is malformed")
+    if recorded != expected_initial_model_sha256:
+        raise SystemExit(
+            "initial-state snapshot hash mismatch: snapshot recorded "
+            f"{recorded}, teacher run metadata says {expected_initial_model_sha256}"
+        )
+    observed = _state_dict_sha256(state)
+    if observed != expected_initial_model_sha256:
+        raise SystemExit(
+            "initial-state snapshot weights do not match the recorded hash "
+            f"(observed {observed}, expected {expected_initial_model_sha256})"
+        )
+    return state
 
 
-def build_anchor_state(model_human, animal_init_model) -> dict:
+def build_anchor_state(model_human, animal_init_state: dict) -> dict:
     """Review §20: human heads stay fresh; backbone = teacher initial coordinate."""
 
-    animal_state = animal_init_model.state_dict()
     anchor = {key: value.detach().clone() for key, value in model_human.state_dict().items()}
     for key in anchor:
-        if key.startswith(BACKBONE_PREFIX) and key in animal_state:
-            anchor[key] = animal_state[key].detach().clone()
+        if key.startswith(BACKBONE_PREFIX) and key in animal_init_state:
+            anchor[key] = animal_init_state[key].detach().clone()
     return anchor
 
 
@@ -760,7 +798,13 @@ def main() -> None:
     parser.add_argument("--delta_csv", default=None, help="CSDT/CLST per-layer diagnostic CSV")
     args = parser.parse_args()
 
-    device = torch.device(args.gpu_id if args.gpu_id != "cpu" and torch.cuda.is_available() else "cpu")
+    # Smoke-gate fix: --gpu_id accepts "cpu" or a numeric CUDA index.
+    if str(args.gpu_id) == "cpu":
+        device = torch.device("cpu")
+    else:
+        device = torch.device(
+            f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu"
+        )
     teacher_real_dir = Path(args.teacher_real_dir)
     teacher_shuffle_dir = Path(args.teacher_shuffle_dir) if args.teacher_shuffle_dir else None
     if args.mode in {"csdt", "clst", "card_table"} and teacher_shuffle_dir is None:
@@ -885,10 +929,13 @@ def main() -> None:
         expected_init_hash = matched_init_hash
         if not expected_init_hash:
             raise SystemExit("teacher verification did not yield initial_model_sha256")
-        animal_init_model = _regenerate_teacher_anchor(
-            args.human_seed, template_config, expected_init_hash
-        )
-        theta_anchor = build_anchor_state(model_human, animal_init_model)
+        # D6 P0-4 root fix: load the recorded initial-state snapshots instead
+        # of trying to reproduce the run's RNG lineage; csdt additionally
+        # proves the shuffle teacher started from the SAME initial state.
+        animal_init_state = _load_teacher_anchor_state(teacher_real_dir, expected_init_hash)
+        if args.mode == "csdt":
+            _load_teacher_anchor_state(teacher_shuffle_dir, expected_init_hash)
+        theta_anchor = build_anchor_state(model_human, animal_init_state)
         provenance["teacher_anchor_initial_model_sha256"] = expected_init_hash
 
     model_real, _, _ = _build_model(args.human_seed, "animal56", torch.device("cpu"), template_config)

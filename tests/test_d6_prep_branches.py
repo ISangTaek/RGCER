@@ -162,7 +162,7 @@ def _install_stubs(monkeypatch, tmp_path, clst_rows=None, card_rows=(["s1", "s2"
     monkeypatch.setattr(prep, "card_delta_table", _stub_card_table)
     monkeypatch.setattr(prep, "validate_params", lambda params: None)
     monkeypatch.setattr(
-        prep, "_regenerate_teacher_anchor", lambda seed, template, expected: _StubModel()
+        prep, "_load_teacher_anchor_state", lambda run_dir, expected: {}
     )
     return recorded, real_dir, shuffle_dir
 

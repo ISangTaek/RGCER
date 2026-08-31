@@ -554,32 +554,77 @@ def test_same_seed_human3_and_animal56_native_backbones_differ():
     )
 
 
-def test_teacher_anchor_reproduction_hash():
-    # Review P0-4/§19: the regenerated animal initialisation must match the
-    # teacher's recorded initial model hash.
-    from scripts.d6_prep_inits import _regenerate_teacher_anchor
+def _write_initial_state_snapshot(run_dir, model, sha=None):
+    run_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state": {
+                key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+            },
+            "initial_model_sha256": sha or state_dict_sha256(model),
+            "seed": 42,
+        },
+        run_dir / "initial_model.pt",
+    )
+    return run_dir / "initial_model.pt"
+
+
+def test_teacher_anchor_snapshot_roundtrip(tmp_path):
+    # D6 P0-4 root fix: the anchor is loaded from the teacher run's recorded
+    # initial-state snapshot, verified on both payload hash and actual weights.
+    from scripts.d6_prep_inits import _load_teacher_anchor_state, _state_dict_sha256
 
     model, _, _ = _build_model(42, "animal56", torch.device("cpu"))
+    run_dir = tmp_path / "teacher"
+    _write_initial_state_snapshot(run_dir, model)
     expected = state_dict_sha256(model)
-    regenerated = _regenerate_teacher_anchor(42, None, expected)
-    assert state_dict_sha256(regenerated) == expected
+    state = _load_teacher_anchor_state(run_dir, expected)
+    assert _state_dict_sha256(state) == expected
 
 
-def test_regenerated_teacher_anchor_rejects_wrong_hash():
-    from scripts.d6_prep_inits import _regenerate_teacher_anchor
+def test_teacher_anchor_snapshot_rejects_missing_file(tmp_path):
+    from scripts.d6_prep_inits import _load_teacher_anchor_state
 
-    with pytest.raises(SystemExit, match="Could not reproduce teacher initial model"):
-        _regenerate_teacher_anchor(42, None, "wrong-hash")
+    with pytest.raises(SystemExit, match="missing initial_model.pt"):
+        _load_teacher_anchor_state(tmp_path, "some-hash")
+
+
+def test_teacher_anchor_snapshot_rejects_wrong_hash(tmp_path):
+    from scripts.d6_prep_inits import _load_teacher_anchor_state
+
+    model, _, _ = _build_model(42, "animal56", torch.device("cpu"))
+    run_dir = tmp_path / "teacher"
+    _write_initial_state_snapshot(run_dir, model, sha="wrong-hash")
+    with pytest.raises(SystemExit, match="hash mismatch"):
+        _load_teacher_anchor_state(run_dir, "expected-hash")
+
+
+def test_teacher_anchor_snapshot_rejects_tampered_weights(tmp_path):
+    # A snapshot claiming hash X whose weights hash to Y must be refused.
+    from scripts.d6_prep_inits import _load_teacher_anchor_state
+
+    model, _, _ = _build_model(42, "animal56", torch.device("cpu"))
+    run_dir = tmp_path / "teacher"
+    run_dir.mkdir(parents=True)
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "initial_model_sha256": "claimed",
+            "seed": 42,
+        },
+        run_dir / "initial_model.pt",
+    )
+    with pytest.raises(SystemExit, match="do not match the recorded hash"):
+        _load_teacher_anchor_state(run_dir, "claimed")
 
 
 def test_anchor_only_preserves_human_heads():
-    from scripts.d6_prep_inits import _regenerate_teacher_anchor, build_anchor_state
+    from scripts.d6_prep_inits import build_anchor_state
 
     model_human, _, _ = _build_model(42, "human3", torch.device("cpu"))
-    animal_init = _regenerate_teacher_anchor.__wrapped__ if False else None
     # Build a genuine animal initial model with the same seed.
     model_animal, _, _ = _build_model(42, "animal56", torch.device("cpu"))
-    anchor = build_anchor_state(model_human, model_animal)
+    anchor = build_anchor_state(model_human, model_animal.state_dict())
     human_sd = model_human.state_dict()
     animal_sd = model_animal.state_dict()
     for key, value in anchor.items():
