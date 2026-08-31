@@ -491,6 +491,10 @@ class Trainer:
         base_raw = diagnostics.get("base_raw", final_raw)
         routing_enabled = self._routing_enabled(epoch)
         total_loss = getattr(self.args, "lambda_quantile", 1.0) * final_loss
+        card = getattr(getattr(self, "model", None), "card", None)
+        if card is not None and getattr(card, "last_loss", None) is not None:
+            # D6 O3 CARD distillation (plan §17): L = L_human + lambda_delta * L_delta.
+            total_loss = total_loss + card.lambda_delta * card.last_loss
         if routing_enabled and self._is_rgcer:
             base_loss = self._prediction_loss(task, base_raw, normalized_labels)
             if getattr(self.args, "rgcer_use_base_aux_loss", True):
@@ -610,6 +614,9 @@ class Trainer:
         schedule_diagnostics = self._schedule_diagnostics(schedule, train_dataloaders_dict)
         self.schedule_usage = {task: 0 for task in self.task_name}
         self.training_cache = {}
+        card = getattr(getattr(self, "model", None), "card", None)
+        if card is not None:
+            card.reset_epoch_stats()
         # Review §15: a task may be scheduled for more passes than its
         # loader provides batches (human_target_floor extra passes).  The
         # iterator restarts only while scheduled-but-unconsumed batches
@@ -726,6 +733,9 @@ class Trainer:
         schedule_diagnostics["human3_actual_fraction"] = round(human_actual / actual_total, 6)
         result["schedule_diagnostics"] = schedule_diagnostics
         result["routing"] = self._routing_summary()
+        card = getattr(getattr(self, "model", None), "card", None)
+        if card is not None:
+            result["card"] = card.pop_epoch_stats()
         return result
 
     def _selection_tasks(self):

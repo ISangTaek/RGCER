@@ -503,6 +503,23 @@ def main(params):
                 _write_json(Path(params.save_path) / "data_preflight.json", preflight)
     task_dict = build_task_dict(params, task_names)
     device = _device_from_params(params)
+    if getattr(params, "shuffle_animal_train_labels", False) and params.mode in {"train", "test"}:
+        # D6 §61-§63: counterfactual Animal56 teacher.  Only train-split labels
+        # of the animal endpoints are permuted (fixed task-local mapping);
+        # validation stays real and human labels are never touched.
+        from shuffled_animal_labels import ANIMAL_SHUFFLE_SEED, ShuffledAnimalTrainLabels
+
+        animal_tasks = [name for name in task_names if name in set(ANIMAL_SOURCE_TASKS)]
+        if store is not None and animal_tasks:
+            provider = ShuffledAnimalTrainLabels(
+                store,
+                animal_tasks,
+                shuffle_seed=getattr(params, "animal_shuffle_seed", ANIMAL_SHUFFLE_SEED),
+            )
+            params.label_providers = {name: provider for name in animal_tasks}
+            print(
+                f"shuffled-animal teacher: permuted train labels for {len(animal_tasks)} endpoints"
+            )
     kwargs, optim_param = prepare_args(params)
     encoder_class, architecture_class, decoders = _build_model_components(params, task_names, device)
     collator = DataCollator(
@@ -524,6 +541,17 @@ def main(params):
         **kwargs,
     )
     _write_run_metadata(params, task_names, trainer)
+    if getattr(params, "init_state_path", None):
+        # D6 CSDT/CLST/sequential-transfer initialisation (plan §64-§65): the
+        # fresh seed-matched model receives a prepared state dict before any
+        # training step; provenance hashes are recorded post-overlay.
+        state = torch.load(params.init_state_path, map_location=trainer.device, weights_only=False)
+        trainer.model.load_state_dict(state, strict=True)
+        from reproducibility import state_dict_sha256
+
+        trainer.initial_model_sha256 = state_dict_sha256(trainer.model)
+        print(f"applied init state overlay from {params.init_state_path}")
+        _write_run_metadata(params, task_names, trainer)
     print(f"Using device: {trainer.device}; tasks={len(task_names)}; architecture={params.arch}")
 
     if params.mode in {"train", "test"}:
@@ -831,6 +859,35 @@ def build_parser():
         "as router sources under rgcer_source_policy=animal56_only.",
     )
     parser.add_argument("--experiment_tag", default="full")
+
+    # D6 counterfactual transfer switches (plan §61-§67, §77).
+    parser.add_argument(
+        "--shuffle_animal_train_labels",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Animal56 teacher mode: replace train-split labels of every animal "
+        "endpoint with a fixed task-local permutation (ANIMAL_SHUFFLE_SEED). "
+        "Validation labels stay real; human labels are never touched.",
+    )
+    parser.add_argument("--animal_shuffle_seed", type=int, default=20260831)
+    parser.add_argument(
+        "--init_state_path",
+        default=None,
+        help="Optional plain model state_dict applied to the freshly built model "
+        "before training (CSDT/CLST/sequential-transfer initialisation).",
+    )
+    parser.add_argument(
+        "--card_lambda_delta",
+        type=float,
+        default=0.0,
+        help="D6 O3 CARD distillation weight; >0 enables the zero-init residual adapter.",
+    )
+    parser.add_argument("--card_bottleneck", type=int, default=32)
+    parser.add_argument(
+        "--card_delta_table",
+        default=None,
+        help="npz (ids, delta) with per-sample real-vs-shuffled teacher representation deltas.",
+    )
 
     parser.add_argument("--weighting", choices=["EW", "UW", "DWA"], default="EW")
     parser.add_argument("--optim", choices=["adam", "adamw"], default="adamw")

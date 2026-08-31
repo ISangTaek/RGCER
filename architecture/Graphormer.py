@@ -76,6 +76,18 @@ class Graphormer(AbsArchitecture):
                 "spatial_pos_max_clip", getattr(args, "spatial_pos_clip", 20)
             ),
         )
+        # D6 O3 CARD: zero-init residual adapter + counterfactual distillation
+        # (plan §15-§18).  Inert unless --card_lambda_delta > 0.
+        self.card = None
+        if float(getattr(args, "card_lambda_delta", 0.0)) > 0:
+            from card_adapter import CardAdapter
+
+            self.card = CardAdapter(
+                hidden_dim=args.hidden_dim,
+                bottleneck=int(getattr(args, "card_bottleneck", 32)),
+                lambda_delta=float(args.card_lambda_delta),
+                delta_table_path=str(getattr(args, "card_delta_table", "") or ""),
+            )
 
     def forward(
         self,
@@ -89,6 +101,10 @@ class Graphormer(AbsArchitecture):
     ):
         del source_mask, routing_enabled, mode
         representation = self.encoder(inputs)
+        if self.card is not None:
+            representation = self.card(
+                representation, list(getattr(inputs, "sample_id", None) or [])
+            )
         ones = torch.ones(representation.size(0), 1, device=representation.device, dtype=representation.dtype)
         if return_all_tasks or task_name is None:
             predictions = {task: self.decoders[task](representation) for task in self.task_name}
