@@ -91,6 +91,16 @@ def _git_commit_hash() -> str:
         return "<unknown>"
 
 
+def _sha256_file(path):
+    import hashlib
+
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _write_run_metadata(params, task_names, trainer):
     if not getattr(params, "save_path", None):
         return
@@ -150,6 +160,15 @@ def _write_run_metadata(params, task_names, trainer):
             "train_eval_scope": getattr(params, "train_eval_scope", "full"),
             "evaluation_scope": getattr(params, "train_eval_scope", "full"),
             "git_commit": _git_commit_hash(),
+            # D6 shuffle/counterfactual provenance (review P1-5, §51).
+            "shuffle_animal_train_labels": bool(
+                getattr(params, "shuffle_animal_train_labels", False)
+            ),
+            "animal_shuffle_seed": getattr(params, "animal_shuffle_seed", None),
+            "animal_shuffle_mapping_sha256": getattr(
+                params, "animal_shuffle_mapping_sha256", None
+            ),
+            "init_overlay": getattr(params, "init_overlay_provenance", None),
             "initial_model_sha256": initial_model_sha256,
             "manifest_sha256": data_metadata.get("split_manifest_hash"),
             "datastore_fingerprint": data_metadata.get("datastore_fingerprint"),
@@ -520,6 +539,23 @@ def main(params):
             print(
                 f"shuffled-animal teacher: permuted train labels for {len(animal_tasks)} endpoints"
             )
+            # Review P1-5: persist the exact shuffle mapping + sanity table so
+            # the counterfactual alignment is auditable per run.
+            mapping_sha = provider.mapping_sha256()
+            params.animal_shuffle_mapping_sha256 = mapping_sha
+            if params.save_path:
+                manifest = {
+                    "animal_shuffle_seed": getattr(params, "animal_shuffle_seed", ANIMAL_SHUFFLE_SEED),
+                    "animal_shuffle_mapping_sha256": mapping_sha,
+                    "tasks": sorted(animal_tasks),
+                }
+                _write_json(Path(params.save_path) / "D6_ANIMAL_SHUFFLE_MANIFEST.json", manifest)
+                _write_csv(
+                    Path(params.save_path) / "D6_SHUFFLE_SANITY.csv",
+                    ["task", "n", "mean_before", "mean_after", "std_before", "std_after",
+                     "label_multiset_equal", "mapping_hash"],
+                    provider.sanity_rows(),
+                )
     kwargs, optim_param = prepare_args(params)
     encoder_class, architecture_class, decoders = _build_model_components(params, task_names, device)
     collator = DataCollator(
@@ -544,12 +580,25 @@ def main(params):
     if getattr(params, "init_state_path", None):
         # D6 CSDT/CLST/sequential-transfer initialisation (plan §64-§65): the
         # fresh seed-matched model receives a prepared state dict before any
-        # training step; provenance hashes are recorded post-overlay.
-        state = torch.load(params.init_state_path, map_location=trainer.device, weights_only=False)
-        trainer.model.load_state_dict(state, strict=True)
+        # training step; provenance hashes are recorded post-overlay
+        # (review P1-12/§51).
         from reproducibility import state_dict_sha256
 
-        trainer.initial_model_sha256 = state_dict_sha256(trainer.model)
+        pre_overlay_model_sha256 = trainer.initial_model_sha256
+        state = torch.load(params.init_state_path, map_location=trainer.device, weights_only=False)
+        trainer.model.load_state_dict(state, strict=True)
+        post_overlay_model_sha256 = state_dict_sha256(trainer.model)
+        trainer.initial_model_sha256 = post_overlay_model_sha256
+        init_provenance_path = Path(str(params.init_state_path) + ".provenance.json")
+        params.init_overlay_provenance = {
+            "pre_overlay_model_sha256": pre_overlay_model_sha256,
+            "post_overlay_model_sha256": post_overlay_model_sha256,
+            "init_state_path": str(params.init_state_path),
+            "init_state_sha256": _sha256_file(Path(params.init_state_path)),
+            "init_provenance_path": (
+                str(init_provenance_path) if init_provenance_path.exists() else None
+            ),
+        }
         print(f"applied init state overlay from {params.init_state_path}")
         _write_run_metadata(params, task_names, trainer)
     print(f"Using device: {trainer.device}; tasks={len(task_names)}; architecture={params.arch}")
@@ -953,10 +1002,34 @@ def validate_params(params):
         changed = [name for name, default in defaults.items() if getattr(params, name, default) != default]
         if changed:
             warnings.warn(
-                f"RGCER flags {changed} are ignored by architecture {params.arch}.",
-                RuntimeWarning,
-                stacklevel=2,
+            f"RGCER flags {changed} are ignored by architecture {params.arch}.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    # D6 fail-fast guards (review P1-6, §62): illegal CARD / shuffle
+    # combinations must abort before any model or dataloader is built.
+    card_lambda = getattr(params, "card_lambda_delta", 0.0)
+    if card_lambda < 0:
+        raise ValueError("card_lambda_delta must be >= 0")
+    if card_lambda > 0:
+        if params.arch != "Graphormer":
+            raise ValueError("CARD micro-screen uses the HPS Graphormer architecture")
+        if getattr(params, "toxacute_task_scope", "human3") != "human3":
+            raise ValueError("CARD is defined only for Human3 fine-tuning")
+        if not getattr(params, "card_delta_table", None):
+            raise ValueError("--card_delta_table is required when CARD is enabled")
+        if not Path(params.card_delta_table).is_file():
+            raise FileNotFoundError(f"CARD delta table not found: {params.card_delta_table}")
+        if getattr(params, "shuffle_animal_train_labels", False):
+            raise ValueError(
+                "CARD Human3 runs must not enable --shuffle_animal_train_labels"
             )
+    if getattr(params, "shuffle_animal_train_labels", False) and getattr(
+        params, "toxacute_task_scope", "all59"
+    ) != "animal56":
+        raise ValueError(
+            "--shuffle_animal_train_labels is only valid with --toxacute_task_scope animal56"
+        )
     params.effective_rgcer_config = resolve_effective_rgcer_config(params)
 
 

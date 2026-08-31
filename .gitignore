@@ -37,3 +37,6 @@ _check*.py
 # Cython intermediates and compiler output
 algos/algos.c
 /build/
+
+# Data audit outputs (EXPRIMENTS/E0_*) are scratch audit artifacts
+/EXPRIMENTS/

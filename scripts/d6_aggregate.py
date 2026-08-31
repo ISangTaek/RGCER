@@ -1,4 +1,4 @@
-"""D6 Progressive Micro-Screening aggregation and auditable selection (§34, §73-§76).
+"""D6 Progressive Micro-Screening aggregation and auditable selection (§34, §73-§76; review P0-2/3/4, P1-7/8/9/10/11).
 
 Modes:
 - stage-a : rank B1/O1/O2/O3 by StableRMSE_20 (mean of the last five epochs)
@@ -7,10 +7,13 @@ Modes:
 - stage-b : three-seed (42/44/46) confirmation of the Stage-A Top-2 with the
   B0 paired reference; StableGain gates §43-§44; Top-1 per §45-§46.
 - stage-c : five-seed full-budget confirmation of the Stage-B Top-1 with the
-  §51-§52 gates.
+  §51-§52 gates (paired StableGain sign per §42/§52 and the endpoint gate).
 
-Every decision (thresholds, rankings, ties, reasons) is written to
-D6_SELECTION_TRACE.json so the selection is auditable (§76).
+Selection contract (review P0-2): every run directory is resolved as an exact
+``runs_root/candidate/tag/seed_<seed>`` match — Stage B/C therefore read each
+seed independently, and incomplete trajectories (missing or duplicate epochs
+up to the stage's expected last epoch) are rejected instead of ranked (P1-7).
+Every decision is written to D6_SELECTION_TRACE.json (§76).
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ ELIMINATE_ENDPOINT_MARGIN = 0.05
 ORIGINAL_MIN_GAIN = 0.01
 STRONG_GAIN = 0.02
 TIE_MARGIN = 0.01
+STAGE_LAST_EPOCH = {"stage-a": 19, "stage-b": 39, "stage-c": 99}
 
 
 def _read_csv(path: Path) -> list[dict]:
@@ -62,15 +66,23 @@ def _finite_mean(values):
     return sum(finite) / len(finite) if finite else float("nan")
 
 
-def candidate_run_dir(runs_root: Path, candidate: str, tag: str) -> Path | None:
-    base = runs_root / candidate / tag
-    if base.exists():
-        return base
-    matches = sorted((runs_root / candidate).glob(f"{tag}/seed_*"))
-    return matches[0].parent if matches else None
+def candidate_run_dir(runs_root: Path, candidate: str, tag: str, seed: int) -> Path | None:
+    """Review P0-2: exact per-seed run directory, no glob fallback."""
+
+    path = runs_root / candidate / tag / f"seed_{int(seed)}"
+    return path if path.exists() else None
 
 
-def trajectory(run_dir: Path) -> list[dict]:
+def _mean(values):
+    return sum(values) / len(values)
+
+
+def _std(values):
+    mean = _mean(values)
+    return math.sqrt(sum((value - mean) ** 2 for value in values) / max(len(values) - 1, 1))
+
+
+def trajectory(run_dir: Path, expected_last_epoch: int) -> list[dict]:
     rows = _read_csv(run_dir / "diagnostics" / "epoch_summary.csv")
     parsed = [
         {"epoch": int(row["epoch"]), "val": float(row["val_human3_macro_rmse"])}
@@ -78,6 +90,71 @@ def trajectory(run_dir: Path) -> list[dict]:
         if row.get("val_human3_macro_rmse") not in (None, "", "nan")
     ]
     return sorted(parsed, key=lambda row: row["epoch"])
+
+
+def summarize_run(
+    run_dir: Path | None,
+    candidate: str,
+    seed: int,
+    expected_last_epoch: int,
+) -> dict:
+    row: dict = {
+        "candidate": candidate,
+        "originality_eligible": CANDIDATES.get(candidate, {}).get("originality_eligible", False),
+        "seed": seed,
+        "expected_last_epoch": expected_last_epoch,
+    }
+    if run_dir is None or not run_dir.exists():
+        row["status"] = "MISSING_RUN"
+        return row
+    trajectory_rows = trajectory(run_dir, expected_last_epoch)
+    if not trajectory_rows:
+        row["status"] = "INCOMPLETE_TRAJECTORY"
+        row["missing_epochs"] = f"0..{expected_last_epoch}"
+        return row
+    observed = [entry["epoch"] for entry in trajectory_rows]
+    duplicates = sorted({epoch for epoch in observed if observed.count(epoch) > 1})
+    if duplicates:
+        row["status"] = "DUPLICATE_EPOCHS"
+        row["duplicate_epochs"] = duplicates
+        return row
+    missing = sorted(set(range(expected_last_epoch + 1)) - set(observed))
+    if missing:
+        # Review P1-7: a crashed run must never enter the ranking.
+        row["status"] = "INCOMPLETE_TRAJECTORY"
+        row["missing_epochs"] = (
+            f"{missing[0]}..{missing[-1]}" if len(missing) > 1 else str(missing[0])
+        )
+        row["n_missing_epochs"] = len(missing)
+        return row
+
+    values = [entry["val"] for entry in trajectory_rows]
+    window = values[-STABLE_WINDOW:]
+    stable = _mean(window)
+    best = min(values)
+    best_index = values.index(best)
+    local = values[max(0, best_index - 2) : best_index + 3]
+    epochs = {entry["epoch"] for entry in trajectory_rows[-STABLE_WINDOW:]}
+    endpoints = endpoint_stable(run_dir, epochs)
+    row.update(
+        {
+            "status": "PASS",
+            "stable_rmse": stable,
+            "best_rmse": best,
+            "best_epoch": trajectory_rows[best_index]["epoch"],
+            "best_sharpness": _mean(local) - best,
+            "trajectory_std": _std(values),
+            "man_rmse": endpoints[HUMAN_TASKS[0]],
+            "women_rmse": endpoints[HUMAN_TASKS[1]],
+            "human_rmse": endpoints[HUMAN_TASKS[2]],
+        }
+    )
+    if any(
+        not math.isfinite(float(row[key]))
+        for key in ("stable_rmse", "man_rmse", "women_rmse", "human_rmse")
+    ):
+        row["status"] = "FAILED_NON_FINITE"
+    return row
 
 
 def endpoint_stable(run_dir: Path, epochs: set[int]) -> dict[str, float]:
@@ -92,73 +169,28 @@ def endpoint_stable(run_dir: Path, epochs: set[int]) -> dict[str, float]:
     }
 
 
-def summarize_run(run_dir: Path | None, candidate: str, seed: int) -> dict:
-    row: dict = {
-        "candidate": candidate,
-        "originality_eligible": CANDIDATES.get(candidate, {}).get("originality_eligible", False),
-        "seed": seed,
+def _endpoint_means(rows: list[dict], candidate: str) -> dict[str, float]:
+    passed = [
+        row for row in rows if row["candidate"] == candidate and row.get("status") == "PASS"
+    ]
+    return {
+        task: _finite_mean([row.get(f"{task.split('_')[0]}_rmse") for row in passed])
+        for task in HUMAN_TASKS
     }
-    if run_dir is None or not run_dir.exists():
-        row["status"] = "MISSING_RUN"
-        return row
-    trajectory_rows = trajectory(run_dir)
-    if len(trajectory_rows) < STABLE_WINDOW:
-        row["status"] = "INCOMPLETE_TRAJECTORY"
-        return row
-    values = [entry["val"] for entry in trajectory_rows]
-    window = values[-STABLE_WINDOW:]
-    stable = float(np_mean(window))
-    best = min(values)
-    best_index = values.index(best)
-    local = values[max(0, best_index - 2) : best_index + 3]
-    epochs = {entry["epoch"] for entry in trajectory_rows[-STABLE_WINDOW:]}
-    endpoints = endpoint_stable(run_dir, epochs)
-    row.update(
-        {
-            "status": "PASS",
-            "stable_rmse": stable,
-            "best_rmse": best,
-            "best_epoch": trajectory_rows[best_index]["epoch"],
-            "best_sharpness": float(np_mean(local)) - best,
-            "trajectory_std": float(np_std(values)),
-            "man_rmse": endpoints[HUMAN_TASKS[0]],
-            "women_rmse": endpoints[HUMAN_TASKS[1]],
-            "human_rmse": endpoints[HUMAN_TASKS[2]],
-        }
-    )
-    if any(not math.isfinite(row[key]) for key in ("stable_rmse", "man_rmse", "women_rmse", "human_rmse")):
-        row["status"] = "FAILED_NON_FINITE"
-    return row
-
-
-def np_mean(values):
-    return sum(values) / len(values)
-
-
-def np_std(values):
-    mean = np_mean(values)
-    return math.sqrt(sum((value - mean) ** 2 for value in values) / max(len(values) - 1, 1))
-
-
-def _pcts_of_best(values: list[float], best: float) -> int:
-    return sum(1 for value in values if value <= best * 1.02)
 
 
 def stage_a(runs_root: Path, seed: int, output_dir: Path, trace: dict) -> list[str]:
+    expected_last_epoch = STAGE_LAST_EPOCH["stage-a"]
     rows = []
     b0_row = None
     for candidate in CANDIDATES:
-        tag = f"d6_{candidate}_e20"
-        run_dir = candidate_run_dir(runs_root, candidate, tag)
-        row = summarize_run(run_dir, candidate, seed)
-        if row.get("status") != "PASS":
-            rows.append(row)
-            continue
-        if candidate == "b0":
-            b0_row = row
+        run_dir = candidate_run_dir(runs_root, candidate, f"d6_{candidate}_e20", seed)
+        row = summarize_run(run_dir, candidate, seed, expected_last_epoch)
         rows.append(row)
+        if row.get("status") == "PASS" and candidate == "b0":
+            b0_row = row
 
-    if b0_row is None or b0_row.get("status") != "PASS":
+    if b0_row is None:
         raise SystemExit("Stage A requires a PASS B0 Human3-only reference run")
     b0_stable = float(b0_row["stable_rmse"])
     b0_endpoints = {task: float(b0_row[f"{task.split('_')[0]}_rmse"]) for task in HUMAN_TASKS}
@@ -168,7 +200,9 @@ def stage_a(runs_root: Path, seed: int, output_dir: Path, trace: dict) -> list[s
             continue
         endpoints = {task: float(row[f"{task.split('_')[0]}_rmse"]) for task in HUMAN_TASKS}
         worse_endpoints = sum(
-            1 for task in HUMAN_TASKS if endpoints[task] >= b0_endpoints[task] + ELIMINATE_ENDPOINT_MARGIN
+            1
+            for task in HUMAN_TASKS
+            if endpoints[task] >= b0_endpoints[task] + ELIMINATE_ENDPOINT_MARGIN
         )
         row["stable_gain_vs_human3_only"] = b0_stable - float(row["stable_rmse"])
         reasons = []
@@ -180,19 +214,12 @@ def stage_a(runs_root: Path, seed: int, output_dir: Path, trace: dict) -> list[s
             row["status"] = "ELIMINATED"
             row["elimination_reason"] = "; ".join(reasons)
         elif CANDIDATES[row["candidate"]]["originality_eligible"]:
-            endpoint_improved = sum(
-                1 for task in HUMAN_TASKS if endpoints[task] < b0_endpoints[task]
-            )
+            endpoint_improved = sum(1 for task in HUMAN_TASKS if endpoints[task] < b0_endpoints[task])
             gain = b0_stable - float(row["stable_rmse"])
             row["meets_original_minimum"] = bool(gain >= ORIGINAL_MIN_GAIN or endpoint_improved >= 2)
-        row["b0_endpoints"] = b0_endpoints
 
     ranked = sorted(
-        (
-            row
-            for row in rows
-            if row.get("status") == "PASS" and row["candidate"] != "b0"
-        ),
+        (row for row in rows if row.get("status") == "PASS" and row["candidate"] != "b0"),
         key=lambda row: row["stable_rmse"],
     )
     eligible = [
@@ -202,15 +229,19 @@ def stage_a(runs_root: Path, seed: int, output_dir: Path, trace: dict) -> list[s
         or row.get("meets_original_minimum")
     ]
     top2 = [row["candidate"] for row in eligible[:2]]
-    while len(top2) < 2:
-        top2.append("NONE")
+
     trace["stage_a"] = {
         "seed": seed,
         "stable_window": "last 5 epochs of 20 (epochs 15-19)",
+        "expected_last_epoch": expected_last_epoch,
         "b0_stable_rmse": b0_stable,
         "ranking": [
-            {"candidate": row["candidate"], "stable_rmse": row["stable_rmse"],
-             "status": row.get("status"), "meets_original_minimum": row.get("meets_original_minimum")}
+            {
+                "candidate": row["candidate"],
+                "stable_rmse": row.get("stable_rmse"),
+                "status": row.get("status"),
+                "meets_original_minimum": row.get("meets_original_minimum"),
+            }
             for row in ranked
         ],
         "thresholds": {
@@ -219,13 +250,20 @@ def stage_a(runs_root: Path, seed: int, output_dir: Path, trace: dict) -> list[s
             "original_min_gain": ORIGINAL_MIN_GAIN,
         },
         "top2": top2,
-        "top2_reason": "§32: top-2 by StableRMSE among B1/O1/O2/O3 that pass §33 original minimum",
+        "top2_reason": "§32: top-2 by StableRMSE among B1/O1/O2/O3 that pass the §33 original minimum",
+        "top2_insufficient": len(top2) < 2,
     }
+    if len(top2) < 2:
+        # Review P1-8: never fabricate placeholder candidates.
+        trace["stage_a"]["stop_reason"] = (
+            "fewer than two eligible Stage-A candidates (§32/§33); STOP before Stage B"
+        )
+        print(f"Stage A Top-2 incomplete: {top2} — {trace['stage_a']['stop_reason']}")
 
     fields = ["candidate", "originality_eligible", "seed", "status", "elimination_reason",
-              "stable_rmse", "best_rmse", "best_epoch", "best_sharpness", "trajectory_std",
-              "man_rmse", "women_rmse", "human_rmse", "stable_gain_vs_human3_only",
-              "meets_original_minimum"]
+              "missing_epochs", "stable_rmse", "best_rmse", "best_epoch", "best_sharpness",
+              "trajectory_std", "man_rmse", "women_rmse", "human_rmse",
+              "stable_gain_vs_human3_only", "meets_original_minimum"]
     _write_csv(output_dir / "D6A_MICROSCREEN_SUMMARY.csv", fields, rows)
 
     endpoint_rows = []
@@ -238,7 +276,9 @@ def stage_a(runs_root: Path, seed: int, output_dir: Path, trace: dict) -> list[s
                     "task": task,
                     "stable_rmse": row.get(f"{task.split('_')[0]}_rmse"),
                     "b0_stable_rmse": b0_endpoints[task],
-                    "delta_vs_b0": (b0_endpoints[task] - row[f"{task.split('_')[0]}_rmse"])
+                    "delta_vs_b0": (
+                        b0_endpoints[task] - row[f"{task.split('_')[0]}_rmse"]
+                    )
                     if row.get("status") == "PASS"
                     else float("nan"),
                 }
@@ -252,15 +292,22 @@ def stage_a(runs_root: Path, seed: int, output_dir: Path, trace: dict) -> list[s
 
 
 def stage_b(runs_root: Path, candidates: list[str], seeds: list[int], output_dir: Path, trace: dict) -> str | None:
+    # Review P1-8/§45: fail-fast on unknown or duplicated candidates.
+    for candidate in candidates:
+        if candidate not in CANDIDATES:
+            raise SystemExit(f"unknown Stage-B candidate: {candidate!r}")
+    if len(set(candidates)) != len(candidates):
+        raise SystemExit(f"Stage-B candidates must be unique: {candidates}")
+
+    expected_last_epoch = STAGE_LAST_EPOCH["stage-b"]
     summary_rows = []
     paired_rows = []
     stable_by_candidate: dict[str, dict[int, float]] = {}
     b0_by_seed: dict[int, float] = {}
     for candidate in candidates + ["b0"]:
-        tag = f"d6_{candidate}_e40"
         for seed in seeds:
-            run_dir = candidate_run_dir(runs_root, candidate, tag)
-            row = summarize_run(candidate_run_dir(runs_root, candidate, tag), candidate, seed)
+            run_dir = candidate_run_dir(runs_root, candidate, f"d6_{candidate}_e40", seed)
+            row = summarize_run(run_dir, candidate, seed, expected_last_epoch)
             summary_rows.append(row)
             if row.get("status") == "PASS":
                 stable_by_candidate.setdefault(candidate, {})[seed] = float(row["stable_rmse"])
@@ -269,6 +316,7 @@ def stage_b(runs_root: Path, candidates: list[str], seeds: list[int], output_dir
 
     gate_rows = []
     verdicts = []
+    tie_break = None
     for candidate in candidates:
         per_seed = stable_by_candidate.get(candidate, {})
         paired = [
@@ -276,6 +324,7 @@ def stage_b(runs_root: Path, candidates: list[str], seeds: list[int], output_dir
                 "seed": seed,
                 "b0_stable_rmse": b0_by_seed[seed],
                 "candidate_stable_rmse": per_seed[seed],
+                # §42/§52: StableGain = Human3Only - Candidate (RMSE lower is better).
                 "stable_gain": b0_by_seed[seed] - per_seed[seed],
             }
             for seed in seeds
@@ -285,28 +334,12 @@ def stage_b(runs_root: Path, candidates: list[str], seeds: list[int], output_dir
         gains = [entry["stable_gain"] for entry in paired]
         mean_gain = _finite_mean(gains)
         positive = sum(1 for gain in gains if gain > 0)
-        endpoint_means = {
-            task: _finite_mean(
-                [
-                    float(row[f"{task.split('_')[0]}_rmse"])
-                    for row in summary_rows
-                    if row["candidate"] == candidate and row.get("status") == "PASS"
-                ]
-            )
-            for task in HUMAN_TASKS
-        }
-        b0_endpoint_means = {
-            task: _finite_mean(
-                [
-                    float(row[f"{task.split('_')[0]}_rmse"])
-                    for row in summary_rows
-                    if row["candidate"] == "b0" and row.get("status") == "PASS"
-                ]
-            )
-            for task in HUMAN_TASKS
-        }
+        candidate_endpoint_means = _endpoint_means(summary_rows, candidate)
+        b0_endpoint_means = _endpoint_means(summary_rows, "b0")
         endpoints_non_worse = sum(
-            1 for task in HUMAN_TASKS if endpoint_means[task] <= b0_endpoint_means[task] + 1e-9
+            1
+            for task in HUMAN_TASKS
+            if candidate_endpoint_means[task] <= b0_endpoint_means[task] + 1e-9
         )
         gate_pass = bool(
             mean_gain > 0
@@ -314,8 +347,10 @@ def stage_b(runs_root: Path, candidates: list[str], seeds: list[int], output_dir
             and endpoints_non_worse >= 2
             and len(gains) == len(seeds)
         )
-        verdict = "STRONG" if gate_pass and mean_gain >= STRONG_GAIN else (
-            "BORDERLINE" if gate_pass else "FAIL"
+        verdict = (
+            "STRONG"
+            if gate_pass and mean_gain >= STRONG_GAIN
+            else ("BORDERLINE" if gate_pass else "FAIL")
         )
         verdicts.append((candidate, mean_gain, positive, endpoints_non_worse, gate_pass, verdict))
         gate_rows.append(
@@ -329,14 +364,13 @@ def stage_b(runs_root: Path, candidates: list[str], seeds: list[int], output_dir
             }
         )
 
-    original_gate_pass = [entry for entry in verdicts if CANDIDATES[entry[0]]["originality_eligible"] and entry[4]]
+    original_pass = [entry for entry in verdicts if CANDIDATES[entry[0]]["originality_eligible"] and entry[4]]
     top1 = None
-    if original_gate_pass:
-        strong = [entry for entry in original_gate_pass if entry[5] == "STRONG"]
-        pool = strong or [
-            entry for entry in original_gate_pass if entry[1] is not None and entry[1] > 0
-        ]
-        pool_sorted = sorted(pool, key=lambda entry: stable_by_candidate.get(entry[0], {}).get("mean", 9e9)) if pool else []
+    if original_pass:
+        pool = [entry for entry in original_pass if entry[1] is not None and entry[1] > 0]
+        strong = [entry for entry in pool if entry[5] == "STRONG"]
+        if strong:
+            pool = strong
         means = {
             candidate: _finite_mean(list(stable_by_candidate.get(candidate, {}).values()))
             for candidate, *_ in pool
@@ -344,23 +378,38 @@ def stage_b(runs_root: Path, candidates: list[str], seeds: list[int], output_dir
         pool_sorted = sorted(pool, key=lambda entry: means[entry[0]])
         top1 = pool_sorted[0][0]
         if len(pool_sorted) >= 2:
-            best_mean, second_mean = means[pool_sorted[0][0]], means[pool_sorted[1][0]]
+            best_mean = means[pool_sorted[0][0]]
+            second_mean = means[pool_sorted[1][0]]
             if abs(best_mean - second_mean) < TIE_MARGIN:
-                preference = [name for name in PREFERENCE_ORDER if name in {entry[0] for entry in pool_sorted[:2]}]
-                top1 = preference[0] if preference else top1
-                trace.setdefault("stage_b", {})["tie_break"] = {
-                    "means": means, "applied_preference": PREFERENCE_ORDER, "top1": top1,
-                }
+                shared_preferences = [
+                    name
+                    for name in PREFERENCE_ORDER
+                    if name in {entry[0] for entry in pool_sorted[:2]}
+                ]
+                if shared_preferences:
+                    top1 = shared_preferences[0]
+                    tie_break = {
+                        "means": means,
+                        "applied_preference": PREFERENCE_ORDER,
+                        "top1": top1,
+                    }
 
     trace["stage_b"] = {
         "seeds": seeds,
+        "expected_last_epoch": expected_last_epoch,
         "ranking": [
-            {"candidate": candidate, "mean_stable_gain": mean_gain, "positive_seeds": positive,
-             "endpoints_non_worse": endpoints_non_worse, "gate": verdict}
-            for candidate, mean_gain, positive, endpoints_non_worse, gate_pass, verdict in verdicts
+            {
+                "candidate": candidate,
+                "mean_stable_gain": mean_gain,
+                "positive_seeds": positive,
+                "endpoints_non_worse": endpoints_non_worse,
+                "gate": verdict,
+            }
+            for candidate, mean_gain, positive, endpoints_non_worse, _gate_pass, verdict in verdicts
         ],
         "thresholds": {"strong_gain": STRONG_GAIN, "tie_margin": TIE_MARGIN,
                         "preference_order": PREFERENCE_ORDER},
+        "tie_break": tie_break,
         "top1": top1,
         "top1_reason": "§43-§46" if top1 else "no original candidate passed the Stage-B gate (§81 STOP)",
         "novelty_candidates_failed": top1 is None,
@@ -387,21 +436,27 @@ def stage_b(runs_root: Path, candidates: list[str], seeds: list[int], output_dir
 
 
 def stage_c(runs_root: Path, top1: str, seeds: list[int], output_dir: Path, trace: dict) -> None:
+    # Review P1-9: Stage C only accepts an originality-eligible winner.
+    if top1 not in CANDIDATES:
+        raise SystemExit(f"unknown Stage-C candidate: {top1!r}")
+    if not CANDIDATES[top1]["originality_eligible"]:
+        raise SystemExit("Stage C only accepts an originality-eligible Stage-B winner")
+
+    expected_last_epoch = STAGE_LAST_EPOCH["stage-c"]
     summary_rows = []
     endpoint_rows = []
-    task_stable: dict[int, float] = {}
+    candidate_stable: dict[int, float] = {}
     b0_stable: dict[int, float] = {}
     for candidate in (top1, "b0"):
-        tag = f"d6_{candidate}_e100"
         for seed in seeds:
-            run_dir = candidate_run_dir(runs_root, candidate, tag)
-            row = summarize_run(run_dir, candidate, seed)
+            run_dir = candidate_run_dir(runs_root, candidate, f"d6_{candidate}_e100", seed)
+            row = summarize_run(run_dir, candidate, seed, expected_last_epoch)
             summary_rows.append(row)
             if row.get("status") != "PASS":
                 continue
             stable = float(row["stable_rmse"])
             if candidate == top1:
-                task_stable[seed] = stable
+                candidate_stable[seed] = stable
             else:
                 b0_stable[seed] = stable
             for task in HUMAN_TASKS:
@@ -413,20 +468,43 @@ def stage_c(runs_root: Path, top1: str, seeds: list[int], output_dir: Path, trac
                         "stable_rmse": float(row[f"{task.split('_')[0]}_rmse"]),
                     }
                 )
-    gains = [task_stable[seed] - b0_stable[seed] for seed in seeds if seed in task_stable and seed in b0_stable]
+
+    # §42/§52 gain sign: Human3Only_StableRMSE - Candidate_StableRMSE.
+    gains = [
+        b0_stable[seed] - candidate_stable[seed]
+        for seed in seeds
+        if seed in candidate_stable and seed in b0_stable
+    ]
+    mean_gain = _finite_mean(gains)
+    positive_seeds = sum(1 for gain in gains if gain > 0)
+
+    candidate_endpoint_means = _endpoint_means(summary_rows, top1)
+    b0_endpoint_means = _endpoint_means(summary_rows, "b0")
+    endpoints_non_worse = sum(
+        1
+        for task in HUMAN_TASKS
+        if candidate_endpoint_means[task] <= b0_endpoint_means[task] + 1e-9
+    )
+    # Review P0-4/§51-§52: mean gain, seed count AND the endpoint gate.
+    gate_pass = bool(
+        mean_gain > 0
+        and endpoints_non_worse >= 2
+        and (
+            positive_seeds >= 4
+            or (positive_seeds >= 3 and mean_gain >= STRONG_GAIN)
+        )
+    )
     gate = {
-        "paired_mean_stable_gain": _finite_mean(gains),
-        "positive_seeds": sum(1 for gain in gains if gain > 0),
+        "paired_mean_stable_gain": mean_gain,
+        "positive_seeds": positive_seeds,
         "seeds_compared": len(gains),
-        "gate_pass": bool(
-            _finite_mean(gains) > 0
-            and (
-                sum(1 for gain in gains if gain > 0) >= 4
-                or (sum(1 for gain in gains if gain > 0) >= 3 and _finite_mean(gains) >= STRONG_GAIN)
-            )
-        ),
+        "endpoints_non_worse": endpoints_non_worse,
+        "endpoint_means_candidate": candidate_endpoint_means,
+        "endpoint_means_b0": b0_endpoint_means,
+        "gate_pass": gate_pass,
     }
     trace["stage_c"] = {"top1": top1, "seeds": seeds, "gate": gate}
+
     _write_csv(
         output_dir / "D6C_FINAL_5SEED_SUMMARY.csv",
         ["candidate", "seed", "status", "stable_rmse", "best_rmse", "best_epoch",
@@ -438,11 +516,20 @@ def stage_c(runs_root: Path, top1: str, seeds: list[int], output_dir: Path, trac
         ["model", "seed", "task", "stable_rmse"],
         endpoint_rows,
     )
+    # Review P1-11: stability rows expose the "model" field properly.
     _write_csv(
         output_dir / "D6C_STABILITY_SUMMARY.csv",
         ["model", "seed", "stable_rmse", "best_rmse", "best_epoch", "best_sharpness", "trajectory_std"],
         [
-            {key: row.get(key) for key in ("candidate", "seed", "stable_rmse", "best_rmse", "best_epoch", "best_sharpness", "trajectory_std")}
+            {
+                "model": row.get("candidate"),
+                "seed": row.get("seed"),
+                "stable_rmse": row.get("stable_rmse"),
+                "best_rmse": row.get("best_rmse"),
+                "best_epoch": row.get("best_epoch"),
+                "best_sharpness": row.get("best_sharpness"),
+                "trajectory_std": row.get("trajectory_std"),
+            }
             for row in summary_rows
         ],
     )
@@ -455,7 +542,6 @@ def main() -> None:
     parser.add_argument("--runs_root", default="artifacts/runs")
     parser.add_argument("--output_dir", default=".")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--candidates", nargs="+", default=None)
     parser.add_argument("--top2", nargs="+", default=None, help="Stage-B candidates (from Stage A)")
     parser.add_argument("--top1", default=None, help="Stage-C candidate (from Stage B)")
     parser.add_argument("--csdt_csv", default=None)
@@ -468,26 +554,30 @@ def main() -> None:
     trace = json.loads(trace_path.read_text(encoding="utf-8")) if trace_path.exists() else {}
 
     if args.mode == "stage-a":
-        top2 = stage_a(Path(args.runs_root), args.seed, output_dir, trace)
+        runs_root = Path(args.runs_root) / "d6_stage_a"
+        top2 = stage_a(runs_root, args.seed, output_dir, trace)
         print(f"Stage A Top-2: {top2}")
+        if len(top2) < 2:
+            print("STOP: " + trace["stage_a"].get("stop_reason", "insufficient eligible candidates"))
     elif args.mode == "stage-b":
         candidates = args.top2 or []
-        if not candidates:
-            raise SystemExit("stage-b requires --top2 from Stage A")
-        top1 = stage_b(Path(args.runs_root), candidates, [42, 44, 46], output_dir, trace)
+        runs_root = Path(args.runs_root) / "d6_stage_b"
+        top1 = stage_b(runs_root, candidates, [42, 44, 46], output_dir, trace)
         print(f"Stage B Top-1: {top1}")
         if top1 is None:
             print("STOP: no original candidate passed the Stage-B gate (plan §81).")
     else:
         if not args.top1:
             raise SystemExit("stage-c requires --top1 from Stage B")
-        stage_c(Path(args.runs_root), args.top1, [42, 43, 44, 45, 46], output_dir, trace)
+        runs_root = Path(args.runs_root) / "d6_stage_c"
+        stage_c(runs_root, args.top1, [42, 43, 44, 45, 46], output_dir, trace)
         print("Stage C complete; STOP before any test/CQR (plan §82).")
 
+    artifacts = trace.setdefault("artifacts", {})
     if args.csdt_csv:
-        trace.setdefault("artifacts", {})["csdt_parameter_delta_csv"] = args.csdt_csv
+        artifacts["csdt_parameter_delta_csv"] = args.csdt_csv
     if args.clst_csv:
-        trace.setdefault("artifacts", {})["clst_layer_score_csv"] = args.clst_csv
+        artifacts["clst_layer_score_csv"] = args.clst_csv
     trace_path.write_text(json.dumps(trace, indent=2, sort_keys=True), encoding="utf-8")
     print(f"updated {trace_path}")
 

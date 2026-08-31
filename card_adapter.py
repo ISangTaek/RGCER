@@ -11,6 +11,15 @@ real-vs-shuffled animal teacher representation delta:
 The teachers are deleted at inference; only the adapter remains, and because
 its output layer is zero-initialised the model starts exactly at the HPS
 baseline.
+
+Safety contracts (review P1-1):
+- Sample alignment is positional-exact: each retained batch position is
+  paired with its own table position, so a missing id can never shift the
+  teacher delta onto the wrong molecule.
+- In training mode every batch sample_id must exist in the delta table
+  (fail-fast); in eval mode missing ids simply skip the distillation term.
+- The delta table is validated at load time (unique ids, 2-D, width equals
+  hidden dim, all finite).
 """
 
 from __future__ import annotations
@@ -18,6 +27,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 class CardAdapter(nn.Module):
@@ -25,6 +35,8 @@ class CardAdapter(nn.Module):
 
     def __init__(self, hidden_dim: int, bottleneck: int, lambda_delta: float, delta_table_path: str):
         super().__init__()
+        if lambda_delta < 0:
+            raise ValueError("card lambda_delta must be >= 0")
         self.lambda_delta = float(lambda_delta)
         self.down = nn.Linear(hidden_dim, int(bottleneck))
         self.up = nn.Linear(int(bottleneck), hidden_dim)
@@ -32,13 +44,29 @@ class CardAdapter(nn.Module):
         nn.init.zeros_(self.up.bias)
 
         table = np.load(delta_table_path, allow_pickle=False)
-        self.delta_ids = [str(value) for value in table["ids"]]
+        delta_ids = [str(value) for value in table["ids"]]
+        if len(set(delta_ids)) != len(delta_ids):
+            raise ValueError("CARD delta table contains duplicate sample ids")
+        delta = np.asarray(table["delta"], dtype=np.float32)
+        if delta.ndim != 2:
+            raise ValueError(f"CARD delta table must be 2-D, got shape {delta.shape}")
+        if delta.shape[0] != len(delta_ids):
+            raise ValueError(
+                f"CARD delta table rows ({delta.shape[0]}) != ids ({len(delta_ids)})"
+            )
+        if delta.shape[1] != int(hidden_dim):
+            raise ValueError(
+                f"CARD delta width {delta.shape[1]} != model hidden_dim {hidden_dim}"
+            )
+        if not np.isfinite(delta).all():
+            raise ValueError("CARD delta table contains non-finite values")
+
+        self.delta_ids = delta_ids
         self.id_to_index = {sample_id: index for index, sample_id in enumerate(self.delta_ids)}
         # Registered as a buffer so .to(device) moves it with the module; it is
         # a constant target (stopgrad by construction — no gradient path).
-        self.register_buffer(
-            "delta_table", torch.tensor(np.asarray(table["delta"], dtype=np.float32))
-        )
+        self.register_buffer("delta_table", torch.tensor(delta))
+
         self.reset_epoch_stats()
 
     def reset_epoch_stats(self):
@@ -66,25 +94,56 @@ class CardAdapter(nn.Module):
         adapter_output = self.up(torch.nn.functional.gelu(self.down(representation)))
         representation = representation + adapter_output
 
-        indices = [self.id_to_index.get(str(sample_id)) for sample_id in (sample_ids or [])]
-        valid = [index for index in indices if index is not None]
-        if valid:
-            delta = self.delta_table[torch.tensor(valid, device=adapter_output.device)]
-            delta = torch.nn.functional.normalize(delta, dim=-1)
-            aligned = adapter_output[: len(valid)]
-            aligned = torch.nn.functional.normalize(aligned, dim=-1)
+        sample_ids = [str(sample_id) for sample_id in (sample_ids or [])]
+        pairs = [
+            (batch_position, self.id_to_index.get(sample_id))
+            for batch_position, sample_id in enumerate(sample_ids)
+        ]
+        if self.training:
+            missing = [
+                sample_id
+                for batch_position, table_position in pairs
+                if table_position is None
+                for sample_id in [sample_ids[batch_position]]
+            ]
+            if missing:
+                # Review P1-1/§22: never let a training batch silently skip or
+                # misalign its distillation target.
+                raise KeyError(
+                    f"CARD delta table missing {len(missing)} training samples; "
+                    f"examples={missing[:5]}"
+                )
+            valid_pairs = pairs
+        else:
+            # Eval/inference: the adapter prediction is enough; missing ids
+            # simply contribute no distillation term.
+            valid_pairs = [pair for pair in pairs if pair[1] is not None]
+
+        if valid_pairs:
+            batch_positions = torch.tensor(
+                [pair[0] for pair in valid_pairs], device=adapter_output.device, dtype=torch.long
+            )
+            table_positions = torch.tensor(
+                [pair[1] for pair in valid_pairs], device=adapter_output.device, dtype=torch.long
+            )
+            aligned = adapter_output[batch_positions]
+            raw_delta = self.delta_table[table_positions]
+            teacher_delta_norm = raw_delta.norm(dim=-1)
+            delta = F.normalize(raw_delta, dim=-1)
+            aligned = F.normalize(aligned, dim=-1)
             cosine = (aligned * delta).sum(dim=-1)
             loss = (1.0 - cosine).mean()
         else:
-            loss = adapter_output.new_zeros(())
+            raw_delta = self.delta_table[:0]
+            teacher_delta_norm = raw_delta.new_zeros(())
+            cosine = raw_delta.new_zeros(())
+            loss = representation.new_zeros(())
 
         self.last_loss = loss
         with torch.no_grad():
             self.epoch_stats["loss_sum"] += float(loss.detach())
             self.epoch_stats["loss_count"] += 1
             self.epoch_stats["adapter_norm_sum"] += float(adapter_output.detach().norm(dim=-1).mean())
-            self.epoch_stats["teacher_delta_norm_sum"] += (
-                float(delta.norm(dim=-1).mean()) if valid else 0.0
-            )
-            self.epoch_stats["cos_sum"] += float(cosine.mean()) if valid else 0.0
+            self.epoch_stats["teacher_delta_norm_sum"] += float(teacher_delta_norm.mean())
+            self.epoch_stats["cos_sum"] += float(cosine.mean())
         return representation
