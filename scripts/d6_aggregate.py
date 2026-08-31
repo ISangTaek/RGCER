@@ -25,17 +25,27 @@ import math
 from pathlib import Path
 
 HUMAN_TASKS = ["man_oral_TDLo", "women_oral_TDLo", "human_oral_TDLo"]
+STABLE_WINDOW = 5
 CANDIDATES = {
     "b0": {"originality_eligible": False},
+    # Review §22/§71: B0A is the anchor-only diagnostic control for O1; it is
+    # never ranked and never becomes a Stage-B/C candidate.
+    "b0a": {"originality_eligible": False, "control": True},
     "b1": {"originality_eligible": False},
     "o1": {"originality_eligible": True},
     "o2": {"originality_eligible": True},
     "o3": {"originality_eligible": True},
 }
+# Review P0-6/§34: within this StableRMSE margin an original candidate and B1
+# are treated as tied, so originality/simplicity may decide; beyond it B1
+# dominates and the novelty candidates must not be promoted.
+ORIGINAL_VS_B1_TOLERANCE = 0.01
+# Review §25: O1 must beat the anchor-only control by more than zero
+# (strong: >= 0.01) to attribute any gain to the semantic delta itself.
+ANCHOR_SEMANTIC_GAIN_MIN = 0.0
+ANCHOR_SEMANTIC_GAIN_STRONG = 0.01
 # §46: minimal-change preference order for near ties.
 PREFERENCE_ORDER = ["o1", "o2", "o3"]
-
-STABLE_WINDOW = 5
 ELIMINATE_MACRO_MARGIN = 0.05
 ELIMINATE_ENDPOINT_MARGIN = 0.05
 ORIGINAL_MIN_GAIN = 0.01
@@ -183,12 +193,17 @@ def stage_a(runs_root: Path, seed: int, output_dir: Path, trace: dict) -> list[s
     expected_last_epoch = STAGE_LAST_EPOCH["stage-a"]
     rows = []
     b0_row = None
+    b0a_row = None
     for candidate in CANDIDATES:
         run_dir = candidate_run_dir(runs_root, candidate, f"d6_{candidate}_e20", seed)
         row = summarize_run(run_dir, candidate, seed, expected_last_epoch)
         rows.append(row)
-        if row.get("status") == "PASS" and candidate == "b0":
+        if row.get("status") != "PASS":
+            continue
+        if candidate == "b0":
             b0_row = row
+        if candidate == "b0a":
+            b0a_row = row
 
     if b0_row is None:
         raise SystemExit("Stage A requires a PASS B0 Human3-only reference run")
@@ -216,10 +231,31 @@ def stage_a(runs_root: Path, seed: int, output_dir: Path, trace: dict) -> list[s
         elif CANDIDATES[row["candidate"]]["originality_eligible"]:
             endpoint_improved = sum(1 for task in HUMAN_TASKS if endpoints[task] < b0_endpoints[task])
             gain = b0_stable - float(row["stable_rmse"])
-            row["meets_original_minimum"] = bool(gain >= ORIGINAL_MIN_GAIN or endpoint_improved >= 2)
+            meets = bool(gain >= ORIGINAL_MIN_GAIN or endpoint_improved >= 2)
+            if row["candidate"] == "o1":
+                # Review P0-4/§22/§25: O1 must additionally beat the anchor-only
+                # control, otherwise its gain is not attributable to the
+                # semantic delta (it could be the anchor initialisation alone).
+                if b0a_row is None:
+                    meets = False
+                    row["anchor_note"] = "B0A anchor control missing/failed"
+                else:
+                    anchor_gain = float(b0a_row["stable_rmse"]) - float(row["stable_rmse"])
+                    row["anchor_semantic_gain"] = anchor_gain
+                    if anchor_gain <= ANCHOR_SEMANTIC_GAIN_MIN:
+                        meets = False
+                        row["anchor_note"] = "AnchorSemanticGain <= 0 (§25)"
+                    elif anchor_gain >= ANCHOR_SEMANTIC_GAIN_STRONG:
+                        row["anchor_note"] = "AnchorSemanticGain strong (>=0.01)"
+            row["meets_original_minimum"] = meets
 
     ranked = sorted(
-        (row for row in rows if row.get("status") == "PASS" and row["candidate"] != "b0"),
+        (
+            row
+            for row in rows
+            if row.get("status") == "PASS"
+            and row["candidate"] not in ("b0", "b0a")  # references are never ranked
+        ),
         key=lambda row: row["stable_rmse"],
     )
     eligible = [
@@ -292,7 +328,11 @@ def stage_a(runs_root: Path, seed: int, output_dir: Path, trace: dict) -> list[s
 
 
 def stage_b(runs_root: Path, candidates: list[str], seeds: list[int], output_dir: Path, trace: dict) -> str | None:
-    # Review P1-8/§45: fail-fast on unknown or duplicated candidates.
+    # Review P1-7: Stage B requires exactly the two Stage-A candidates.
+    if len(candidates) != 2:
+        raise SystemExit(
+            f"Stage B requires exactly two Stage-A candidates, got {candidates}"
+        )
     for candidate in candidates:
         if candidate not in CANDIDATES:
             raise SystemExit(f"unknown Stage-B candidate: {candidate!r}")
@@ -304,7 +344,11 @@ def stage_b(runs_root: Path, candidates: list[str], seeds: list[int], output_dir
     paired_rows = []
     stable_by_candidate: dict[str, dict[int, float]] = {}
     b0_by_seed: dict[int, float] = {}
-    for candidate in candidates + ["b0"]:
+    b0a_by_seed: dict[int, float] = {}
+    # Review P0-4/§26: when O1 is confirmed, its anchor-only control B0A must
+    # be summarised over the same seeds to keep the causal evidence alive.
+    references = ["b0"] + (["b0a"] if "o1" in candidates else [])
+    for candidate in candidates + references:
         for seed in seeds:
             run_dir = candidate_run_dir(runs_root, candidate, f"d6_{candidate}_e40", seed)
             row = summarize_run(run_dir, candidate, seed, expected_last_epoch)
@@ -313,6 +357,8 @@ def stage_b(runs_root: Path, candidates: list[str], seeds: list[int], output_dir
                 stable_by_candidate.setdefault(candidate, {})[seed] = float(row["stable_rmse"])
                 if candidate == "b0":
                     b0_by_seed[seed] = float(row["stable_rmse"])
+                if candidate == "b0a":
+                    b0a_by_seed[seed] = float(row["stable_rmse"])
 
     gate_rows = []
     verdicts = []
@@ -321,6 +367,7 @@ def stage_b(runs_root: Path, candidates: list[str], seeds: list[int], output_dir
         per_seed = stable_by_candidate.get(candidate, {})
         paired = [
             {
+                "candidate": candidate,
                 "seed": seed,
                 "b0_stable_rmse": b0_by_seed[seed],
                 "candidate_stable_rmse": per_seed[seed],
@@ -347,6 +394,22 @@ def stage_b(runs_root: Path, candidates: list[str], seeds: list[int], output_dir
             and endpoints_non_worse >= 2
             and len(gains) == len(seeds)
         )
+        anchor_info = {}
+        if candidate == "o1" and gate_pass:
+            # Review P0-4/§26: O1's Stage-B gate additionally requires the
+            # anchor-only control (mean AnchorSemanticGain > 0).
+            anchor_gains = [
+                b0a_by_seed[seed] - per_seed[seed]
+                for seed in seeds
+                if seed in per_seed and seed in b0a_by_seed
+            ]
+            mean_anchor = _finite_mean(anchor_gains)
+            gate_pass = bool(len(anchor_gains) == len(seeds) and mean_anchor > ANCHOR_SEMANTIC_GAIN_MIN)
+            anchor_info = {
+                "mean_anchor_semantic_gain": mean_anchor,
+                "anchor_gate_pass": gate_pass,
+                "anchor_strong": bool(mean_anchor >= ANCHOR_SEMANTIC_GAIN_STRONG),
+            }
         verdict = (
             "STRONG"
             if gate_pass and mean_gain >= STRONG_GAIN
@@ -360,12 +423,16 @@ def stage_b(runs_root: Path, candidates: list[str], seeds: list[int], output_dir
                 "positive_seeds": positive,
                 "seeds_compared": len(gains),
                 "endpoints_non_worse": endpoints_non_worse,
+                **anchor_info,
                 "gate": verdict,
             }
         )
 
-    original_pass = [entry for entry in verdicts if CANDIDATES[entry[0]]["originality_eligible"] and entry[4]]
+    # Review P0-6/§32-§35: B1 dominance guard — a clearly stronger sequential
+    # transfer baseline stops the novelty line.
+    b1_mean_stable = _finite_mean(list(stable_by_candidate.get("b1", {}).values()))
     top1 = None
+    original_pass = [entry for entry in verdicts if CANDIDATES[entry[0]]["originality_eligible"] and entry[4]]
     if original_pass:
         pool = [entry for entry in original_pass if entry[1] is not None and entry[1] > 0]
         strong = [entry for entry in pool if entry[5] == "STRONG"]
@@ -394,6 +461,14 @@ def stage_b(runs_root: Path, candidates: list[str], seeds: list[int], output_dir
                         "top1": top1,
                     }
 
+        b1_dominates = False
+        if math.isfinite(b1_mean_stable):
+            best_original_mean = means[top1]
+            if best_original_mean > b1_mean_stable + ORIGINAL_VS_B1_TOLERANCE:
+                b1_dominates = True
+        if b1_dominates:
+            top1 = None
+
     trace["stage_b"] = {
         "seeds": seeds,
         "expected_last_epoch": expected_last_epoch,
@@ -408,10 +483,21 @@ def stage_b(runs_root: Path, candidates: list[str], seeds: list[int], output_dir
             for candidate, mean_gain, positive, endpoints_non_worse, _gate_pass, verdict in verdicts
         ],
         "thresholds": {"strong_gain": STRONG_GAIN, "tie_margin": TIE_MARGIN,
-                        "preference_order": PREFERENCE_ORDER},
+                        "preference_order": PREFERENCE_ORDER,
+                        "original_vs_b1_tolerance": ORIGINAL_VS_B1_TOLERANCE},
         "tie_break": tie_break,
+        "b1_mean_stable_rmse": b1_mean_stable,
+        "b1_dominates": top1 is None and bool(
+            original_pass and math.isfinite(b1_mean_stable)
+        ),
         "top1": top1,
-        "top1_reason": "§43-§46" if top1 else "no original candidate passed the Stage-B gate (§81 STOP)",
+        "top1_reason": (
+            "§43-§46" if top1 else (
+                "B1 sequential transfer dominates all originality-eligible candidates "
+                "(review P0-6/§83 STOP)" if original_pass and top1 is None else
+                "no original candidate passed the Stage-B gate (§81 STOP)"
+            )
+        ),
         "novelty_candidates_failed": top1 is None,
     }
 
@@ -447,7 +533,11 @@ def stage_c(runs_root: Path, top1: str, seeds: list[int], output_dir: Path, trac
     endpoint_rows = []
     candidate_stable: dict[int, float] = {}
     b0_stable: dict[int, float] = {}
-    for candidate in (top1, "b0"):
+    b0a_stable: dict[int, float] = {}
+    # Review P0-4/§26: when the winner is O1, its anchor-only control B0A runs
+    # the same five seeds so the CSDT-vs-anchor causal evidence survives.
+    references = ("b0", "b0a") if top1 == "o1" else ("b0",)
+    for candidate in (top1,) + references:
         for seed in seeds:
             run_dir = candidate_run_dir(runs_root, candidate, f"d6_{candidate}_e100", seed)
             row = summarize_run(run_dir, candidate, seed, expected_last_epoch)
@@ -457,8 +547,10 @@ def stage_c(runs_root: Path, top1: str, seeds: list[int], output_dir: Path, trac
             stable = float(row["stable_rmse"])
             if candidate == top1:
                 candidate_stable[seed] = stable
-            else:
+            elif candidate == "b0":
                 b0_stable[seed] = stable
+            elif candidate == "b0a":
+                b0a_stable[seed] = stable
             for task in HUMAN_TASKS:
                 endpoint_rows.append(
                     {
@@ -485,9 +577,13 @@ def stage_c(runs_root: Path, top1: str, seeds: list[int], output_dir: Path, trac
         for task in HUMAN_TASKS
         if candidate_endpoint_means[task] <= b0_endpoint_means[task] + 1e-9
     )
+    # Review P0-5: Stage C is the 5-seed final validation — every seed pair
+    # must be present before the gate can pass.
+    complete_seed_pairs = len(gains) == len(seeds)
     # Review P0-4/§51-§52: mean gain, seed count AND the endpoint gate.
     gate_pass = bool(
-        mean_gain > 0
+        complete_seed_pairs
+        and mean_gain > 0
         and endpoints_non_worse >= 2
         and (
             positive_seeds >= 4
@@ -498,11 +594,20 @@ def stage_c(runs_root: Path, top1: str, seeds: list[int], output_dir: Path, trac
         "paired_mean_stable_gain": mean_gain,
         "positive_seeds": positive_seeds,
         "seeds_compared": len(gains),
+        "expected_seed_count": len(seeds),
+        "complete_seed_pairs": complete_seed_pairs,
         "endpoints_non_worse": endpoints_non_worse,
         "endpoint_means_candidate": candidate_endpoint_means,
         "endpoint_means_b0": b0_endpoint_means,
         "gate_pass": gate_pass,
     }
+    if top1 == "o1" and b0a_stable:
+        anchor_gains = [
+            b0a_stable[seed] - candidate_stable[seed]
+            for seed in seeds
+            if seed in candidate_stable and seed in b0a_stable
+        ]
+        gate["anchor_semantic_gain_mean"] = _finite_mean(anchor_gains)
     trace["stage_c"] = {"top1": top1, "seeds": seeds, "gate": gate}
 
     _write_csv(

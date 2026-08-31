@@ -93,13 +93,34 @@ def test_stage_b_reads_three_different_seeds(tmp_path):
                 for epoch in range(35, 40)
             },
         )
+        # O1's gate now requires the anchor-only control (review P0-4/§25-§26).
+        _write_run(
+            tmp_path, "b0a", "d6_b0a_e40", seed, _flat_macro(39, value + 0.02),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 1.0, "women_oral_TDLo": 1.0, "human_oral_TDLo": 1.0}
+                for epoch in range(35, 40)
+            },
+        )
+        _write_run(
+            tmp_path, "o2", "d6_o2_e40", seed, _flat_macro(39, value + 0.05),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 1.2, "women_oral_TDLo": 1.2, "human_oral_TDLo": 1.2}
+                for epoch in range(35, 40)
+            },
+        )
     trace = {}
-    top1 = stage_b(tmp_path, ["o1"], [42, 44, 46], tmp_path, trace)
+    top1 = stage_b(tmp_path, ["o1", "o2"], [42, 44, 46], tmp_path, trace)
     assert top1 == "o1"
-    paired = list(csv_rows(tmp_path / "D6B_PAIRED_COMPARISON.csv"))
+    paired = [
+        row
+        for row in csv_rows(tmp_path / "D6B_PAIRED_COMPARISON.csv")
+        if row["candidate"] == "o1"
+    ]
     assert {int(row["seed"]) for row in paired} == {42, 44, 46}
     assert {float(row["b0_stable_rmse"]) for row in paired} == {1.10}
-    assert {round(float(row["stable_gain"]), 6) for row in paired} == {round(1.10 - 1.05, 6), round(1.10 - 1.06, 6), round(1.10 - 1.07, 6)}
+    assert {round(float(row["stable_gain"]), 6) for row in paired} == {
+        round(1.10 - 1.05, 6), round(1.10 - 1.06, 6), round(1.10 - 1.07, 6),
+    }
 
 
 def csv_rows(path):
@@ -228,3 +249,147 @@ def test_stage_c_rejects_non_original_winner(tmp_path):
         stage_c(tmp_path, "b1", [42, 43, 44, 45, 46], tmp_path, {})
     with pytest.raises(SystemExit):
         stage_c(tmp_path, "unknown", [42, 43, 44, 45, 46], tmp_path, {})
+
+
+def test_stage_c_missing_one_seed_cannot_pass(tmp_path):
+    # Review P0-5: four better seeds plus one missing seed must FAIL — Stage C
+    # is the 5-seed final validation.
+    seeds = [42, 43, 44, 45, 46]
+    for seed in seeds:
+        _write_run(
+            tmp_path, "b0", "d6_b0_e100", seed, _flat_macro(99, 1.10),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 1.0, "women_oral_TDLo": 1.0, "human_oral_TDLo": 1.0}
+                for epoch in range(95, 100)
+            },
+        )
+    for seed in seeds[:-1]:  # seed 46 missing
+        _write_run(
+            tmp_path, "o1", "d6_o1_e100", seed, _flat_macro(99, 1.00),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 0.9, "women_oral_TDLo": 0.9, "human_oral_TDLo": 0.9}
+                for epoch in range(95, 100)
+            },
+        )
+    trace = {}
+    stage_c(tmp_path, "o1", seeds, tmp_path, trace)
+    gate = trace["stage_c"]["gate"]
+    assert gate["complete_seed_pairs"] is False
+    assert gate["expected_seed_count"] == 5
+    assert gate["gate_pass"] is False
+
+
+def test_stage_b_requires_exactly_two_candidates(tmp_path):
+    with pytest.raises(SystemExit):
+        stage_b(tmp_path, ["o1"], [42, 44, 46], tmp_path, {})
+    with pytest.raises(SystemExit):
+        stage_b(tmp_path, ["o1", "o2", "b1"], [42, 44, 46], tmp_path, {})
+
+
+def test_stage_b_stops_when_b1_clearly_dominates_original(tmp_path):
+    # Review P0-6: B1 = 0.90 clearly beats O1 = 1.07 (B0 = 1.10).
+    for seed in (42, 44, 46):
+        _write_run(
+            tmp_path, "b0", "d6_b0_e40", seed, _flat_macro(39, 1.10),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 1.0, "women_oral_TDLo": 1.0, "human_oral_TDLo": 1.0}
+                for epoch in range(35, 40)
+            },
+        )
+        _write_run(
+            tmp_path, "b1", "d6_b1_e40", seed, _flat_macro(39, 0.90),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 0.8, "women_oral_TDLo": 0.8, "human_oral_TDLo": 0.8}
+                for epoch in range(35, 40)
+            },
+        )
+        _write_run(
+            tmp_path, "o1", "d6_o1_e40", seed, _flat_macro(39, 1.07),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 0.9, "women_oral_TDLo": 0.9, "human_oral_TDLo": 0.9}
+                for epoch in range(35, 40)
+            },
+        )
+        _write_run(
+            tmp_path, "b0a", "d6_b0a_e40", seed, _flat_macro(39, 1.09),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 1.0, "women_oral_TDLo": 1.0, "human_oral_TDLo": 1.0}
+                for epoch in range(35, 40)
+            },
+        )
+    trace = {}
+    top1 = stage_b(tmp_path, ["o1", "b1"], [42, 44, 46], tmp_path, trace)
+    assert top1 is None
+    assert trace["stage_b"]["b1_dominates"] is True
+    assert "dominates" in trace["stage_b"]["top1_reason"]
+
+
+def test_stage_b_allows_original_when_tied_with_b1(tmp_path):
+    # B1 = 1.01 vs O1 = 1.015: within the 0.01 tolerance → tied, original wins
+    # on simplicity/originality (§35).
+    for seed in (42, 44, 46):
+        _write_run(
+            tmp_path, "b0", "d6_b0_e40", seed, _flat_macro(39, 1.10),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 1.0, "women_oral_TDLo": 1.0, "human_oral_TDLo": 1.0}
+                for epoch in range(35, 40)
+            },
+        )
+        _write_run(
+            tmp_path, "b1", "d6_b1_e40", seed, _flat_macro(39, 1.01),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 0.95, "women_oral_TDLo": 0.95, "human_oral_TDLo": 0.95}
+                for epoch in range(35, 40)
+            },
+        )
+        _write_run(
+            tmp_path, "o1", "d6_o1_e40", seed, _flat_macro(39, 1.015),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 0.9, "women_oral_TDLo": 0.9, "human_oral_TDLo": 0.9}
+                for epoch in range(35, 40)
+            },
+        )
+        _write_run(
+            tmp_path, "b0a", "d6_b0a_e40", seed, _flat_macro(39, 1.03),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 1.0, "women_oral_TDLo": 1.0, "human_oral_TDLo": 1.0}
+                for epoch in range(35, 40)
+            },
+        )
+    trace = {}
+    top1 = stage_b(tmp_path, ["o1", "b1"], [42, 44, 46], tmp_path, trace)
+    assert top1 == "o1"
+    assert trace["stage_b"]["b1_dominates"] is False
+    assert trace["stage_b"]["tie_break"] is None  # O1 strictly better than B1 here
+
+
+def test_o1_requires_anchor_control(tmp_path):
+    # Review §72: without a passing B0A control, O1's gain cannot be attributed
+    # to the semantic delta and it must not be promoted.
+    _write_run(
+        tmp_path, "b0", "d6_b0_e20", 42, _flat_macro(19, 1.10),
+        endpoint_by_epoch={
+            epoch: {"man_oral_TDLo": 1.0, "women_oral_TDLo": 1.0, "human_oral_TDLo": 1.0}
+            for epoch in range(15, 20)
+        },
+    )
+    _write_run(
+        tmp_path, "b1", "d6_b1_e20", 42, _flat_macro(19, 1.09),
+        endpoint_by_epoch={
+            epoch: {"man_oral_TDLo": 0.9, "women_oral_TDLo": 0.9, "human_oral_TDLo": 0.9}
+            for epoch in range(15, 20)
+        },
+    )
+    # O1 beats B0 clearly but the B0A anchor control is missing entirely.
+    _write_run(
+        tmp_path, "o1", "d6_o1_e20", 42, _flat_macro(19, 1.05),
+        endpoint_by_epoch={
+            epoch: {"man_oral_TDLo": 0.9, "women_oral_TDLo": 0.9, "human_oral_TDLo": 0.9}
+            for epoch in range(15, 20)
+        },
+    )
+    trace = {}
+    top2 = stage_a(tmp_path, 42, tmp_path, trace)
+    summary = {row["candidate"]: row for row in csv_rows(tmp_path / "D6A_MICROSCREEN_SUMMARY.csv")}
+    assert summary["o1"]["meets_original_minimum"] in ("False", "")
+    assert "o1" not in top2

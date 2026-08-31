@@ -140,10 +140,16 @@ class CardAdapter(nn.Module):
             loss = representation.new_zeros(())
 
         self.last_loss = loss
-        with torch.no_grad():
-            self.epoch_stats["loss_sum"] += float(loss.detach())
-            self.epoch_stats["loss_count"] += 1
-            self.epoch_stats["adapter_norm_sum"] += float(adapter_output.detach().norm(dim=-1).mean())
-            self.epoch_stats["teacher_delta_norm_sum"] += float(teacher_delta_norm.mean())
-            self.epoch_stats["cos_sum"] += float(cosine.mean())
+        # Review P1-1: only TRAINING forwards accumulate the epoch stats.
+        # Validation would otherwise pollute card_loss_mean / card_cos_mean
+        # after the trainer pops the per-epoch stats.
+        if self.training:
+            with torch.no_grad():
+                self.epoch_stats["loss_sum"] += float(loss.detach())
+                self.epoch_stats["loss_count"] += 1
+                self.epoch_stats["adapter_norm_sum"] += float(
+                    adapter_output.detach().norm(dim=-1).mean()
+                )
+                self.epoch_stats["teacher_delta_norm_sum"] += float(teacher_delta_norm.mean())
+                self.epoch_stats["cos_sum"] += float(cosine.mean())
         return representation

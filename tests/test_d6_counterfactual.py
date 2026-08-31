@@ -116,7 +116,11 @@ def _teacher_payload(shuffle, epoch=29, seed=42, manifest="m", fingerprint="f"):
         "epoch": epoch,
         "model_state": {"w": torch.zeros(1)},
         "task_names": sorted(ANIMAL_SOURCE_TASKS),
-        "configuration": {"arch": "Graphormer", "shuffle_animal_train_labels": shuffle},
+        "configuration": {
+            "arch": "Graphormer",
+            "shuffle_animal_train_labels": shuffle,
+            "animal_shuffle_seed": 20260831 if shuffle else None,
+        },
         "architecture_config": {"hidden_dim": 96},
         "split_manifest_hash": manifest,
         "feature_schema_version": "atom_v2_bond_v1_pathavg_v1",
@@ -129,8 +133,12 @@ def _write_teacher(root, name, payload, init_hash="init-hash"):
     run_dir = root / name
     run_dir.mkdir(parents=True, exist_ok=True)
     torch.save(payload, run_dir / "teacher_last.pt")
+    metadata = {"initial_model_sha256": init_hash}
+    if payload.get("configuration", {}).get("shuffle_animal_train_labels") is True:
+        metadata["animal_shuffle_seed"] = 20260831
+        metadata["animal_shuffle_mapping_sha256"] = "map-hash"
     (run_dir / "run_metadata.json").write_text(
-        json.dumps({"initial_model_sha256": init_hash}), encoding="utf-8"
+        json.dumps(metadata), encoding="utf-8"
     )
     return run_dir
 
@@ -356,6 +364,20 @@ def test_card_records_raw_teacher_delta_norm(tmp_path):
     table_path = tmp_path / "delta.npz"
     np.savez(table_path, ids=np.array(["a"]), delta=np.array([[3.0, 4.0]]))  # norm 5
     card = CardAdapter(hidden_dim=2, bottleneck=2, lambda_delta=0.1, delta_table_path=str(table_path))
-    card.eval()
+    card.train()
     card(torch.ones(1, 2), ["a"])
     assert card.epoch_stats["teacher_delta_norm_sum"] == pytest.approx(5.0)
+
+
+def test_card_eval_does_not_accumulate_training_epoch_stats(tmp_path):
+    from card_adapter import CardAdapter
+
+    table_path = tmp_path / "delta.npz"
+    np.savez(table_path, ids=np.array(["a"]), delta=np.array([[3.0, 4.0]]))
+    card = CardAdapter(hidden_dim=2, bottleneck=2, lambda_delta=0.1, delta_table_path=str(table_path))
+    card.train()
+    card(torch.ones(1, 2), ["a"])
+    card.pop_epoch_stats()
+    card.eval()
+    card(torch.ones(1, 2), ["a"])
+    assert card.epoch_stats["loss_count"] == 0  # review P1-1

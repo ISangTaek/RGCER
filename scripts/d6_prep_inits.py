@@ -73,8 +73,51 @@ ALLOWED_TEMPLATE_KEYS = (
     "head_hidden_dim",
     "head_dropout",
 )
-# The single permitted real-vs-shuffle configuration difference.
+# The single permitted real-vs-shuffle configuration difference is whether
+# the teacher trained on shuffled animal labels (plus the shuffle seed that
+# defines the mapping).  Review P0-3: matched-config equality is checked on a
+# scientific-field whitelist, never on the whole vars(args) dict —
+# orchestration/runtime fields (save_path, experiment_tag, ckpt_name,
+# label_providers, mapping hashes, provenance objects) legitimately differ
+# between two real teacher runs.
 SHUFFLE_ONLY_KEYS = {"shuffle_animal_train_labels", "animal_shuffle_seed"}
+MATCHED_TEACHER_CONFIG_KEYS = (
+    "arch",
+    "dataset",
+    "toxacute_task_scope",
+    "hidden_dim",
+    "mid_dim",
+    "a_layers",
+    "a_heads",
+    "edge_bias_mode",
+    "spatial_pos_clip",
+    "max_nodes_filter",
+    "prediction_mode",
+    "head_hidden_dim",
+    "head_dropout",
+    "lower_quantile",
+    "upper_quantile",
+    "lambda_quantile",
+    "weighting",
+    "optim",
+    "lr",
+    "weight_decay",
+    "grad_clip",
+    "bs",
+    "epochs",
+    "task_sampling",
+    "num_loader_workers",
+    "splitting",
+    "vs",
+    "calibration_size",
+    "ts",
+    "split_seed",
+    "fit_conformal",
+    "train_eval_scope",
+    "selection_scope",
+    "seed",
+)
+EXPECTED_ANIMAL_SHUFFLE_SEED = 20260831
 
 
 def _build_model(seed: int, task_scope: str, device, template_config: dict | None = None):
@@ -188,15 +231,14 @@ def _verify_teacher_pair(real_dir: Path, shuffle_dir: Path, expected_epoch: int)
     )
     real_configuration = dict(real_payload.get("configuration") or {})
     shuffle_configuration = dict(shuffle_payload.get("configuration") or {})
-    differing = {
-        key
-        for key in set(real_configuration) | set(shuffle_configuration)
-        if real_configuration.get(key) != shuffle_configuration.get(key)
-    }
-    unexpected = differing - SHUFFLE_ONLY_KEYS
-    if unexpected:
-        mismatch.append(
-            f"configuration differs outside {sorted(SHUFFLE_ONLY_KEYS)}: {sorted(unexpected)}"
+    # Review P0-3: compare only the scientific training fields; orchestration
+    # fields (save_path, experiment_tag, ckpt_name, label_providers, mapping
+    # hashes, ...) legitimately differ between two real teacher runs.
+    for key in MATCHED_TEACHER_CONFIG_KEYS:
+        require_equal(
+            f"configuration.{key}",
+            real_configuration.get(key),
+            shuffle_configuration.get(key),
         )
     if real_configuration.get("shuffle_animal_train_labels") is not False:
         mismatch.append(
@@ -208,16 +250,30 @@ def _verify_teacher_pair(real_dir: Path, shuffle_dir: Path, expected_epoch: int)
             "shuffle teacher must be trained with shuffle_animal_train_labels=True, found "
             f"{shuffle_configuration.get('shuffle_animal_train_labels')!r}"
         )
+    if int(shuffle_configuration.get("animal_shuffle_seed", -1)) != EXPECTED_ANIMAL_SHUFFLE_SEED:
+        mismatch.append(
+            f"shuffle teacher animal_shuffle_seed must be {EXPECTED_ANIMAL_SHUFFLE_SEED}, found "
+            f"{shuffle_configuration.get('animal_shuffle_seed')!r}"
+        )
 
     init_hashes = {}
+    metadata_by_label = {}
     for label, run_dir in (("real", real_dir), ("shuffle", shuffle_dir)):
         metadata_path = Path(run_dir) / "run_metadata.json"
         if not metadata_path.exists():
             raise SystemExit(f"missing run_metadata.json under {run_dir}")
-        init_hashes[label] = json.loads(metadata_path.read_text(encoding="utf-8")).get(
-            "initial_model_sha256"
-        )
+        metadata_by_label[label] = json.loads(metadata_path.read_text(encoding="utf-8"))
+        init_hashes[label] = metadata_by_label[label].get("initial_model_sha256")
     require_equal("initial_model_sha256", init_hashes["real"], init_hashes["shuffle"])
+
+    # Review P1-2: the shuffle mapping identity is part of the counterfactual
+    # contract — the shuffle teacher must record it.
+    shuffle_metadata = metadata_by_label["shuffle"]
+    mapping_hash = shuffle_metadata.get("animal_shuffle_mapping_sha256")
+    if not mapping_hash:
+        mismatch.append(
+            "shuffle teacher run_metadata.json lacks animal_shuffle_mapping_sha256"
+        )
 
     if mismatch:
         raise SystemExit(
@@ -226,13 +282,17 @@ def _verify_teacher_pair(real_dir: Path, shuffle_dir: Path, expected_epoch: int)
 
     return {
         "teacher_real_checkpoint": str(real_path),
+        "teacher_real_checkpoint_sha256": _sha256_file(real_path),
         "teacher_real_epoch": int(real_payload["epoch"]),
         "teacher_shuffle_checkpoint": str(shuffle_path),
+        "teacher_shuffle_checkpoint_sha256": _sha256_file(shuffle_path),
         "teacher_shuffle_epoch": int(shuffle_payload["epoch"]),
         "teacher_initial_model_sha256": init_hashes["real"],
         "split_manifest_hash": real_payload.get("split_manifest_hash"),
         "feature_schema_version": real_payload.get("feature_schema_version"),
         "datastore_fingerprint": real_data.get("datastore_fingerprint"),
+        "animal_shuffle_seed": shuffle_configuration.get("animal_shuffle_seed"),
+        "animal_shuffle_mapping_sha256": mapping_hash,
         "teacher_configuration": real_configuration,
         "architecture_config": real_payload.get("architecture_config"),
     }
@@ -263,9 +323,9 @@ def _b1_teacher_contract(real_payload: dict, real_dir: Path, human_seed: int, ex
             raise SystemExit("B1 teacher run_metadata.json lacks initial_model_sha256")
 
 
-def _sha256_file(path: Path) -> str:
+def _sha256_file(path: Path | str) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    with Path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -294,7 +354,13 @@ def _write_rows(path: str | None, rows: list[dict]) -> None:
 
 
 def apply_csdt(theta0: dict, real: dict, shuffle: dict, alpha: float) -> dict:
-    """theta_init = theta0 + alpha * (real - shuffle) on backbone params (§64)."""
+    """theta_init = theta0 + alpha * (real - shuffle) on backbone params (§64).
+
+    Review P0-4: ``theta0`` must be the *teacher-coordinate anchor* (see
+    ``build_anchor_state``), never the human3-native random initialisation —
+    weight-space task vectors are only additive within one random coordinate
+    system.
+    """
 
     merged = {key: value.detach().clone() for key, value in theta0.items()}
     for key in merged:
@@ -311,6 +377,37 @@ def apply_b1(theta0: dict, real: dict) -> dict:
         if key.startswith(BACKBONE_PREFIX) and key in real:
             merged[key] = real[key].detach().clone()
     return merged
+
+
+def _regenerate_teacher_anchor(human_seed: int, template_config: dict | None, expected_initial_model_sha256: str):
+    """Review P0-4 (§19): rebuild the teachers' true common starting point.
+
+    The Animal56 teacher construction consumes a different amount of RNG than
+    the human3 construction (56 vs 3 decoders first), so a same-seed human3
+    model does NOT share the teacher backbone coordinate.  This helper
+    reproduces the teacher's initial model exactly and fails loudly when the
+    reproduction is imperfect.
+    """
+
+    animal_init_model, _, _ = _build_model(human_seed, "animal56", torch.device("cpu"), template_config)
+    observed_hash = state_dict_sha256(animal_init_model)
+    if observed_hash != expected_initial_model_sha256:
+        raise SystemExit(
+            "Could not reproduce teacher initial model exactly "
+            f"(expected {expected_initial_model_sha256}, observed {observed_hash})"
+        )
+    return animal_init_model
+
+
+def build_anchor_state(model_human, animal_init_model) -> dict:
+    """Review §20: human heads stay fresh; backbone = teacher initial coordinate."""
+
+    animal_state = animal_init_model.state_dict()
+    anchor = {key: value.detach().clone() for key, value in model_human.state_dict().items()}
+    for key in anchor:
+        if key.startswith(BACKBONE_PREFIX) and key in animal_state:
+            anchor[key] = animal_state[key].detach().clone()
+    return anchor
 
 
 @torch.no_grad()
@@ -422,9 +519,22 @@ def card_delta_table(model_real, model_shuffle, train_loaders: dict, task_names,
     return np.asarray(ids), np.stack(deltas)
 
 
+def _human_loaders(params):
+    """Build the human3 train/val loader dict (review P0-1: single helper so
+    the CLST/CARD branches cannot reference an undefined collator)."""
+
+    collator = DataCollator(
+        spatial_pos_max_clip=params.spatial_pos_clip,
+        max_node_filter=None,
+    )
+    return _loaders(params, list(HUMAN_TARGET_TASKS), collator)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["csdt", "clst", "b1", "card_table"])
+    parser.add_argument(
+        "mode", choices=["anchor", "csdt", "clst", "b1", "card_table"]
+    )
     parser.add_argument("--teacher_real_dir", required=True)
     parser.add_argument("--teacher_shuffle_dir", default=None)
     parser.add_argument(
@@ -446,6 +556,10 @@ def main() -> None:
     teacher_shuffle_dir = Path(args.teacher_shuffle_dir) if args.teacher_shuffle_dir else None
     if args.mode in {"csdt", "clst", "card_table"} and teacher_shuffle_dir is None:
         raise SystemExit(f"{args.mode} requires --teacher_shuffle_dir")
+    if args.mode == "card_table" and not str(args.output).endswith(".npz"):
+        # Review P1-4: np.savez silently appends .npz, which would break the
+        # provenance sidecar path.
+        raise SystemExit("CARD table --output must end with .npz")
 
     provenance: dict = {
         "mode": args.mode,
@@ -462,7 +576,7 @@ def main() -> None:
         matched = _verify_teacher_pair(teacher_real_dir, teacher_shuffle_dir, args.expected_teacher_epoch)
         provenance.update(matched)
         template_config = matched["teacher_configuration"]
-        model_real, _, animal_tasks = _build_model(args.human_seed, "animal56", device, template_config)
+        model_real, _, teacher_tasks = _build_model(args.human_seed, "animal56", device, template_config)
         model_real.load_state_dict(
             _load_teacher_checkpoint(teacher_real_dir, args.expected_teacher_epoch)[1]["model_state"],
             strict=True,
@@ -487,15 +601,17 @@ def main() -> None:
         setattr(params, "train_eval_scope", "validation_only")
         setattr(params, "card_lambda_delta", 0.0)
         validate_params(params)
-        _resolve_data_store(params, list(HUMAN_TARGET_TASKS), required=True)
-        collator = DataCollator(spatial_pos_max_clip=params.spatial_pos_clip, max_node_filter=None)
-        loaders = _loaders(params, list(HUMAN_TARGET_TASKS), collator)
+        # Review P0-2: iterate the human3 train loaders (keyed by the three
+        # human endpoints) — the 56 animal task names must never be used as
+        # loader keys here.
+        loaders = _human_loaders(params)
         ids, deltas = card_delta_table(
-            model_real, model_shuffle, loaders["train"], animal_tasks, device
+            model_real, model_shuffle, loaders["train"], list(HUMAN_TARGET_TASKS), device
         )
-        np.savez(args.output, ids=ids, delta=deltas)
-        print(f"card delta table: {len(ids)} samples x {deltas.shape[1]} dims -> {args.output}")
-        _write_provenance(Path(args.output), provenance)
+        output = Path(args.output)
+        np.savez(output, ids=ids, delta=deltas)
+        print(f"card delta table: {len(ids)} samples x {deltas.shape[1]} dims -> {output}")
+        _write_provenance(output, provenance)
         return
 
     # theta0: fresh seed-matched human3 model.  Architecture/data settings are
@@ -517,9 +633,13 @@ def main() -> None:
     else:
         _b1_teacher_contract(real_checkpoint, teacher_real_dir, args.human_seed, args.expected_teacher_epoch)
         metadata_path = teacher_real_dir / "run_metadata.json"
-        if metadata_path.exists():
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            provenance["teacher_initial_model_sha256"] = metadata.get("initial_model_sha256")
+        # Review P1-3: formal teachers must come from auditable runs.
+        if not metadata_path.exists():
+            raise SystemExit(f"B1 teacher is missing run_metadata.json under {teacher_real_dir}")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if not metadata.get("initial_model_sha256"):
+            raise SystemExit("B1 teacher run_metadata.json lacks initial_model_sha256")
+        provenance["teacher_initial_model_sha256"] = metadata["initial_model_sha256"]
 
     shuffle_checkpoint_path = None
     if teacher_shuffle_dir is not None:
@@ -534,15 +654,39 @@ def main() -> None:
     )
     theta0 = {key: value.detach().clone() for key, value in model_human.state_dict().items()}
 
+    # Review P0-4: regenerate the teachers' common initial backbone and build
+    # the teacher-coordinate anchor (heads fresh, backbone = teacher init).
+    theta_anchor = None
+    if args.mode in {"anchor", "csdt"}:
+        expected_init_hash = (
+            matched_init_hash
+            if args.mode == "csdt"
+            else json.loads((teacher_real_dir / "run_metadata.json").read_text(encoding="utf-8")).get(
+                "initial_model_sha256"
+            )
+        )
+        if not expected_init_hash:
+            raise SystemExit("teacher run_metadata.json lacks initial_model_sha256")
+        animal_init_model = _regenerate_teacher_anchor(
+            args.human_seed, template_config, expected_init_hash
+        )
+        theta_anchor = build_anchor_state(model_human, animal_init_model)
+        provenance["teacher_anchor_initial_model_sha256"] = expected_init_hash
+
     model_real, _, _ = _build_model(args.human_seed, "animal56", torch.device("cpu"), template_config)
     model_real.load_state_dict(real_checkpoint["model_state"], strict=True)
     state_real = model_real.state_dict()
 
-    if args.mode == "csdt":
+    if args.mode == "anchor":
+        # §22-§23: B0A anchor-only control — no semantic delta applied.
+        merged = theta_anchor
+    elif args.mode == "csdt":
+        # Review P0-4/§21: CSDT must apply the counterfactual delta in the
+        # teacher coordinate (alpha=0 reproduces the anchor exactly).
         model_shuffle, _, _ = _build_model(args.human_seed, "animal56", torch.device("cpu"), template_config)
         model_shuffle.load_state_dict(shuffle_checkpoint["model_state"], strict=True)
         state_shuffle = model_shuffle.state_dict()
-        merged = apply_csdt(theta0, state_real, state_shuffle, args.alpha)
+        merged = apply_csdt(theta_anchor, state_real, state_shuffle, args.alpha)
 
         if args.delta_csv:
             rows = []
@@ -574,7 +718,7 @@ def main() -> None:
         model_shuffle.load_state_dict(shuffle_checkpoint["model_state"], strict=True)
 
         seed_everything(args.human_seed)
-        loaders = _loaders(human_params, list(HUMAN_TARGET_TASKS), collator)
+        loaders = _human_loaders(human_params)
         model_real.to(device)
         model_shuffle.to(device)
         score_rows, n = clst_layer_scores(model_real, model_shuffle, loaders["train"], device)

@@ -150,31 +150,42 @@ def _write_run_metadata(params, task_names, trainer):
     data_metadata = getattr(trainer, "data_metadata", None) or {}
     from reproducibility import PERSISTENT_WORKER_POLICY, SEED_POLICY_VERSION
 
-    _write_json(
-        run_path / "run_metadata.json",
-        {
-            "seed": int(getattr(params, "seed", 42)),
-            "seed_policy_version": SEED_POLICY_VERSION,
-            "num_loader_workers": int(getattr(params, "num_loader_workers", 0)),
-            "persistent_worker_policy": PERSISTENT_WORKER_POLICY,
-            "train_eval_scope": getattr(params, "train_eval_scope", "full"),
-            "evaluation_scope": getattr(params, "train_eval_scope", "full"),
-            "git_commit": _git_commit_hash(),
-            # D6 shuffle/counterfactual provenance (review P1-5, §51).
-            "shuffle_animal_train_labels": bool(
-                getattr(params, "shuffle_animal_train_labels", False)
-            ),
-            "animal_shuffle_seed": getattr(params, "animal_shuffle_seed", None),
-            "animal_shuffle_mapping_sha256": getattr(
-                params, "animal_shuffle_mapping_sha256", None
-            ),
-            "init_overlay": getattr(params, "init_overlay_provenance", None),
-            "initial_model_sha256": initial_model_sha256,
-            "manifest_sha256": data_metadata.get("split_manifest_hash"),
-            "datastore_fingerprint": data_metadata.get("datastore_fingerprint"),
-            "checkpoint_version": 6 if data_metadata else 4,
-        },
-    )
+    metadata = {
+        "seed": int(getattr(params, "seed", 42)),
+        "seed_policy_version": SEED_POLICY_VERSION,
+        "num_loader_workers": int(getattr(params, "num_loader_workers", 0)),
+        "persistent_worker_policy": PERSISTENT_WORKER_POLICY,
+        "train_eval_scope": getattr(params, "train_eval_scope", "full"),
+        "evaluation_scope": getattr(params, "train_eval_scope", "full"),
+        "git_commit": _git_commit_hash(),
+        # D6 shuffle/counterfactual provenance (review P1-5, §51).
+        "shuffle_animal_train_labels": bool(
+            getattr(params, "shuffle_animal_train_labels", False)
+        ),
+        "animal_shuffle_seed": getattr(params, "animal_shuffle_seed", None),
+        "animal_shuffle_mapping_sha256": getattr(
+            params, "animal_shuffle_mapping_sha256", None
+        ),
+        "init_overlay": getattr(params, "init_overlay_provenance", None),
+        "initial_model_sha256": initial_model_sha256,
+        "manifest_sha256": data_metadata.get("split_manifest_hash"),
+        "datastore_fingerprint": data_metadata.get("datastore_fingerprint"),
+        "checkpoint_version": 6 if data_metadata else 4,
+    }
+    # Review P1-5: formal CARD runs must pin the delta-table identity.
+    if float(getattr(params, "card_lambda_delta", 0.0)) > 0:
+        card_path = Path(params.card_delta_table)
+        sidecar = Path(str(card_path) + ".provenance.json")
+        if not sidecar.is_file():
+            raise RuntimeError(
+                "Formal D6 CARD run requires the delta-table provenance sidecar: "
+                f"{sidecar}"
+            )
+        metadata["card_delta_table"] = str(card_path)
+        metadata["card_delta_table_sha256"] = _sha256_file(card_path)
+        metadata["card_delta_provenance_path"] = str(sidecar)
+        metadata["card_delta_provenance_sha256"] = _sha256_file(sidecar)
+    _write_json(run_path / "run_metadata.json", metadata)
     effective = getattr(params, "effective_rgcer_config", None)
     if effective is not None:
         _write_json(run_path / "effective_config.json", effective)
@@ -590,6 +601,11 @@ def main(params):
         post_overlay_model_sha256 = state_dict_sha256(trainer.model)
         trainer.initial_model_sha256 = post_overlay_model_sha256
         init_provenance_path = Path(str(params.init_state_path) + ".provenance.json")
+        if getattr(params, "require_init_provenance", False) and not init_provenance_path.is_file():
+            raise FileNotFoundError(
+                "D6 formal candidate is missing its init provenance sidecar: "
+                f"{init_provenance_path}"
+            )
         params.init_overlay_provenance = {
             "pre_overlay_model_sha256": pre_overlay_model_sha256,
             "post_overlay_model_sha256": post_overlay_model_sha256,
@@ -924,6 +940,13 @@ def build_parser():
         default=None,
         help="Optional plain model state_dict applied to the freshly built model "
         "before training (CSDT/CLST/sequential-transfer initialisation).",
+    )
+    parser.add_argument(
+        "--require_init_provenance",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="D6 formal candidates: abort when the init state lacks its "
+        ".provenance.json sidecar (review P1-6).",
     )
     parser.add_argument(
         "--card_lambda_delta",
