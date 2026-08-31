@@ -603,7 +603,7 @@ def run_d5_0(features_by_seed: dict[int, Path], output_dir: Path):
             )
             labels = np.array([per_seed_tables[0][key]["label"] for key in keys])
             with np.errstate(invalid="ignore"):
-                seed_std = np.nanstd(stacked, axis=0, ddof=1)
+                seed_std = np.nanstd(stacked, axis=1, ddof=1)
             disagreement_rows.append(
                 {
                     "model": model,
@@ -614,7 +614,7 @@ def run_d5_0(features_by_seed: dict[int, Path], output_dir: Path):
                     "p95_seed_std": float(np.nanpercentile(seed_std, 95)),
                 }
             )
-            ensemble = np.nanmean(stacked, axis=0)
+            ensemble = np.nanmean(stacked, axis=1)
             ensemble_rows.append(
                 {
                     "model": model,
