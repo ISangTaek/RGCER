@@ -109,6 +109,22 @@ def _install_stubs(monkeypatch, tmp_path, clst_rows=None, card_rows=(["s1", "s2"
             "teacher_shuffle_checkpoint_sha256": "shuffle-sha",
             "animal_shuffle_seed": 20260831,
             "animal_shuffle_mapping_sha256": "map-hash",
+            "split_manifest_hash": "m",
+            "feature_schema_version": "s",
+            "datastore_fingerprint": "f",
+        }
+
+    def _stub_single_real(real_payload, real_dir, *, expected_model_seed=None, expected_epoch=None):
+        return {
+            "teacher_real_checkpoint": str(real_dir / "teacher_last.pt"),
+            "teacher_real_checkpoint_sha256": "real-sha",
+            "teacher_real_epoch": 29,
+            "teacher_initial_model_sha256": "teacher-init-hash",
+            "split_manifest_hash": "m",
+            "feature_schema_version": "s",
+            "datastore_fingerprint": "f",
+            "teacher_configuration": {"hidden_dim": 4},
+            "architecture_config": {},
         }
 
     fake_train_loaders = {
@@ -138,7 +154,7 @@ def _install_stubs(monkeypatch, tmp_path, clst_rows=None, card_rows=(["s1", "s2"
 
     monkeypatch.setattr(prep, "_load_teacher_checkpoint", _stub_load_checkpoint)
     monkeypatch.setattr(prep, "_verify_teacher_pair", _stub_verify)
-    monkeypatch.setattr(prep, "_b1_teacher_contract", lambda *a, **k: None)
+    monkeypatch.setattr(prep, "_verify_single_real_teacher", _stub_single_real)
     monkeypatch.setattr(prep, "_build_model", _stub_build_model)
     monkeypatch.setattr(prep, "_human_loaders", _stub_human_loaders)
     monkeypatch.setattr(prep, "_loaders", _stub_loaders)
@@ -244,6 +260,15 @@ def test_csdt_main_branch_smoke(monkeypatch, tmp_path):
 
 def test_anchor_main_branch_smoke(monkeypatch, tmp_path):
     recorded, real_dir, shuffle_dir = _install_stubs(monkeypatch, tmp_path)
+
+    # Review P0-1 (§11): anchor mode must NEVER require a shuffle teacher —
+    # wire the pair verifier to explode so the real branch cannot regress to
+    # calling it with teacher_shuffle_dir=None.
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("anchor mode must not require a shuffle teacher pair")
+
+    monkeypatch.setattr(prep, "_verify_teacher_pair", _must_not_be_called)
+
     output = tmp_path / "b0a_init.pt"
     _run_prep_main(
         monkeypatch,
@@ -256,11 +281,27 @@ def test_anchor_main_branch_smoke(monkeypatch, tmp_path):
         ],
     )
     assert output.exists()
-    assert output.with_name(output.name + ".provenance.json").exists()
+    provenance = json.loads(
+        output.with_name(output.name + ".provenance.json").read_text(encoding="utf-8")
+    )
+    # Review P1-1 (§52): the anchor sidecar must carry the full data identity.
+    for key in (
+        "mode", "human_seed", "output_sha256", "expected_teacher_epoch",
+        "split_manifest_hash", "datastore_fingerprint", "feature_schema_version",
+        "teacher_real_checkpoint_sha256", "teacher_real_epoch",
+        "teacher_initial_model_sha256",
+    ):
+        assert provenance.get(key) not in (None, ""), f"anchor sidecar lacks {key}"
 
 
 def test_b1_main_branch_smoke(monkeypatch, tmp_path):
     recorded, real_dir, shuffle_dir = _install_stubs(monkeypatch, tmp_path)
+
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("b1 mode must not require a shuffle teacher pair")
+
+    monkeypatch.setattr(prep, "_verify_teacher_pair", _must_not_be_called)
+
     output = tmp_path / "b1_init.pt"
     _run_prep_main(
         monkeypatch,
@@ -274,3 +315,85 @@ def test_b1_main_branch_smoke(monkeypatch, tmp_path):
     )
     assert output.exists()
     assert output.with_name(output.name + ".provenance.json").exists()
+
+
+# ----------------------------------------------------------------------
+# Review P0-1 (§12) / P1-1/P1-3: helper-level tests for the unified
+# single-real teacher contract used by anchor (B0A) and b1.
+# ----------------------------------------------------------------------
+from architecture.toxacute_tasks import ANIMAL_SOURCE_TASKS
+
+
+def _single_teacher_payload(seed=43, epoch=29):
+    return {
+        "checkpoint_version": 6,
+        "epoch": epoch,
+        "model_state": {"w": torch.zeros(1)},
+        "task_names": sorted(ANIMAL_SOURCE_TASKS),
+        "configuration": {
+            "arch": "Graphormer",
+            "train_eval_scope": "validation_only",
+            "fit_conformal": False,
+        },
+        "architecture_config": {"hidden_dim": 96},
+        "split_manifest_hash": "m",
+        "feature_schema_version": "s",
+        "data_config": {"datastore_fingerprint": "f"},
+        "reproducibility": {"base_seed": seed},
+    }
+
+
+def _write_single_teacher(root, payload, init_hash="init-hash"):
+    run_dir = root / "teacher_real"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, run_dir / "teacher_last.pt")
+    (run_dir / "run_metadata.json").write_text(
+        json.dumps({"initial_model_sha256": init_hash}), encoding="utf-8"
+    )
+    return run_dir
+
+
+def test_anchor_requires_single_real_teacher_seed_match(tmp_path):
+    # Review P0-1 (§12): human_seed 42 must reject a seed-43 teacher.
+    run_dir = _write_single_teacher(tmp_path, _single_teacher_payload(seed=43))
+    with pytest.raises(SystemExit, match="base seed"):
+        prep._verify_single_real_teacher(
+            torch.load(run_dir / "teacher_last.pt", weights_only=False),
+            run_dir,
+            expected_model_seed=42,
+            expected_epoch=29,
+        )
+
+
+def test_single_real_teacher_rejects_missing_base_seed(tmp_path):
+    # Review P1-3 (§36): a teacher without reproducibility.base_seed must FAIL.
+    payload = _single_teacher_payload(seed=42)
+    payload["reproducibility"] = {}
+    run_dir = _write_single_teacher(tmp_path, payload)
+    with pytest.raises(SystemExit, match="base_seed"):
+        prep._verify_single_real_teacher(
+            payload, run_dir, expected_model_seed=42, expected_epoch=29
+        )
+
+
+def test_single_real_teacher_provenance_is_complete(tmp_path):
+    # Review P1-1 (§52): anchor/b1 sidecars must carry the full data identity.
+    payload = _single_teacher_payload(seed=42)
+    run_dir = _write_single_teacher(tmp_path, payload)
+    provenance = prep._verify_single_real_teacher(
+        payload, run_dir, expected_model_seed=42, expected_epoch=29
+    )
+    for key in (
+        "teacher_real_checkpoint",
+        "teacher_real_checkpoint_sha256",
+        "teacher_real_epoch",
+        "teacher_initial_model_sha256",
+        "split_manifest_hash",
+        "feature_schema_version",
+        "datastore_fingerprint",
+        "teacher_configuration",
+        "architecture_config",
+    ):
+        assert provenance.get(key) not in (None, ""), f"single-real provenance lacks {key}"
+    assert provenance["teacher_real_epoch"] == 29
+    assert provenance["split_manifest_hash"] == "m"

@@ -12,7 +12,7 @@ import torch
 from torch import nn
 
 from reproducibility import state_dict_sha256
-from scripts.d6_prep_inits import _b1_teacher_contract, apply_b1, apply_csdt, _build_model
+from scripts.d6_prep_inits import apply_b1, apply_csdt, _build_model
 from shuffled_animal_labels import ShuffledAnimalTrainLabels
 
 
@@ -99,15 +99,18 @@ def test_card_zero_init_residual_and_gradient_flow(tmp_path):
 
 
 def test_card_zero_init_gradient_is_finite_and_bounded(tmp_path):
-    # Review P0-1 Test A: the old cosine-on-zero-vector loss produced a
-    # ~1e10 gradient; the unit-direction MSE must stay finite and bounded.
+    # Review P0-1 Test A / P1-6 (§41-§42): the regression must bound the
+    # CARD DISTILLATION gradient itself (backward on last_loss), not the
+    # prediction-residual path — the old cosine-on-zero-vector loss produced
+    # a ~1e10 gradient here; the unit-direction MSE must stay ~O(1).
     from card_adapter import CardAdapter
 
     table_path = tmp_path / "delta.npz"
     np.savez(table_path, ids=np.array(["s1", "s2"]), delta=np.array([[1.0, 0.0], [0.0, 1.0]]))
     card = CardAdapter(hidden_dim=2, bottleneck=3, lambda_delta=0.1, delta_table_path=str(table_path))
     representation = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
-    loss = (card(representation, ["s1", "s2"]) * card.lambda_delta).sum()
+    card(representation, ["s1", "s2"])
+    loss = card.last_loss * card.lambda_delta
     loss.backward()
     for parameter in card.parameters():
         assert parameter.grad is None or torch.isfinite(parameter.grad).all()
@@ -122,8 +125,8 @@ import json
 
 from architecture.toxacute_tasks import ANIMAL_SOURCE_TASKS, HUMAN_TARGET_TASKS
 from scripts.d6_prep_inits import (
-    _b1_teacher_contract,
     _load_teacher_checkpoint,
+    _verify_single_real_teacher,
     _verify_teacher_pair,
     clst_layer_scores,
 )
@@ -150,6 +153,27 @@ def _teacher_payload(shuffle, epoch=29, seed=42, manifest="m", fingerprint="f"):
     }
 
 
+def _write_shuffle_audit(run_dir, mapping_hash="map-hash", label_multiset_equal="True"):
+    """Review P1-2: every formal shuffle teacher carries its manifest +
+    sanity table; prep must refuse the pair without them."""
+    manifest = {
+        "animal_shuffle_seed": 20260831,
+        "animal_shuffle_mapping_sha256": mapping_hash,
+        "tasks": sorted(ANIMAL_SOURCE_TASKS),
+    }
+    (run_dir / "D6_ANIMAL_SHUFFLE_MANIFEST.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    with (run_dir / "D6_SHUFFLE_SANITY.csv").open("w", encoding="utf-8", newline="") as handle:
+        handle.write(
+            "task,n,mean_before,mean_after,std_before,std_after,label_multiset_equal,mapping_hash\n"
+        )
+        for task in sorted(ANIMAL_SOURCE_TASKS):
+            handle.write(
+                f"{task},4,1.5,1.5,0.5,0.5,{label_multiset_equal},{mapping_hash}\n"
+            )
+
+
 def _write_teacher(root, name, payload, init_hash="init-hash"):
     run_dir = root / name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -158,6 +182,7 @@ def _write_teacher(root, name, payload, init_hash="init-hash"):
     if payload.get("configuration", {}).get("shuffle_animal_train_labels") is True:
         metadata["animal_shuffle_seed"] = 20260831
         metadata["animal_shuffle_mapping_sha256"] = "map-hash"
+        _write_shuffle_audit(run_dir)
     (run_dir / "run_metadata.json").write_text(
         json.dumps(metadata), encoding="utf-8"
     )
@@ -192,14 +217,6 @@ def test_teacher_pair_requires_real_labels_for_real_teacher(tmp_path):
         _verify_teacher_pair(real, shuffle, expected_epoch=29, expected_model_seed=42)
 
 
-def test_teacher_pair_passes_when_matched(tmp_path):
-    real = _write_teacher(tmp_path, "real", _teacher_payload(False))
-    shuffle = _write_teacher(tmp_path, "shuffle", _teacher_payload(True))
-    matched = _verify_teacher_pair(real, shuffle, expected_epoch=29, expected_model_seed=42)
-    assert matched["teacher_real_epoch"] == 29
-    assert matched["teacher_initial_model_sha256"] == "init-hash"
-
-
 def test_teacher_load_rejects_wrong_fixed_epoch(tmp_path):
     run_dir = _write_teacher(tmp_path, "real", _teacher_payload(False, epoch=39))
     with pytest.raises(SystemExit):
@@ -209,8 +226,65 @@ def test_teacher_load_rejects_wrong_fixed_epoch(tmp_path):
 def test_b1_requires_matching_model_seed(tmp_path):
     run_dir = _write_teacher(tmp_path, "real", _teacher_payload(False, seed=43))
     payload = torch.load(run_dir / "teacher_last.pt", weights_only=False)
-    with pytest.raises(SystemExit):
-        _b1_teacher_contract(payload, run_dir, human_seed=42, expected_epoch=29)
+    with pytest.raises(SystemExit, match="base seed"):
+        _verify_single_real_teacher(
+            payload, run_dir, expected_model_seed=42, expected_epoch=29
+        )
+
+
+def test_teacher_pair_rejects_missing_base_seed(tmp_path):
+    # Review P1-3 (§34-§35): a v6 teacher without reproducibility.base_seed
+    # must FAIL the pair contract, never pass silently.
+    real_payload = _teacher_payload(False)
+    real_payload["reproducibility"] = {}
+    real = _write_teacher(tmp_path, "real", real_payload)
+    shuffle = _write_teacher(tmp_path, "shuffle", _teacher_payload(True))
+    with pytest.raises(SystemExit, match="base_seed"):
+        _verify_teacher_pair(real, shuffle, expected_epoch=29, expected_model_seed=42)
+
+
+def test_teacher_pair_requires_shuffle_manifest_file(tmp_path):
+    # Review P1-2 (§30-§31): the shuffle manifest is mandatory for a formal
+    # counterfactual pair.
+    real = _write_teacher(tmp_path, "real", _teacher_payload(False))
+    shuffle = _write_teacher(tmp_path, "shuffle", _teacher_payload(True))
+    (shuffle / "D6_ANIMAL_SHUFFLE_MANIFEST.json").unlink()
+    with pytest.raises(SystemExit, match="missing D6_ANIMAL_SHUFFLE_MANIFEST"):
+        _verify_teacher_pair(real, shuffle, expected_epoch=29, expected_model_seed=42)
+
+
+def test_teacher_pair_requires_shuffle_sanity_csv(tmp_path):
+    # Review P1-2 (§32): the shuffle sanity table is mandatory too.
+    real = _write_teacher(tmp_path, "real", _teacher_payload(False))
+    shuffle = _write_teacher(tmp_path, "shuffle", _teacher_payload(True))
+    (shuffle / "D6_SHUFFLE_SANITY.csv").unlink()
+    with pytest.raises(SystemExit, match="missing D6_SHUFFLE_SANITY"):
+        _verify_teacher_pair(real, shuffle, expected_epoch=29, expected_model_seed=42)
+
+
+def test_teacher_pair_rejects_label_multiset_mismatch(tmp_path):
+    # Review P1-2 (§32): every task must prove its shuffled label multiset
+    # equals the original one.
+    real = _write_teacher(tmp_path, "real", _teacher_payload(False))
+    shuffle = _write_teacher(tmp_path, "shuffle", _teacher_payload(True))
+    _write_shuffle_audit(shuffle, label_multiset_equal="False")
+    with pytest.raises(SystemExit, match="label_multiset_equal"):
+        _verify_teacher_pair(real, shuffle, expected_epoch=29, expected_model_seed=42)
+
+
+def test_teacher_pair_passes_when_matched(tmp_path):
+    real = _write_teacher(tmp_path, "real", _teacher_payload(False))
+    shuffle = _write_teacher(tmp_path, "shuffle", _teacher_payload(True))
+    matched = _verify_teacher_pair(real, shuffle, expected_epoch=29, expected_model_seed=42)
+    assert matched["teacher_real_epoch"] == 29
+    assert matched["teacher_initial_model_sha256"] == "init-hash"
+    # Review P1-1 (§52): the pair sidecar must carry the full data identity.
+    for key in (
+        "split_manifest_hash", "feature_schema_version", "datastore_fingerprint",
+        "teacher_shuffle_checkpoint_sha256", "animal_shuffle_seed",
+        "animal_shuffle_mapping_sha256",
+    ):
+        assert matched.get(key) not in (None, ""), f"pair provenance lacks {key}"
 
 
 class _StubLayer(nn.Module):
@@ -262,6 +336,8 @@ class _CountingLoader:
         self.iterations += 1
         batch = _FakeBatch()
         batch.sample_id = list(self.sample_id)
+        # Review P1-4 guard: batch_size must equal the sample-id count.
+        batch.batch_size = len(batch.sample_id)
         return iter([batch])
 
     def __len__(self):
@@ -504,3 +580,182 @@ def test_csdt_alpha_one_exact_delta():
     shuffle = {"encoder.backbone.a": torch.tensor([1.0, 0.0])}
     merged = apply_csdt(anchor, real, shuffle, alpha=1.0)
     assert torch.allclose(merged["encoder.backbone.a"], torch.tensor([3.0, 3.0]))
+
+
+# ----------------------------------------------------------------------
+# Review P0-2 (§17-§26) / P1-7 (§43-§44): the unified artifact provenance
+# validator must bind init states and CARD tables to the CURRENT run's
+# manifest/datastore/feature-schema identity before any training step.
+# ----------------------------------------------------------------------
+import hashlib
+from pathlib import Path
+
+from main import _d6_artifact_contract, _validate_d6_artifact_provenance
+
+RUN_DATA_METADATA = {
+    "split_manifest_hash": "m",
+    "datastore_fingerprint": "f",
+    "feature_schema_version": "atom_v2_bond_v1_pathavg_v1",
+}
+
+
+def _digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _write_artifact_with_sidecar(
+    tmp_path,
+    filename,
+    mode,
+    *,
+    seed=42,
+    manifest="m",
+    fingerprint="f",
+    schema="atom_v2_bond_v1_pathavg_v1",
+    omit_sha=False,
+    tamper_artifact=False,
+):
+    artifact = tmp_path / filename
+    torch.save({"model_state": {"w": torch.zeros(1)}}, artifact)
+    provenance = {
+        "mode": mode,
+        "human_seed": seed,
+        "expected_teacher_epoch": 29,
+        "split_manifest_hash": manifest,
+        "datastore_fingerprint": fingerprint,
+        "feature_schema_version": schema,
+    }
+    if not omit_sha:
+        provenance["output_sha256"] = _digest(artifact)
+    if tamper_artifact:
+        # Mutate the artifact AFTER the sha was recorded — a post-hoc swap
+        # must be caught by the output_sha256 check (review §21).
+        torch.save({"model_state": {"w": torch.ones(1)}}, artifact)
+    sidecar = artifact.with_name(artifact.name + ".provenance.json")
+    sidecar.write_text(json.dumps(provenance), encoding="utf-8")
+    return artifact, sidecar
+
+
+def test_o3_accepts_matching_card_table_provenance(tmp_path):
+    artifact, sidecar = _write_artifact_with_sidecar(tmp_path, "card_table.pt", "card_table")
+    provenance = _validate_d6_artifact_provenance(
+        provenance_path=sidecar,
+        artifact_path=artifact,
+        candidate="o3",
+        seed=42,
+        data_metadata=RUN_DATA_METADATA,
+    )
+    contract = _d6_artifact_contract(provenance)
+    assert contract["mode"] == "card_table"
+    assert contract["human_seed"] == 42
+    assert contract["split_manifest_hash"] == "m"
+    assert contract["datastore_fingerprint"] == "f"
+    assert contract["expected_teacher_epoch"] == 29
+
+
+def test_o3_rejects_card_table_from_wrong_seed(tmp_path):
+    artifact, sidecar = _write_artifact_with_sidecar(
+        tmp_path, "card_table.pt", "card_table", seed=44
+    )
+    with pytest.raises(ValueError, match="human_seed"):
+        _validate_d6_artifact_provenance(
+            provenance_path=sidecar, artifact_path=artifact, candidate="o3",
+            seed=42, data_metadata=RUN_DATA_METADATA,
+        )
+
+
+def test_o3_rejects_card_table_from_wrong_manifest(tmp_path):
+    artifact, sidecar = _write_artifact_with_sidecar(
+        tmp_path, "card_table.pt", "card_table", manifest="other-split"
+    )
+    with pytest.raises(ValueError, match="split_manifest_hash"):
+        _validate_d6_artifact_provenance(
+            provenance_path=sidecar, artifact_path=artifact, candidate="o3",
+            seed=42, data_metadata=RUN_DATA_METADATA,
+        )
+
+
+def test_o3_rejects_card_table_from_wrong_datastore(tmp_path):
+    artifact, sidecar = _write_artifact_with_sidecar(
+        tmp_path, "card_table.pt", "card_table", fingerprint="other-store"
+    )
+    with pytest.raises(ValueError, match="datastore_fingerprint"):
+        _validate_d6_artifact_provenance(
+            provenance_path=sidecar, artifact_path=artifact, candidate="o3",
+            seed=42, data_metadata=RUN_DATA_METADATA,
+        )
+
+
+def test_o3_rejects_non_card_table_provenance(tmp_path):
+    artifact, sidecar = _write_artifact_with_sidecar(tmp_path, "card_table.pt", "clst")
+    with pytest.raises(ValueError, match="mode"):
+        _validate_d6_artifact_provenance(
+            provenance_path=sidecar, artifact_path=artifact, candidate="o3",
+            seed=42, data_metadata=RUN_DATA_METADATA,
+        )
+
+
+def test_o3_rejects_tampered_card_table(tmp_path):
+    artifact, sidecar = _write_artifact_with_sidecar(
+        tmp_path, "card_table.pt", "card_table", tamper_artifact=True
+    )
+    with pytest.raises(ValueError, match="output_sha256"):
+        _validate_d6_artifact_provenance(
+            provenance_path=sidecar, artifact_path=artifact, candidate="o3",
+            seed=42, data_metadata=RUN_DATA_METADATA,
+        )
+
+
+def test_o3_rejects_sidecar_without_artifact_sha(tmp_path):
+    artifact, sidecar = _write_artifact_with_sidecar(
+        tmp_path, "card_table.pt", "card_table", omit_sha=True
+    )
+    with pytest.raises(ValueError, match="output_sha256"):
+        _validate_d6_artifact_provenance(
+            provenance_path=sidecar, artifact_path=artifact, candidate="o3",
+            seed=42, data_metadata=RUN_DATA_METADATA,
+        )
+
+
+def test_o1_rejects_init_from_wrong_manifest(tmp_path):
+    artifact, sidecar = _write_artifact_with_sidecar(
+        tmp_path, "o1_init.pt", "csdt", manifest="other-split"
+    )
+    with pytest.raises(ValueError, match="split_manifest_hash"):
+        _validate_d6_artifact_provenance(
+            provenance_path=sidecar, artifact_path=artifact, candidate="o1",
+            seed=42, data_metadata=RUN_DATA_METADATA,
+        )
+
+
+def test_o2_rejects_init_from_wrong_datastore(tmp_path):
+    artifact, sidecar = _write_artifact_with_sidecar(
+        tmp_path, "o2_init.pt", "clst", fingerprint="other-store"
+    )
+    with pytest.raises(ValueError, match="datastore_fingerprint"):
+        _validate_d6_artifact_provenance(
+            provenance_path=sidecar, artifact_path=artifact, candidate="o2",
+            seed=42, data_metadata=RUN_DATA_METADATA,
+        )
+
+
+def test_b1_rejects_init_from_wrong_feature_schema(tmp_path):
+    artifact, sidecar = _write_artifact_with_sidecar(
+        tmp_path, "b1_init.pt", "b1", schema="other-schema"
+    )
+    with pytest.raises(ValueError, match="feature_schema_version"):
+        _validate_d6_artifact_provenance(
+            provenance_path=sidecar, artifact_path=artifact, candidate="b1",
+            seed=42, data_metadata=RUN_DATA_METADATA,
+        )
+
+
+def test_b0a_rejects_missing_sidecar(tmp_path):
+    artifact, _ = _write_artifact_with_sidecar(tmp_path, "b0a_init.pt", "anchor")
+    sidecar = artifact.with_name(artifact.name + ".provenance.json")
+    sidecar.unlink()
+    with pytest.raises(FileNotFoundError):
+        _validate_d6_artifact_provenance(
+            provenance_path=sidecar, artifact_path=artifact, candidate="b0a",
+            seed=42, data_metadata=RUN_DATA_METADATA,
+        )

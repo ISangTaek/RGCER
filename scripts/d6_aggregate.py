@@ -24,8 +24,6 @@ import json
 import math
 from pathlib import Path
 
-import json
-
 HUMAN_TASKS = ["man_oral_TDLo", "women_oral_TDLo", "human_oral_TDLo"]
 STABLE_WINDOW = 5
 CANDIDATES = {
@@ -95,6 +93,26 @@ def check_d6_run_contract(
     _check("args.fit_conformal", args_payload.get("fit_conformal"), False)
     _check("args.epochs", args_payload.get("epochs"), expected_last_epoch + 1)
     _check("run_metadata.d6_candidate", metadata.get("d6_candidate"), candidate)
+
+    # Review P0-2 (§27): init/CARD candidates must record the validated
+    # artifact contract that binds them to THIS data identity — the selector
+    # never ranks a run whose provenance is missing or inconsistent.
+    if candidate in {"b0a", "b1", "o1", "o2", "o3"}:
+        artifact = metadata.get("d6_artifact_contract")
+        if not isinstance(artifact, dict):
+            violations.append("run_metadata.d6_artifact_contract missing")
+        else:
+            _check("d6_artifact_contract.human_seed", artifact.get("human_seed"), seed)
+            _check(
+                "d6_artifact_contract.split_manifest_hash",
+                artifact.get("split_manifest_hash"),
+                metadata.get("manifest_sha256"),
+            )
+            _check(
+                "d6_artifact_contract.datastore_fingerprint",
+                artifact.get("datastore_fingerprint"),
+                metadata.get("datastore_fingerprint"),
+            )
 
     identity = {
         "manifest_sha256": metadata.get("manifest_sha256"),
@@ -386,7 +404,10 @@ def stage_a(runs_root: Path, seed: int, output_dir: Path, trace: dict) -> list[s
     fields = ["candidate", "originality_eligible", "seed", "status", "elimination_reason",
               "missing_epochs", "stable_rmse", "best_rmse", "best_epoch", "best_sharpness",
               "trajectory_std", "man_rmse", "women_rmse", "human_rmse",
-              "stable_gain_vs_human3_only", "meets_original_minimum"]
+              "stable_gain_vs_human3_only", "meets_original_minimum",
+              # Review P2 (§45): expose the O1 anchor causal evidence in the
+              # summary instead of leaving it only inside the selection trace.
+              "anchor_semantic_gain", "anchor_note"]
     _write_csv(output_dir / "D6A_MICROSCREEN_SUMMARY.csv", fields, rows)
 
     endpoint_rows = []

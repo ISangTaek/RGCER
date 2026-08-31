@@ -34,6 +34,7 @@ from experiment_config import (
 )
 from metric import ClsMetric, RegMetric
 from loss import BCELoss, MSELoss
+from molecular_features import FEATURE_SCHEMA_VERSION
 from preprocess_data import convert_to_single_emb_offline, get_graph_data_from_smiles
 from reproducibility import seed_everything, state_dict_sha256
 from conformal import resolve_conformal_tasks
@@ -99,6 +100,99 @@ def _sha256_file(path):
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+# Review P0-2 (fourth round §17): every artifact-consuming D6 candidate must
+# present a provenance sidecar generated in exactly this mode.
+D6_PROVENANCE_MODE = {
+    "b0a": "anchor",
+    "b1": "b1",
+    "o1": "csdt",
+    "o2": "clst",
+    "o3": "card_table",
+}
+
+
+def _validate_d6_artifact_provenance(
+    *,
+    provenance_path,
+    artifact_path,
+    candidate,
+    seed,
+    data_metadata,
+):
+    """Review P0-2 (§17-§22): bind a D6 artifact to the CURRENT run's data
+    identity before any training step.
+
+    A same-shape state dict (or CARD table) generated under a different
+    split_seed/datastore would ``strict``-load successfully and silently
+    corrupt the counterfactual, so the sidecar must carry and match this
+    run's manifest hash, datastore fingerprint and feature schema.
+    """
+
+    provenance_path = Path(provenance_path)
+    artifact_path = Path(artifact_path)
+    if not provenance_path.is_file():
+        raise FileNotFoundError(
+            f"D6 artifact provenance sidecar missing: {provenance_path}"
+        )
+    try:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"D6 artifact provenance sidecar is not valid JSON: {provenance_path}"
+        ) from exc
+    if not isinstance(provenance, dict):
+        raise ValueError(
+            f"D6 artifact provenance sidecar is not a JSON object: {provenance_path}"
+        )
+
+    expected_mode = D6_PROVENANCE_MODE[candidate]
+    if provenance.get("mode") != expected_mode:
+        raise ValueError(
+            f"--d6_candidate {candidate} requires artifact mode {expected_mode!r}, "
+            f"found {provenance.get('mode')!r} in {provenance_path}"
+        )
+    if provenance.get("human_seed") is None or int(provenance["human_seed"]) != int(seed):
+        raise ValueError(
+            f"D6 artifact provenance human_seed {provenance.get('human_seed')!r} "
+            f"does not match --seed {seed}"
+        )
+    if not provenance.get("output_sha256"):
+        raise ValueError(f"D6 artifact provenance lacks output_sha256: {provenance_path}")
+    if provenance["output_sha256"] != _sha256_file(artifact_path):
+        raise ValueError(
+            "D6 artifact provenance output_sha256 does not match the artifact file "
+            f"({artifact_path})"
+        )
+    for key in ("split_manifest_hash", "datastore_fingerprint", "feature_schema_version"):
+        recorded = provenance.get(key)
+        if not recorded:
+            raise ValueError(f"D6 provenance lacks required {key}: {provenance_path}")
+        expected = (data_metadata or {}).get(key)
+        if key == "feature_schema_version" and expected is None:
+            expected = FEATURE_SCHEMA_VERSION
+        if recorded != expected:
+            raise ValueError(
+                f"D6 artifact {key} {recorded!r} does not match the current run "
+                f"({expected!r}) — the artifact was generated under a different "
+                "data identity (review P0-2)"
+            )
+    return provenance
+
+
+def _d6_artifact_contract(provenance: dict) -> dict:
+    """Review §26: the validated provenance summary recorded in run metadata."""
+
+    return {
+        "mode": provenance.get("mode"),
+        "human_seed": provenance.get("human_seed"),
+        "artifact_sha256": provenance.get("output_sha256"),
+        "split_manifest_hash": provenance.get("split_manifest_hash"),
+        "datastore_fingerprint": provenance.get("datastore_fingerprint"),
+        "feature_schema_version": provenance.get("feature_schema_version"),
+        "expected_teacher_epoch": provenance.get("expected_teacher_epoch"),
+    }
 
 
 def _write_run_metadata(params, task_names, trainer):
@@ -169,6 +263,8 @@ def _write_run_metadata(params, task_names, trainer):
             params, "animal_shuffle_mapping_sha256", None
         ),
         "init_overlay": getattr(params, "init_overlay_provenance", None),
+        # Review P0-2 (§26): validated artifact ↔ data-identity contract.
+        "d6_artifact_contract": getattr(params, "d6_artifact_contract", None),
         "initial_model_sha256": initial_model_sha256,
         "manifest_sha256": data_metadata.get("split_manifest_hash"),
         "datastore_fingerprint": data_metadata.get("datastore_fingerprint"),
@@ -589,6 +685,30 @@ def main(params):
         load_path=params.load_path,
         **kwargs,
     )
+    # Review P0-2 (§23-§25): D6 artifact provenance is validated as soon as
+    # trainer.data_metadata exists and BEFORE the first run-metadata write, so
+    # an artifact from a wrong split/datastore can never even record metrics.
+    d6_candidate = getattr(params, "d6_candidate", "none")
+    if d6_candidate in {"b0a", "b1", "o1", "o2"}:
+        params.d6_artifact_contract = _d6_artifact_contract(
+            _validate_d6_artifact_provenance(
+                provenance_path=Path(str(params.init_state_path) + ".provenance.json"),
+                artifact_path=Path(params.init_state_path),
+                candidate=d6_candidate,
+                seed=params.seed,
+                data_metadata=getattr(trainer, "data_metadata", None) or {},
+            )
+        )
+    elif d6_candidate == "o3":
+        params.d6_artifact_contract = _d6_artifact_contract(
+            _validate_d6_artifact_provenance(
+                provenance_path=Path(str(params.card_delta_table) + ".provenance.json"),
+                artifact_path=Path(params.card_delta_table),
+                candidate="o3",
+                seed=params.seed,
+                data_metadata=getattr(trainer, "data_metadata", None) or {},
+            )
+        )
     _write_run_metadata(params, task_names, trainer)
     if getattr(params, "init_state_path", None):
         # D6 CSDT/CLST/sequential-transfer initialisation (plan §64-§65): the

@@ -1,6 +1,9 @@
 """D6 candidate initialisation utilities (plan §7-§27, §63-§67; review P0-1, P1-2/3/4/12).
 
 Modes:
+- anchor : teacher-coordinate anchor-only control (B0A) — heads stay
+           seed-matched fresh, backbone = the teachers' common initial
+           model; consumes only the real teacher (review P0-1/P0-4).
 - csdt : theta_init = theta0 + alpha * (theta_real - theta_shuffle), shared
          Graphormer backbone only; heads stay seed-matched fresh (§64).
 - b1   : standard sequential transfer initialisation - copy the real
@@ -29,6 +32,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -249,10 +253,14 @@ def _verify_teacher_pair(
     )
     # Review P1-1: the teacher pair must also be trained at the same model
     # seed as the human run (Stage B/C seed-paired protocol).
+    # Review P1-3 (fourth round §34-§35): a formal v6 teacher must RECORD its
+    # base seed — a missing seed is a contract violation, never a silent pass.
     for label in ("real", "shuffle"):
         payload = real_payload if label == "real" else shuffle_payload
         pair_seed = (payload.get("reproducibility") or {}).get("base_seed")
-        if pair_seed is not None and int(pair_seed) != int(expected_model_seed):
+        if pair_seed is None:
+            mismatch.append(f"{label} teacher lacks reproducibility.base_seed")
+        elif int(pair_seed) != int(expected_model_seed):
             mismatch.append(
                 f"{label} teacher base seed {pair_seed} != expected model seed {expected_model_seed}"
             )
@@ -301,8 +309,15 @@ def _verify_teacher_pair(
 
     # Review P1-11: cross-check the shuffle manifest file against the hash
     # recorded in the run metadata — provenance is more than "a string".
+    # Review P1-2 (fourth round §30-§32): the manifest and sanity table are
+    # MANDATORY for a formal counterfactual — absence is a mismatch, not an
+    # optional extra.
     shuffle_manifest_path = Path(shuffle_dir) / "D6_ANIMAL_SHUFFLE_MANIFEST.json"
-    if shuffle_manifest_path.exists():
+    if not shuffle_manifest_path.is_file():
+        mismatch.append(
+            "shuffle teacher is missing D6_ANIMAL_SHUFFLE_MANIFEST.json (review P1-2)"
+        )
+    else:
         manifest = json.loads(shuffle_manifest_path.read_text(encoding="utf-8"))
         require_equal(
             "D6_ANIMAL_SHUFFLE_MANIFEST.animal_shuffle_mapping_sha256",
@@ -314,6 +329,62 @@ def _verify_teacher_pair(
             manifest.get("animal_shuffle_seed"),
             metadata_by_label["shuffle"].get("animal_shuffle_seed"),
         )
+
+    sanity_path = Path(shuffle_dir) / "D6_SHUFFLE_SANITY.csv"
+    if not sanity_path.is_file():
+        mismatch.append("shuffle teacher is missing D6_SHUFFLE_SANITY.csv (review P1-2)")
+    else:
+        with sanity_path.open(newline="", encoding="utf-8") as handle:
+            sanity_rows = list(csv.DictReader(handle))
+        if not sanity_rows:
+            mismatch.append("D6_SHUFFLE_SANITY.csv is empty")
+        sanity_tasks = set()
+        for row in sanity_rows:
+            task = row.get("task")
+            sanity_tasks.add(task)
+            try:
+                n = int(float(row.get("n", "")))
+            except (TypeError, ValueError):
+                mismatch.append(f"D6_SHUFFLE_SANITY task {task!r} has invalid n={row.get('n')!r}")
+                continue
+            if n <= 0:
+                mismatch.append(f"D6_SHUFFLE_SANITY task {task!r} has n={n}")
+            if str(row.get("label_multiset_equal", "")).strip().lower() != "true":
+                mismatch.append(
+                    f"D6_SHUFFLE_SANITY task {task!r} label_multiset_equal="
+                    f"{row.get('label_multiset_equal')!r}"
+                )
+            # Review §33: mean/std are float-serialised sanity columns — compare
+            # numerically instead of by string equality.
+            for before_key, after_key in (
+                ("mean_before", "mean_after"),
+                ("std_before", "std_after"),
+            ):
+                try:
+                    before = float(row.get(before_key))
+                    after = float(row.get(after_key))
+                except (TypeError, ValueError):
+                    mismatch.append(
+                        f"D6_SHUFFLE_SANITY task {task!r} has invalid "
+                        f"{before_key}={row.get(before_key)!r}/{after_key}={row.get(after_key)!r}"
+                    )
+                    continue
+                if not math.isclose(before, after, rel_tol=0.0, abs_tol=1e-12):
+                    mismatch.append(
+                        f"D6_SHUFFLE_SANITY task {task!r} {before_key}={before!r} "
+                        f"!= {after_key}={after!r}"
+                    )
+        missing_tasks = sorted(set(ANIMAL_SOURCE_TASKS) - sanity_tasks)
+        if missing_tasks:
+            mismatch.append(
+                "D6_SHUFFLE_SANITY.csv task set != animal56; missing "
+                f"{len(missing_tasks)} tasks (e.g. {missing_tasks[:3]})"
+            )
+        extra_tasks = sorted(sanity_tasks - set(ANIMAL_SOURCE_TASKS))
+        if extra_tasks:
+            mismatch.append(
+                f"D6_SHUFFLE_SANITY.csv lists non-animal tasks: {extra_tasks[:5]}"
+            )
 
     # Review P1-2: the shuffle mapping identity is part of the counterfactual
     # contract — the shuffle teacher must record it.
@@ -347,29 +418,99 @@ def _verify_teacher_pair(
     }
 
 
-def _b1_teacher_contract(real_payload: dict, real_dir: Path, human_seed: int, expected_epoch: int) -> None:
-    """Review §31: B1 skips the shuffle teacher but still checks scope/seed/epoch."""
+def _verify_single_real_teacher(
+    real_payload: dict,
+    real_dir: Path,
+    *,
+    expected_model_seed: int,
+    expected_epoch: int,
+) -> dict:
+    """Review P0-1 (fourth round §7-§9): contract for modes that consume only
+    the real teacher — the B0A ``anchor`` control and ``b1`` sequential
+    transfer.  These modes are defined WITHOUT a shuffled teacher, so they must
+    never enter ``_verify_teacher_pair``.
+
+    Returns the complete provenance block (review P1-1 §28-§29): checkpoint
+    identity AND the data identity (manifest / datastore / feature schema) the
+    consumer-side validator in main.py binds to the current Human3 run.
+    """
+
+    real_dir = Path(real_dir)
+    mismatch: list[str] = []
 
     task_names = list(real_payload.get("task_names", []))
     if sorted(task_names) != sorted(ANIMAL_SOURCE_TASKS):
-        raise SystemExit("B1 teacher task scope must be exactly the 56 animal endpoints")
-    if real_payload.get("configuration", {}).get("arch") != "Graphormer":
-        raise SystemExit("B1 teacher architecture must be the plain Graphormer")
-    if int(real_payload.get("epoch", -1)) != int(expected_epoch):
-        raise SystemExit(
-            f"B1 teacher epoch mismatch: found {real_payload.get('epoch')}, "
-            f"expected {expected_epoch}"
+        mismatch.append(
+            "teacher task scope must be exactly the 56 animal endpoints; found "
+            f"{len(task_names)}"
         )
+    configuration = dict(real_payload.get("configuration") or {})
+    if configuration.get("arch") != "Graphormer":
+        mismatch.append(
+            "teacher architecture must be the plain Graphormer, found "
+            f"{configuration.get('arch')!r}"
+        )
+    observed_epoch = real_payload.get("epoch")
+    if observed_epoch is None or int(observed_epoch) != int(expected_epoch):
+        mismatch.append(
+            f"teacher epoch mismatch: found {observed_epoch!r}, expected {expected_epoch} "
+            "(fixed last-epoch contract)"
+        )
+    # Review P1-3 (§36): a missing base seed must FAIL, never pass silently.
     base_seed = (real_payload.get("reproducibility") or {}).get("base_seed")
-    if base_seed is not None and int(base_seed) != int(human_seed):
-        raise SystemExit(
-            f"B1 teacher base seed {base_seed} != human seed {human_seed} (review §31)"
+    if base_seed is None:
+        mismatch.append("teacher lacks reproducibility.base_seed")
+    elif int(base_seed) != int(expected_model_seed):
+        mismatch.append(
+            f"teacher base seed {base_seed} != expected model seed {expected_model_seed}"
         )
-    metadata_path = Path(real_dir) / "run_metadata.json"
-    if metadata_path.exists():
+    if configuration.get("train_eval_scope") != "validation_only":
+        mismatch.append(
+            "teacher must be trained with validation-only evaluation scope, found "
+            f"{configuration.get('train_eval_scope')!r}"
+        )
+    if bool(configuration.get("fit_conformal", True)):
+        mismatch.append("teacher must use --no-fit_conformal")
+
+    metadata_path = real_dir / "run_metadata.json"
+    if not metadata_path.is_file():
+        mismatch.append(f"teacher is missing run_metadata.json under {real_dir}")
+        metadata: dict = {}
+    else:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if metadata.get("initial_model_sha256") is None:
-            raise SystemExit("B1 teacher run_metadata.json lacks initial_model_sha256")
+    initial_model_sha256 = metadata.get("initial_model_sha256")
+    if not initial_model_sha256:
+        mismatch.append("teacher run_metadata.json lacks initial_model_sha256")
+
+    data_config = dict(real_payload.get("data_config") or {})
+    split_manifest_hash = real_payload.get("split_manifest_hash")
+    feature_schema_version = real_payload.get("feature_schema_version")
+    datastore_fingerprint = data_config.get("datastore_fingerprint")
+    for field, value in (
+        ("split_manifest_hash", split_manifest_hash),
+        ("feature_schema_version", feature_schema_version),
+        ("datastore_fingerprint", datastore_fingerprint),
+    ):
+        if not value:
+            mismatch.append(f"teacher checkpoint lacks {field}")
+
+    if mismatch:
+        raise SystemExit(
+            "single-real teacher contract failed (review §8):\n  - " + "\n  - ".join(mismatch)
+        )
+
+    checkpoint_path = _teacher_state_path(real_dir)
+    return {
+        "teacher_real_checkpoint": str(checkpoint_path),
+        "teacher_real_checkpoint_sha256": _sha256_file(checkpoint_path),
+        "teacher_real_epoch": int(real_payload["epoch"]),
+        "teacher_initial_model_sha256": initial_model_sha256,
+        "split_manifest_hash": split_manifest_hash,
+        "feature_schema_version": feature_schema_version,
+        "datastore_fingerprint": datastore_fingerprint,
+        "teacher_configuration": configuration,
+        "architecture_config": real_payload.get("architecture_config"),
+    }
 
 
 def _sha256_file(path: Path | str) -> str:
@@ -506,6 +647,14 @@ def clst_layer_scores(model_real, model_shuffle, train_loaders: dict, device) ->
                 batch = batch.to(device)
                 model_real.encoder.backbone(batch)
                 model_shuffle.encoder.backbone(batch)
+                # Review P1-4 (§38): a collator that drops sample ids would
+                # silently misalign the layer-score statistics — fail fast.
+                batch_size = acts["real"][0].shape[0]
+                if len(sample_ids) != batch_size:
+                    raise RuntimeError(
+                        "CLST requires one sample_id per molecule: "
+                        f"ids={len(sample_ids)} batch={batch_size}"
+                    )
                 index_tensor = torch.tensor(unseen_positions, dtype=torch.long)
                 for layer_index in range(n_layers):
                     real_pooled = acts["real"][layer_index][index_tensor]
@@ -519,7 +668,11 @@ def clst_layer_scores(model_real, model_shuffle, train_loaders: dict, device) ->
             hook.remove()
 
     rows = []
-    unique = max(len(seen_sample_ids), 1)
+    # Review P1-4 (§39): an empty human3 train set must fail instead of
+    # producing 8 zero scores and an arbitrary layer selection.
+    if not seen_sample_ids:
+        raise RuntimeError("CLST found zero unique Human3 training molecules")
+    unique = len(seen_sample_ids)
     for layer_index in range(n_layers):
         score = (diff_sums[layer_index] / unique) / (real_norm_sums[layer_index] / unique + 1e-8)
         rows.append(
@@ -557,6 +710,13 @@ def card_delta_table(model_real, model_shuffle, train_loaders: dict, task_names,
             real_repr = model_real.encoder(batch)
             shuffle_repr = model_shuffle.encoder(batch)
             delta = (real_repr - shuffle_repr).detach().float().cpu().numpy()
+            # Review P1-5 (§40): a dropped sample-id list would silently shift
+            # every table row onto the wrong molecule — fail fast.
+            if len(sample_ids) != delta.shape[0]:
+                raise RuntimeError(
+                    "CARD table generation requires one sample_id per representation row: "
+                    f"ids={len(sample_ids)} rows={delta.shape[0]}"
+                )
             for index, sample_id in enumerate(sample_ids):
                 if sample_id in seen:
                     continue
@@ -679,7 +839,10 @@ def main() -> None:
     provenance["teacher_real_checkpoint_sha256"] = _sha256_file(real_checkpoint_path)
     matched_init_hash = None
 
-    if args.mode != "b1":
+    # Review P0-1 (fourth round §7): three explicit teacher branches —
+    # csdt/clst verify the matched real/shuffle pair, while anchor/b1 consume
+    # ONLY the real teacher and must never require a shuffle directory.
+    if args.mode in {"csdt", "clst"}:
         matched = _verify_teacher_pair(
             teacher_real_dir,
             teacher_shuffle_dir,
@@ -689,16 +852,16 @@ def main() -> None:
         provenance.update(matched)
         matched_init_hash = matched["teacher_initial_model_sha256"]
         template_config = matched["teacher_configuration"]
-    else:
-        _b1_teacher_contract(real_checkpoint, teacher_real_dir, args.human_seed, args.expected_teacher_epoch)
-        metadata_path = teacher_real_dir / "run_metadata.json"
-        # Review P1-3: formal teachers must come from auditable runs.
-        if not metadata_path.exists():
-            raise SystemExit(f"B1 teacher is missing run_metadata.json under {teacher_real_dir}")
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if not metadata.get("initial_model_sha256"):
-            raise SystemExit("B1 teacher run_metadata.json lacks initial_model_sha256")
-        provenance["teacher_initial_model_sha256"] = metadata["initial_model_sha256"]
+    elif args.mode in {"anchor", "b1"}:
+        single = _verify_single_real_teacher(
+            real_checkpoint,
+            teacher_real_dir,
+            expected_model_seed=args.human_seed,
+            expected_epoch=args.expected_teacher_epoch,
+        )
+        provenance.update(single)
+        matched_init_hash = single["teacher_initial_model_sha256"]
+        template_config = dict(single["teacher_configuration"])
 
     shuffle_checkpoint_path = None
     if teacher_shuffle_dir is not None:
@@ -717,15 +880,11 @@ def main() -> None:
     # the teacher-coordinate anchor (heads fresh, backbone = teacher init).
     theta_anchor = None
     if args.mode in {"anchor", "csdt"}:
-        expected_init_hash = (
-            matched_init_hash
-            if args.mode == "csdt"
-            else json.loads((teacher_real_dir / "run_metadata.json").read_text(encoding="utf-8")).get(
-                "initial_model_sha256"
-            )
-        )
+        # Review §10: the anchor hash always comes from the verified
+        # provenance (teacher_initial_model_sha256), never re-read ad hoc.
+        expected_init_hash = matched_init_hash
         if not expected_init_hash:
-            raise SystemExit("teacher run_metadata.json lacks initial_model_sha256")
+            raise SystemExit("teacher verification did not yield initial_model_sha256")
         animal_init_model = _regenerate_teacher_anchor(
             args.human_seed, template_config, expected_init_hash
         )

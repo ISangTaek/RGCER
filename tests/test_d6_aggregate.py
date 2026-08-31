@@ -21,6 +21,15 @@ from scripts.d6_aggregate import (
 HUMAN_TASKS = ["man_oral_TDLo", "women_oral_TDLo", "human_oral_TDLo"]
 
 
+D6_PROVENANCE_MODE = {
+    "b0a": "anchor",
+    "b1": "b1",
+    "o1": "csdt",
+    "o2": "clst",
+    "o3": "card_table",
+}
+
+
 def _write_run(
     root,
     candidate,
@@ -29,6 +38,7 @@ def _write_run(
     macro_by_epoch,
     endpoint_by_epoch=None,
     args_epochs=None,
+    artifact_contract=True,
 ):
     run_dir = root / candidate / tag / f"seed_{seed}"
     diagnostics = run_dir / "diagnostics"
@@ -48,17 +58,24 @@ def _write_run(
         ),
         encoding="utf-8",
     )
-    (run_dir / "run_metadata.json").write_text(
-        json.dumps(
-            {
-                "d6_candidate": candidate,
-                "manifest_sha256": "manifest-test",
-                "datastore_fingerprint": "datastore-test",
-                "split_seed": 42,
-            }
-        ),
-        encoding="utf-8",
-    )
+    metadata = {
+        "d6_candidate": candidate,
+        "manifest_sha256": "manifest-test",
+        "datastore_fingerprint": "datastore-test",
+        "split_seed": 42,
+    }
+    # Review P0-2 (§27): artifact-consuming candidates must record the
+    # validated provenance contract; the selector refuses runs without it.
+    if artifact_contract and candidate in D6_PROVENANCE_MODE:
+        metadata["d6_artifact_contract"] = {
+            "mode": D6_PROVENANCE_MODE[candidate],
+            "human_seed": seed,
+            "artifact_sha256": "artifact-sha",
+            "split_manifest_hash": "manifest-test",
+            "datastore_fingerprint": "datastore-test",
+            "feature_schema_version": "schema-test",
+        }
+    (run_dir / "run_metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
     with (diagnostics / "epoch_summary.csv").open("w", encoding="utf-8") as handle:
         handle.write("epoch,val_human3_macro_rmse\n")
         for epoch, value in sorted(macro_by_epoch.items()):
@@ -521,6 +538,51 @@ def test_selector_rejects_wrong_d6_candidate_metadata(tmp_path):
     run_dir = tmp_path / "o1" / "d6_o1_e40" / "seed_42"
     row = summarize_run(run_dir, "o1", 42, expected_last_epoch=39)
     assert row["status"] == "CONTRACT_VIOLATION"
+
+
+def test_selector_rejects_missing_artifact_contract(tmp_path):
+    # Review P0-2 (§27): an artifact-consuming candidate without the
+    # validated provenance contract must never be ranked.
+    from scripts.d6_aggregate import summarize_run
+
+    _write_run(tmp_path, "o1", "d6_o1_e40", 42, _flat_macro(39, 1.0), artifact_contract=False)
+    run_dir = tmp_path / "o1" / "d6_o1_e40" / "seed_42"
+    row = summarize_run(run_dir, "o1", 42, expected_last_epoch=39)
+    assert row["status"] == "CONTRACT_VIOLATION"
+    assert "d6_artifact_contract" in row["contract_violations"]
+
+
+def test_selector_rejects_artifact_from_wrong_manifest(tmp_path):
+    from scripts.d6_aggregate import summarize_run
+
+    _write_run(tmp_path, "o2", "d6_o2_e40", 42, _flat_macro(39, 1.0))
+    metadata_path = tmp_path / "o2" / "d6_o2_e40" / "seed_42" / "run_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["d6_artifact_contract"]["split_manifest_hash"] = "manifest-other"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    row = summarize_run(
+        tmp_path / "o2" / "d6_o2_e40" / "seed_42", "o2", 42, expected_last_epoch=39
+    )
+    assert row["status"] == "CONTRACT_VIOLATION"
+    assert "split_manifest_hash" in row["contract_violations"]
+
+
+def test_selector_rejects_artifact_from_wrong_seed(tmp_path):
+    # Review §51: a seed-42 artifact consumed by a seed-44 run must be caught.
+    from scripts.d6_aggregate import summarize_run
+
+    _write_run(tmp_path, "o3", "d6_o3_e40", 44, _flat_macro(39, 1.0))
+    metadata_path = tmp_path / "o3" / "d6_o3_e40" / "seed_44" / "run_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["d6_artifact_contract"]["human_seed"] = 42
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    row = summarize_run(
+        tmp_path / "o3" / "d6_o3_e40" / "seed_44", "o3", 44, expected_last_epoch=39
+    )
+    assert row["status"] == "CONTRACT_VIOLATION"
+    assert "human_seed" in row["contract_violations"]
 
 
 def test_endpoint_stable_requires_all_five_epochs(tmp_path):
