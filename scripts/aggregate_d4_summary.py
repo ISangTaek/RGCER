@@ -406,6 +406,33 @@ def main() -> None:
     summary_rows: list[dict] = []
     endpoint_rows: list[dict] = []
 
+    # HPS first: 45/46 fresh runs, 42/43/44 formal references.  Task-only
+    # paired deltas below need every seed's HPS reference value.
+    hps_reference_by_seed: dict[int, float] = {}
+    for seed in (45, 46):
+        diagnostics_dirs = [Path(args.hps_root) / f"seed_{seed}" / "diagnostics"]
+        if not diagnostics_dirs[0].exists():
+            summary_rows.append(
+                {"model": "hps", "seed": seed, "source": "missing", "status": "MISSING_RUN_DIR"}
+            )
+            continue
+        row, endpoint_section = summarize_model_run("hps", seed, "fresh_100", diagnostics_dirs, float("nan"))
+        summary_rows.append(row)
+        endpoint_rows.extend(endpoint_section)
+        if row.get("human3_rmse") is not None:
+            hps_reference_by_seed[seed] = float(row["human3_rmse"])
+    for seed in (42, 43, 44):
+        reference_row, reference_endpoints = _summarize_hps_reference(
+            seed, Path(args.formal_hps_root) / f"seed_{seed}"
+        )
+        if "human3_rmse" not in reference_row:
+            reference_row["human3_rmse"] = HPS_REFERENCE_HUMAN3_RMSE[seed]
+        summary_rows.append(reference_row)
+        endpoint_rows.extend(reference_endpoints)
+        hps_reference_by_seed[seed] = float(
+            reference_row.get("human3_rmse", HPS_REFERENCE_HUMAN3_RMSE[seed])
+        )
+
     # Task-only runs: 42/43/44 merge the D3-era diagnostics (epochs 0-39).
     for seed in args.seeds:
         diagnostics_dirs = [Path(args.d4_task_root) / f"seed_{seed}" / "diagnostics"]
@@ -418,30 +445,10 @@ def main() -> None:
             continue
         source = "resume_40_to_100" if seed in (42, 43, 44) else "fresh_100"
         row, endpoint_section = summarize_model_run(
-            "task_only", seed, source, diagnostics_dirs, HPS_REFERENCE_HUMAN3_RMSE[seed]
+            "task_only", seed, source, diagnostics_dirs, hps_reference_by_seed[seed]
         )
         summary_rows.append(row)
         endpoint_rows.extend(endpoint_section)
-
-    # HPS: 45/46 fresh runs; 42/43/44 frozen validation references.
-    for seed in (45, 46):
-        diagnostics_dirs = [Path(args.hps_root) / f"seed_{seed}" / "diagnostics"]
-        if not diagnostics_dirs[0].exists():
-            summary_rows.append(
-                {"model": "hps", "seed": seed, "source": "missing", "status": "MISSING_RUN_DIR"}
-            )
-            continue
-        row, endpoint_section = summarize_model_run("hps", seed, "fresh_100", diagnostics_dirs, float("nan"))
-        summary_rows.append(row)
-        endpoint_rows.extend(endpoint_section)
-    for seed in (42, 43, 44):
-        reference_row, reference_endpoints = _summarize_hps_reference(
-            seed, Path(args.formal_hps_root) / f"seed_{seed}"
-        )
-        if "human3_rmse" not in reference_row:
-            reference_row["human3_rmse"] = HPS_REFERENCE_HUMAN3_RMSE[seed]
-        summary_rows.append(reference_row)
-        endpoint_rows.extend(reference_endpoints)
 
     # Paired comparison over the shared seeds (§62-§63).
     task_only_by_seed = {
