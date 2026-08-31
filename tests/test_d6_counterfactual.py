@@ -52,6 +52,34 @@ def test_shuffled_labels_leave_validation_real_and_human_absent():
     assert provider.get_label(0, "man_oral_TDLo", split="train") is None  # human never touched
 
 
+def test_main_writes_shuffle_sanity_csv(tmp_path):
+    # Smoke-gate regression (2026-08-31): the shuffled teacher crashed with
+    # NameError because main.py's D6_SHUFFLE_SANITY.csv write referenced a
+    # _write_csv helper that did not exist in that module.
+    import main as main_module
+
+    target = tmp_path / "run" / "D6_SHUFFLE_SANITY.csv"
+    rows = [
+        {
+            "task": "mouse_oral_LD50",
+            "n": 3,
+            "mean_before": 1.5,
+            "mean_after": 1.5,
+            "std_before": 0.5,
+            "std_after": 0.5,
+            "label_multiset_equal": True,
+            "mapping_hash": "h",
+        }
+    ]
+    main_module._write_csv(target, list(rows[0].keys()), rows)
+    lines = target.read_text(encoding="utf-8").strip().splitlines()
+    assert lines[0] == (
+        "task,n,mean_before,mean_after,std_before,std_after,label_multiset_equal,mapping_hash"
+    )
+    assert lines[1].startswith("mouse_oral_LD50,3,")
+    assert lines[1].endswith(",True,h")
+
+
 def test_csdt_formula_is_exact():
     theta0 = {"encoder.backbone.a": torch.tensor([1.0, 2.0]), "decoders.head": torch.tensor([0.5])}
     real = {"encoder.backbone.a": torch.tensor([2.0, 1.0]), "decoders.head": torch.tensor([9.0])}

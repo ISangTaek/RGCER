@@ -296,6 +296,20 @@ def _write_json(path, payload):
         json.dump(payload, handle, indent=2, sort_keys=True, default=str, allow_nan=True)
 
 
+def _write_csv(path, fieldnames, rows):
+    """D6 shuffle-sanity table writer (review P1-5/§32): the shuffled teacher
+    must persist its per-task label-multiset audit as CSV."""
+    import csv
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(fieldnames))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 def effective_prediction_mode(params):
     """Return a head mode compatible with the selected dataset.
 
