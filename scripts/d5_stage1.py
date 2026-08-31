@@ -415,7 +415,16 @@ def task_only_best_predictions(seed: int) -> list[dict]:
         path = Path(era) / "diagnostics" / "best_validation_human3_predictions.csv"
         rows = _read_csv(path)
         if rows:
-            return rows
+            return [
+                {
+                    "task": row["task"],
+                    "sample_id": row["sample_id"],
+                    "row_index": row.get("row_index", ""),
+                    "label": float(row["label"]),
+                    "final_prediction": float(row["final_prediction"]),
+                }
+                for row in rows
+            ]
     return []
 
 
