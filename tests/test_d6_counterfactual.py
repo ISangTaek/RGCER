@@ -90,10 +90,29 @@ def test_card_zero_init_residual_and_gradient_flow(tmp_path):
     out = card(representation, ["s1", "s2"])
     # Zero-init output layer: the residual starts exactly at the HPS baseline.
     assert torch.allclose(out, representation)
+    # Review P0-1 Test B: unit-direction MSE at zero init is order one.
+    assert 0.5 <= float(card.last_loss) <= 1.5
     loss = card.last_loss * card.lambda_delta
     loss.backward()
     assert card.up.weight.grad is not None and card.up.weight.grad.abs().sum() > 0
     assert card.delta_table.grad is None  # teacher delta is a frozen target (§78)
+
+
+def test_card_zero_init_gradient_is_finite_and_bounded(tmp_path):
+    # Review P0-1 Test A: the old cosine-on-zero-vector loss produced a
+    # ~1e10 gradient; the unit-direction MSE must stay finite and bounded.
+    from card_adapter import CardAdapter
+
+    table_path = tmp_path / "delta.npz"
+    np.savez(table_path, ids=np.array(["s1", "s2"]), delta=np.array([[1.0, 0.0], [0.0, 1.0]]))
+    card = CardAdapter(hidden_dim=2, bottleneck=3, lambda_delta=0.1, delta_table_path=str(table_path))
+    representation = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+    loss = (card(representation, ["s1", "s2"]) * card.lambda_delta).sum()
+    loss.backward()
+    for parameter in card.parameters():
+        assert parameter.grad is None or torch.isfinite(parameter.grad).all()
+    up_grad_norm = float(card.up.weight.grad.norm())
+    assert up_grad_norm < 100, f"card up grad norm exploded: {up_grad_norm}"
 
 
 # ----------------------------------------------------------------------
@@ -120,6 +139,8 @@ def _teacher_payload(shuffle, epoch=29, seed=42, manifest="m", fingerprint="f"):
             "arch": "Graphormer",
             "shuffle_animal_train_labels": shuffle,
             "animal_shuffle_seed": 20260831 if shuffle else None,
+            "train_eval_scope": "validation_only",
+            "fit_conformal": False,
         },
         "architecture_config": {"hidden_dim": 96},
         "split_manifest_hash": manifest,
@@ -147,34 +168,34 @@ def test_teacher_pair_requires_same_initial_hash(tmp_path):
     real = _write_teacher(tmp_path, "real", _teacher_payload(False), init_hash="hash-a")
     shuffle = _write_teacher(tmp_path, "shuffle", _teacher_payload(True), init_hash="hash-b")
     with pytest.raises(SystemExit):
-        _verify_teacher_pair(real, shuffle, expected_epoch=29)
+        _verify_teacher_pair(real, shuffle, expected_epoch=29, expected_model_seed=42)
 
 
 def test_teacher_pair_requires_same_epoch(tmp_path):
     real = _write_teacher(tmp_path, "real", _teacher_payload(False, epoch=29))
     shuffle = _write_teacher(tmp_path, "shuffle", _teacher_payload(True, epoch=39))
     with pytest.raises(SystemExit):
-        _verify_teacher_pair(real, shuffle, expected_epoch=29)
+        _verify_teacher_pair(real, shuffle, expected_epoch=29, expected_model_seed=42)
 
 
 def test_teacher_pair_requires_same_manifest(tmp_path):
     real = _write_teacher(tmp_path, "real", _teacher_payload(False, manifest="m1"))
     shuffle = _write_teacher(tmp_path, "shuffle", _teacher_payload(True, manifest="m2"))
     with pytest.raises(SystemExit):
-        _verify_teacher_pair(real, shuffle, expected_epoch=29)
+        _verify_teacher_pair(real, shuffle, expected_epoch=29, expected_model_seed=42)
 
 
 def test_teacher_pair_requires_real_labels_for_real_teacher(tmp_path):
     real = _write_teacher(tmp_path, "real", _teacher_payload(shuffle=True))
     shuffle = _write_teacher(tmp_path, "shuffle", _teacher_payload(shuffle=True))
     with pytest.raises(SystemExit):
-        _verify_teacher_pair(real, shuffle, expected_epoch=29)
+        _verify_teacher_pair(real, shuffle, expected_epoch=29, expected_model_seed=42)
 
 
 def test_teacher_pair_passes_when_matched(tmp_path):
     real = _write_teacher(tmp_path, "real", _teacher_payload(False))
     shuffle = _write_teacher(tmp_path, "shuffle", _teacher_payload(True))
-    matched = _verify_teacher_pair(real, shuffle, expected_epoch=29)
+    matched = _verify_teacher_pair(real, shuffle, expected_epoch=29, expected_model_seed=42)
     assert matched["teacher_real_epoch"] == 29
     assert matched["teacher_initial_model_sha256"] == "init-hash"
 
@@ -310,7 +331,7 @@ def test_card_alignment_uses_exact_batch_positions(tmp_path):
     with torch.no_grad():
         aligned = card.up(F.gelu(card.down(representation)))[[0, 2]]
         deltas = card.delta_table[[0, 1]]
-        expected = (1.0 - F.normalize(aligned, dim=-1).mul(F.normalize(deltas, dim=-1)).sum(-1)).mean()
+        expected = (aligned - deltas).pow(2).sum(dim=-1).mean()
     assert card.last_loss.detach() == pytest.approx(expected.detach(), abs=1e-6)
     assert torch.allclose(out, representation)  # zero-init residual invariant
 
@@ -381,3 +402,105 @@ def test_card_eval_does_not_accumulate_training_epoch_stats(tmp_path):
     card.eval()
     card(torch.ones(1, 2), ["a"])
     assert card.epoch_stats["loss_count"] == 0  # review P1-1
+
+
+def test_card_zero_target_is_safe(tmp_path):
+    # Review P0-1 Test C / §10: a zero teacher delta must not enter the
+    # distillation loss; everything stays finite and the zero targets are
+    # counted.
+    from card_adapter import CardAdapter
+
+    table_path = tmp_path / "delta.npz"
+    np.savez(table_path, ids=np.array(["z1", "z2"]), delta=np.zeros((2, 2)))
+    card = CardAdapter(hidden_dim=2, bottleneck=2, lambda_delta=0.1, delta_table_path=str(table_path))
+    card.train()
+    out = card(torch.ones(2, 2), ["z1", "z2"])
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(card.last_loss)
+    stats = card.pop_epoch_stats()
+    assert stats["card_valid_target_fraction"] == pytest.approx(0.0)
+    assert stats["card_zero_target_count"] == 2
+
+
+def test_card_training_requires_full_sample_id_alignment(tmp_path):
+    # Review P1-6: a training batch whose sample-id count does not match the
+    # representation batch size must fail fast instead of silently disabling
+    # the distillation loss.
+    from card_adapter import CardAdapter
+
+    table_path = tmp_path / "delta.npz"
+    np.savez(table_path, ids=np.array(["a", "c"]), delta=np.ones((2, 2)))
+    card = CardAdapter(hidden_dim=2, bottleneck=2, lambda_delta=0.1, delta_table_path=str(table_path))
+    card.train()
+    with pytest.raises(RuntimeError, match="one sample_id per representation row"):
+        card(torch.ones(3, 2), ["a", "c"])  # 3 rows, 2 ids
+
+
+def test_same_seed_human3_and_animal56_native_backbones_differ():
+    # Review P0-4 premise: same seed does NOT give the same backbone across
+    # task scopes (56 vs 3 decoders consume different RNG first).  This test
+    # documents the premise so nobody re-assumes coordinate equality.
+    model_human, _, _ = _build_model(42, "human3", torch.device("cpu"))
+    model_animal, _, _ = _build_model(42, "animal56", torch.device("cpu"))
+    human_backbone = {k: v for k, v in model_human.state_dict().items() if k.startswith("encoder.backbone.")}
+    animal_backbone = {k: v for k, v in model_animal.state_dict().items() if k.startswith("encoder.backbone.")}
+    assert any(
+        not torch.equal(human_backbone[key], animal_backbone[key])
+        for key in human_backbone
+    )
+
+
+def test_teacher_anchor_reproduction_hash():
+    # Review P0-4/§19: the regenerated animal initialisation must match the
+    # teacher's recorded initial model hash.
+    from scripts.d6_prep_inits import _regenerate_teacher_anchor
+
+    model, _, _ = _build_model(42, "animal56", torch.device("cpu"))
+    expected = state_dict_sha256(model)
+    regenerated = _regenerate_teacher_anchor(42, None, expected)
+    assert state_dict_sha256(regenerated) == expected
+
+
+def test_regenerated_teacher_anchor_rejects_wrong_hash():
+    from scripts.d6_prep_inits import _regenerate_teacher_anchor
+
+    with pytest.raises(SystemExit, match="Could not reproduce teacher initial model"):
+        _regenerate_teacher_anchor(42, None, "wrong-hash")
+
+
+def test_anchor_only_preserves_human_heads():
+    from scripts.d6_prep_inits import _regenerate_teacher_anchor, build_anchor_state
+
+    model_human, _, _ = _build_model(42, "human3", torch.device("cpu"))
+    animal_init = _regenerate_teacher_anchor.__wrapped__ if False else None
+    # Build a genuine animal initial model with the same seed.
+    model_animal, _, _ = _build_model(42, "animal56", torch.device("cpu"))
+    anchor = build_anchor_state(model_human, model_animal)
+    human_sd = model_human.state_dict()
+    animal_sd = model_animal.state_dict()
+    for key, value in anchor.items():
+        if key.startswith("encoder.backbone."):
+            assert torch.equal(value, animal_sd[key])
+        else:
+            assert torch.equal(value, human_sd[key])
+
+
+def test_csdt_alpha_zero_equals_anchor():
+    from scripts.d6_prep_inits import apply_csdt
+
+    anchor = {"encoder.backbone.a": torch.tensor([1.0, 1.0]), "decoders.head": torch.tensor([0.5])}
+    real = {"encoder.backbone.a": torch.tensor([3.0, 2.0])}
+    shuffle = {"encoder.backbone.a": torch.tensor([1.0, 0.0])}
+    merged = apply_csdt(anchor, real, shuffle, alpha=0.0)
+    for key, value in anchor.items():
+        assert torch.equal(merged[key], value)
+
+
+def test_csdt_alpha_one_exact_delta():
+    from scripts.d6_prep_inits import apply_csdt
+
+    anchor = {"encoder.backbone.a": torch.tensor([1.0, 1.0])}
+    real = {"encoder.backbone.a": torch.tensor([3.0, 2.0])}
+    shuffle = {"encoder.backbone.a": torch.tensor([1.0, 0.0])}
+    merged = apply_csdt(anchor, real, shuffle, alpha=1.0)
+    assert torch.allclose(merged["encoder.backbone.a"], torch.tensor([3.0, 3.0]))

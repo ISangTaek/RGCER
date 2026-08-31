@@ -158,6 +158,8 @@ def _write_run_metadata(params, task_names, trainer):
         "train_eval_scope": getattr(params, "train_eval_scope", "full"),
         "evaluation_scope": getattr(params, "train_eval_scope", "full"),
         "git_commit": _git_commit_hash(),
+        # Review §30: D6 aggregator second-line identity verification.
+        "d6_candidate": getattr(params, "d6_candidate", "none"),
         # D6 shuffle/counterfactual provenance (review P1-5, §51).
         "shuffle_animal_train_labels": bool(
             getattr(params, "shuffle_animal_train_labels", False)
@@ -606,6 +608,23 @@ def main(params):
                 "D6 formal candidate is missing its init provenance sidecar: "
                 f"{init_provenance_path}"
             )
+        # Review §29: actually parse the sidecar and verify it matches this
+        # candidate run (seed, artifact identity, data identity).
+        init_provenance = None
+        if init_provenance_path.is_file():
+            init_provenance = json.loads(init_provenance_path.read_text(encoding="utf-8"))
+            if int(init_provenance.get("human_seed", -1)) != int(params.seed):
+                raise ValueError(
+                    f"Init provenance human_seed {init_provenance.get('human_seed')!r} "
+                    f"does not match --seed {params.seed}"
+                )
+            if (
+                init_provenance.get("output_sha256")
+                and init_provenance["output_sha256"] != _sha256_file(params.init_state_path)
+            ):
+                raise ValueError(
+                    "Init provenance output_sha256 does not match the init state file"
+                )
         params.init_overlay_provenance = {
             "pre_overlay_model_sha256": pre_overlay_model_sha256,
             "post_overlay_model_sha256": post_overlay_model_sha256,
@@ -960,6 +979,13 @@ def build_parser():
         default=None,
         help="npz (ids, delta) with per-sample real-vs-shuffled teacher representation deltas.",
     )
+    parser.add_argument(
+        "--d6_candidate",
+        choices=["none", "b0", "b0a", "b1", "o1", "o2", "o3"],
+        default="none",
+        help="D6 micro-screen candidate identity; enables the per-candidate "
+        "init/provenance contracts (review P1-4, §27-§30).",
+    )
 
     parser.add_argument("--weighting", choices=["EW", "UW", "DWA"], default="EW")
     parser.add_argument("--optim", choices=["adam", "adamw"], default="adamw")
@@ -1053,6 +1079,51 @@ def validate_params(params):
         raise ValueError(
             "--shuffle_animal_train_labels is only valid with --toxacute_task_scope animal56"
         )
+    # D6 candidate-specific contracts (review P1-4, §27-§30).
+    d6_candidate = getattr(params, "d6_candidate", "none")
+    init_state = getattr(params, "init_state_path", None)
+    if d6_candidate != "none":
+        if params.dataset != "toxacute":
+            raise ValueError("D6 candidates run on the toxacute dataset")
+        if params.toxacute_task_scope != "human3":
+            raise ValueError("D6 candidates fine-tune the human3 task scope only")
+        if params.arch != "Graphormer":
+            raise ValueError("D6 candidates use the plain Graphormer architecture")
+        if getattr(params, "fit_conformal", True):
+            raise ValueError("D6 candidates must run with --no-fit_conformal")
+        if getattr(params, "train_eval_scope", "full") != "validation_only":
+            raise ValueError("D6 candidates must run with validation-only evaluation")
+        if getattr(params, "shuffle_animal_train_labels", False):
+            raise ValueError("D6 human candidates must not shuffle animal labels")
+    if d6_candidate in {"b0a", "b1", "o1", "o2"}:
+        if not init_state:
+            raise ValueError(f"--d6_candidate {d6_candidate} requires --init_state_path")
+        sidecar = Path(str(init_state) + ".provenance.json")
+        if not sidecar.is_file():
+            raise FileNotFoundError(f"Candidate init provenance sidecar missing: {sidecar}")
+        try:
+            provenance = json.loads(sidecar.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Init provenance sidecar is not valid JSON: {sidecar}") from exc
+        expected_modes = {"b0a": "anchor", "b1": "b1", "o1": "csdt", "o2": "clst"}
+        if provenance.get("mode") != expected_modes[d6_candidate]:
+            raise ValueError(
+                f"--d6_candidate {d6_candidate} requires init mode "
+                f"{expected_modes[d6_candidate]!r}, found {provenance.get('mode')!r}"
+            )
+        if int(provenance.get("human_seed", -1)) != int(params.seed):
+            raise ValueError("Init provenance human_seed does not match --seed")
+        params.require_init_provenance = True
+    if d6_candidate == "b0":
+        if init_state:
+            raise ValueError("--d6_candidate b0 is a Human3-only scratch run: no --init_state_path")
+        if card_lambda > 0:
+            raise ValueError("--d6_candidate b0 must not enable CARD")
+    if d6_candidate == "o3":
+        if init_state:
+            raise ValueError("--d6_candidate o3 starts from scratch: no --init_state_path")
+        if card_lambda <= 0:
+            raise ValueError("--d6_candidate o3 requires --card_lambda_delta > 0")
     params.effective_rgcer_config = resolve_effective_rgcer_config(params)
 
 

@@ -101,7 +101,7 @@ def _install_stubs(monkeypatch, tmp_path, clst_rows=None, card_rows=(["s1", "s2"
         assert int(expected_epoch) == 29
         return str(run_dir / "teacher_last.pt"), dict(stub_payload)
 
-    def _stub_verify(real_dir, shuffle_dir, expected_epoch):
+    def _stub_verify(real_dir, shuffle_dir, expected_epoch, expected_model_seed=None):
         return {
             "teacher_configuration": {"hidden_dim": 4},
             "teacher_initial_model_sha256": "teacher-init-hash",

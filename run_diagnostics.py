@@ -24,6 +24,17 @@ from representation_audit import (
     REPRESENTATION_METRIC_FIELDS,
 )
 
+# Review P1-8: CARD per-epoch distillation diagnostics (O3 monitoring).
+CARD_EPOCH_FIELDS = (
+    "card_loss_mean",
+    "card_adapter_norm_mean",
+    "card_teacher_delta_norm_mean",
+    "card_cos_mean",
+    "card_batches",
+    "card_valid_target_fraction",
+    "card_zero_target_count",
+)
+
 
 # Parameter-name prefixes per diagnostic group (plan §6.6).  Groups missing
 # from a given architecture (e.g. HPS has no router) simply record NaN.
@@ -39,6 +50,9 @@ GRAD_GROUPS = {
         "encoder.task_conditioner.adapter.adapter_down",
         "encoder.task_conditioner.adapter.adapter_up",
     ),
+    # Review P1-7: CARD adapter gradients (O3) — the RGCER adapter group does
+    # not cover these parameters.
+    "card_adapter": ("card.down", "card.up"),
     "backbone": ("encoder.backbone",),
     "prediction_heads": ("decoders.",),
 }
@@ -74,6 +88,14 @@ EPOCH_SUMMARY_FIELDS = (
     "loss_final_human3",
     "loss_base_human3",
     "loss_total_human3",
+    # Review P1-8: CARD distillation diagnostics per epoch (O3).
+    "card_loss_mean",
+    "card_adapter_norm_mean",
+    "card_teacher_delta_norm_mean",
+    "card_cos_mean",
+    "card_batches",
+    "card_valid_target_fraction",
+    "card_zero_target_count",
     "base_human3_rmse",
     "route_human3_rmse",
     "final_human3_rmse",
@@ -237,6 +259,7 @@ class RunDiagnosticsWriter:
         """Append one epoch's summary/path/routing/gradient/representation rows."""
 
         self._flush_gradients(epoch)
+        card_stats = train_result.get("card", {}) or {}
         routing = validation_result.get("routing", {}) or {}
         for task, values in routing.items():
             self.routing_rows.append(
@@ -277,6 +300,9 @@ class RunDiagnosticsWriter:
             "loss_final_human3": self._human3_loss({k: _float(v) for k, v in final_losses.items()}),
             "loss_base_human3": self._human3_loss({k: _float(v) for k, v in base_losses.items()}),
             "loss_total_human3": self._human3_loss({k: _float(v) for k, v in total_losses.items()}),
+            # Review P1-8: CARD distillation diagnostics per epoch (O3);
+            # non-CARD runs leave these blank in the CSV.
+            **{field: _float(card_stats.get(field)) for field in CARD_EPOCH_FIELDS},
             "base_human3_rmse": self._human3_macro(epoch_path, "base", "rmse"),
             "route_human3_rmse": self._human3_macro(epoch_path, "route", "rmse"),
             "final_human3_rmse": self._human3_macro(epoch_path, "final", "rmse"),

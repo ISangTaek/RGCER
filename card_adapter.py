@@ -76,6 +76,8 @@ class CardAdapter(nn.Module):
             "adapter_norm_sum": 0.0,
             "teacher_delta_norm_sum": 0.0,
             "cos_sum": 0.0,
+            "valid_target_count": 0,
+            "zero_target_count": 0,
         }
 
     def pop_epoch_stats(self) -> dict:
@@ -86,6 +88,11 @@ class CardAdapter(nn.Module):
             "card_teacher_delta_norm_mean": self.epoch_stats["teacher_delta_norm_sum"] / count,
             "card_cos_mean": self.epoch_stats["cos_sum"] / count,
             "card_batches": self.epoch_stats["loss_count"],
+            "card_valid_target_fraction": (
+                self.epoch_stats["valid_target_count"]
+                / max(self.epoch_stats["valid_target_count"] + self.epoch_stats["zero_target_count"], 1)
+            ),
+            "card_zero_target_count": self.epoch_stats["zero_target_count"],
         }
         self.reset_epoch_stats()
         return stats
@@ -99,6 +106,13 @@ class CardAdapter(nn.Module):
             (batch_position, self.id_to_index.get(sample_id))
             for batch_position, sample_id in enumerate(sample_ids)
         ]
+        # Review P1-6: a collator fault that drops sample ids would silently
+        # disable the distillation term — fail fast instead.
+        if self.training and len(sample_ids) != representation.size(0):
+            raise RuntimeError(
+                "CARD training requires one sample_id per representation row: "
+                f"ids={len(sample_ids)} batch={representation.size(0)}"
+            )
         if self.training:
             missing = [
                 sample_id
@@ -129,10 +143,25 @@ class CardAdapter(nn.Module):
             aligned = adapter_output[batch_positions]
             raw_delta = self.delta_table[table_positions]
             teacher_delta_norm = raw_delta.norm(dim=-1)
-            delta = F.normalize(raw_delta, dim=-1)
-            aligned = F.normalize(aligned, dim=-1)
-            cosine = (aligned * delta).sum(dim=-1)
-            loss = (1.0 - cosine).mean()
+
+            # Review P0-1: cosine on a zero-init adapter produces a ~1e12
+            # gradient singularity (F.normalize default eps=1e-12).  Train on a
+            # unit-direction finite MSE instead: finite at aligned == 0, with an
+            # initial per-sample loss ~1 so lambda_delta keeps its intended
+            # relative weight.  Cosine stays a read-only diagnostic.
+            valid_target = teacher_delta_norm > 1e-8
+            if bool(valid_target.any()):
+                aligned_valid = aligned[valid_target]
+                target_valid = F.normalize(raw_delta[valid_target], dim=-1, eps=1e-8)
+                per_sample_delta_loss = (aligned_valid - target_valid).pow(2).sum(dim=-1)
+                loss = per_sample_delta_loss.mean()
+                with torch.no_grad():
+                    cosine = F.cosine_similarity(
+                        aligned_valid, target_valid, dim=-1, eps=1e-8
+                    )
+            else:
+                loss = representation.new_zeros(())
+                cosine = torch.zeros(0, device=representation.device)
         else:
             raw_delta = self.delta_table[:0]
             teacher_delta_norm = raw_delta.new_zeros(())
@@ -151,5 +180,9 @@ class CardAdapter(nn.Module):
                     adapter_output.detach().norm(dim=-1).mean()
                 )
                 self.epoch_stats["teacher_delta_norm_sum"] += float(teacher_delta_norm.mean())
-                self.epoch_stats["cos_sum"] += float(cosine.mean())
+                self.epoch_stats["cos_sum"] += float(cosine.mean()) if cosine.numel() else 0.0
+                self.epoch_stats["valid_target_count"] += int(valid_target.sum())
+                self.epoch_stats["zero_target_count"] += int(
+                    valid_target.numel() - valid_target.sum()
+                )
         return representation

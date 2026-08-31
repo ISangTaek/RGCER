@@ -1185,6 +1185,12 @@ class Trainer:
             "router_temperature": getattr(self.args, "router_temperature", 1.0),
             "exclude_target_from_sources": getattr(self.args, "exclude_target_from_sources", True),
             "use_factorized_prompt": factorized,
+            # Review P1-10: CARD configuration belongs to the architecture
+            # contract — a resumed O3 run with a different lambda/bottleneck
+            # must be rejected even when state shapes still agree.
+            "card_enabled": bool(float(getattr(self.args, "card_lambda_delta", 0.0)) > 0),
+            "card_lambda_delta": float(getattr(self.args, "card_lambda_delta", 0.0)),
+            "card_bottleneck": int(getattr(self.args, "card_bottleneck", 32)),
             "task_metadata": [
                 getattr(item, "__dict__", {})
                 for item in getattr(prompt_bank, "metadata", [])
@@ -1415,6 +1421,16 @@ class Trainer:
         ):
             if stored_architecture.get(name) != current_config.get(name):
                 raise ValueError(f"Checkpoint setting {name!r} does not match current configuration")
+        # Review P1-10: enforce the CARD configuration contract only when at
+        # least one side records it, so pre-D6 checkpoints remain resumable.
+        stored_card = stored_architecture.get("card_enabled")
+        current_card = current_config.get("card_enabled")
+        if stored_card is not None or current_card:
+            for name in ("card_enabled", "card_lambda_delta", "card_bottleneck"):
+                if stored_architecture.get(name) != current_config.get(name):
+                    raise ValueError(
+                        f"Checkpoint CARD setting {name!r} does not match current configuration"
+                    )
         if int(checkpoint["hps_warmup_epochs"]) != int(getattr(self.args, "hps_warmup_epochs", 0)):
             raise ValueError("Checkpoint hps_warmup_epochs does not match current configuration")
         current_rgcer = self._rgcer_config()

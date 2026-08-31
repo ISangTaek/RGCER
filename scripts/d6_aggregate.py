@@ -24,6 +24,8 @@ import json
 import math
 from pathlib import Path
 
+import json
+
 HUMAN_TASKS = ["man_oral_TDLo", "women_oral_TDLo", "human_oral_TDLo"]
 STABLE_WINDOW = 5
 CANDIDATES = {
@@ -54,7 +56,56 @@ TIE_MARGIN = 0.01
 STAGE_LAST_EPOCH = {"stage-a": 19, "stage-b": 39, "stage-c": 99}
 
 
-def _read_csv(path: Path) -> list[dict]:
+def _read_json(path) -> dict:
+    path = Path(path)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def check_d6_run_contract(
+    run_dir: Path,
+    candidate: str,
+    seed: int,
+    expected_last_epoch: int,
+) -> tuple[list[str], dict]:
+    """Review P1-5/§31-§32: the selector cannot trust a directory name.
+
+    Every D6 run must carry an args.json/run_metadata.json pair proving it is
+    the requested candidate at the requested seed with the validation-only,
+    no-CQR protocol; it must also record its data identity so the stage can
+    verify manifest/datastore consistency across runs.
+    """
+
+    violations: list[str] = []
+    args_payload = _read_json(run_dir / "args.json")
+    metadata = _read_json(run_dir / "run_metadata.json")
+
+    def _check(label: str, actual, expected) -> None:
+        if actual != expected:
+            violations.append(f"{label}: found {actual!r}, expected {expected!r}")
+
+    _check("args.seed", args_payload.get("seed"), seed)
+    _check("args.dataset", args_payload.get("dataset"), "toxacute")
+    _check("args.toxacute_task_scope", args_payload.get("toxacute_task_scope"), "human3")
+    _check("args.train_eval_scope", args_payload.get("train_eval_scope"), "validation_only")
+    _check("args.fit_conformal", args_payload.get("fit_conformal"), False)
+    _check("args.epochs", args_payload.get("epochs"), expected_last_epoch + 1)
+    _check("run_metadata.d6_candidate", metadata.get("d6_candidate"), candidate)
+
+    identity = {
+        "manifest_sha256": metadata.get("manifest_sha256"),
+        "datastore_fingerprint": metadata.get("datastore_fingerprint"),
+        "split_seed": metadata.get("split_seed"),
+    }
+    return violations, identity
+
+
+def _read_csv(path) -> list[dict]:
+    path = Path(path)
     if not path.exists():
         return []
     with path.open(newline="", encoding="utf-8") as handle:
@@ -117,6 +168,16 @@ def summarize_run(
     if run_dir is None or not run_dir.exists():
         row["status"] = "MISSING_RUN"
         return row
+    # Review P1-5/§31-32: run identity/config contract is checked before any
+    # metric computation — a mislabelled run must never be ranked.
+    violations, identity = check_d6_run_contract(
+        run_dir, candidate, seed, expected_last_epoch
+    )
+    if violations:
+        row["status"] = "CONTRACT_VIOLATION"
+        row["contract_violations"] = "; ".join(violations)
+        return row
+    row["identity"] = identity
     trajectory_rows = trajectory(run_dir, expected_last_epoch)
     if not trajectory_rows:
         row["status"] = "INCOMPLETE_TRAJECTORY"
@@ -173,10 +234,20 @@ def endpoint_stable(run_dir: Path, epochs: set[int]) -> dict[str, float]:
         for row in _read_csv(run_dir / "diagnostics" / "human3_path_metrics.csv")
         if row["path"] == "final" and int(row["epoch"]) in epochs
     ]
-    return {
-        task: _finite_mean([row["rmse"] for row in rows if row["task"] == task])
-        for task in HUMAN_TASKS
-    }
+    result = {}
+    for task in HUMAN_TASKS:
+        task_rows = [row for row in rows if row["task"] == task]
+        observed_epochs = {int(row["epoch"]) for row in task_rows}
+        # Review P1-9: every endpoint must have all stable-window epochs; a
+        # partial endpoint trajectory must never produce a finite mean.
+        if observed_epochs != epochs:
+            raise SystemExit(
+                "INCOMPLETE_ENDPOINT_TRAJECTORY: "
+                f"{run_dir} task {task} observed epochs {sorted(observed_epochs)}, "
+                f"expected {sorted(epochs)}"
+            )
+        result[task] = _finite_mean([row["rmse"] for row in task_rows])
+    return result
 
 
 def _endpoint_means(rows: list[dict], candidate: str) -> dict[str, float]:
@@ -187,6 +258,21 @@ def _endpoint_means(rows: list[dict], candidate: str) -> dict[str, float]:
         task: _finite_mean([row.get(f"{task.split('_')[0]}_rmse") for row in passed])
         for task in HUMAN_TASKS
     }
+
+
+def _verify_stage_identity(rows: list[dict], stage: str) -> None:
+    """Review §32: all runs inside one stage must share the same data identity."""
+
+    identities = {
+        json.dumps(row.get("identity") or {}, sort_keys=True)
+        for row in rows
+        if row.get("identity")
+    }
+    if len(identities) > 1:
+        raise SystemExit(
+            f"{stage}: runs disagree on data identity (manifest/datastore/split_seed): "
+            f"{identities}"
+        )
 
 
 def stage_a(runs_root: Path, seed: int, output_dir: Path, trace: dict) -> list[str]:
@@ -205,6 +291,7 @@ def stage_a(runs_root: Path, seed: int, output_dir: Path, trace: dict) -> list[s
         if candidate == "b0a":
             b0a_row = row
 
+    _verify_stage_identity(rows, "Stage A")
     if b0_row is None:
         raise SystemExit("Stage A requires a PASS B0 Human3-only reference run")
     b0_stable = float(b0_row["stable_rmse"])
@@ -360,6 +447,7 @@ def stage_b(runs_root: Path, candidates: list[str], seeds: list[int], output_dir
                 if candidate == "b0a":
                     b0a_by_seed[seed] = float(row["stable_rmse"])
 
+    _verify_stage_identity(summary_rows, "Stage B")
     gate_rows = []
     verdicts = []
     tie_break = None
@@ -577,6 +665,7 @@ def stage_c(runs_root: Path, top1: str, seeds: list[int], output_dir: Path, trac
         for task in HUMAN_TASKS
         if candidate_endpoint_means[task] <= b0_endpoint_means[task] + 1e-9
     )
+    _verify_stage_identity(summary_rows, "Stage C")
     # Review P0-5: Stage C is the 5-seed final validation — every seed pair
     # must be present before the gate can pass.
     complete_seed_pairs = len(gains) == len(seeds)
@@ -601,13 +690,34 @@ def stage_c(runs_root: Path, top1: str, seeds: list[int], output_dir: Path, trac
         "endpoint_means_b0": b0_endpoint_means,
         "gate_pass": gate_pass,
     }
-    if top1 == "o1" and b0a_stable:
+    if top1 == "o1":
+        # Review P0-2/§15: the anchor causal gate must hold at Stage C too —
+        # O1 passing B0 is not enough if it has lost to the anchor-only
+        # control (the gain would come from the anchor initialisation, not
+        # from the semantic delta).  Strong evidence (>=0.01) is reported but
+        # only >0 is required, consistent with Stage B.
         anchor_gains = [
             b0a_stable[seed] - candidate_stable[seed]
             for seed in seeds
             if seed in candidate_stable and seed in b0a_stable
         ]
-        gate["anchor_semantic_gain_mean"] = _finite_mean(anchor_gains)
+        complete_anchor_pairs = len(anchor_gains) == len(seeds)
+        mean_anchor_gain = _finite_mean(anchor_gains)
+        anchor_gate_pass = bool(
+            complete_anchor_pairs and mean_anchor_gain > ANCHOR_SEMANTIC_GAIN_MIN
+        )
+        gate.update(
+            {
+                "anchor_semantic_gain_mean": mean_anchor_gain,
+                "anchor_seed_pairs": len(anchor_gains),
+                "complete_anchor_pairs": complete_anchor_pairs,
+                "anchor_gate_pass": anchor_gate_pass,
+                "anchor_strong_evidence": bool(
+                    mean_anchor_gain >= ANCHOR_SEMANTIC_GAIN_STRONG
+                ),
+            }
+        )
+        gate["gate_pass"] = bool(gate["gate_pass"] and anchor_gate_pass)
     trace["stage_c"] = {"top1": top1, "seeds": seeds, "gate": gate}
 
     _write_csv(

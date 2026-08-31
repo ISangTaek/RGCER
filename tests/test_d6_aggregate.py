@@ -28,9 +28,37 @@ def _write_run(
     seed,
     macro_by_epoch,
     endpoint_by_epoch=None,
+    args_epochs=None,
 ):
-    diagnostics = root / candidate / tag / f"seed_{seed}" / "diagnostics"
+    run_dir = root / candidate / tag / f"seed_{seed}"
+    diagnostics = run_dir / "diagnostics"
     diagnostics.mkdir(parents=True, exist_ok=True)
+    epochs = max(macro_by_epoch) + 1 if macro_by_epoch else 0
+    (run_dir / "args.json").write_text(
+        json.dumps(
+            {
+                "seed": seed,
+                "dataset": "toxacute",
+                "toxacute_task_scope": "human3",
+                "train_eval_scope": "validation_only",
+                "fit_conformal": False,
+                "epochs": args_epochs if args_epochs is not None else epochs,
+                "split_seed": 42,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "run_metadata.json").write_text(
+        json.dumps(
+            {
+                "d6_candidate": candidate,
+                "manifest_sha256": "manifest-test",
+                "datastore_fingerprint": "datastore-test",
+                "split_seed": 42,
+            }
+        ),
+        encoding="utf-8",
+    )
     with (diagnostics / "epoch_summary.csv").open("w", encoding="utf-8") as handle:
         handle.write("epoch,val_human3_macro_rmse\n")
         for epoch, value in sorted(macro_by_epoch.items()):
@@ -57,7 +85,10 @@ def test_candidate_run_dir_is_seed_specific(tmp_path):
 
 
 def test_summarize_run_requires_complete_stage_a(tmp_path):
-    _write_run(tmp_path, "b1", "d6_b1_e20", 42, {epoch: 1.0 for epoch in range(0, 15)})
+    _write_run(
+        tmp_path, "b1", "d6_b1_e20", 42, {epoch: 1.0 for epoch in range(0, 15)},
+        args_epochs=20,
+    )
     from scripts.d6_aggregate import summarize_run
 
     row = summarize_run(
@@ -67,7 +98,10 @@ def test_summarize_run_requires_complete_stage_a(tmp_path):
 
 
 def test_summarize_run_requires_complete_stage_b(tmp_path):
-    _write_run(tmp_path, "b1", "d6_b1_e40", 42, {epoch: 1.0 for epoch in range(0, 8)})
+    _write_run(
+        tmp_path, "b1", "d6_b1_e40", 42, {epoch: 1.0 for epoch in range(0, 8)},
+        args_epochs=40,
+    )
     from scripts.d6_aggregate import summarize_run
 
     row = summarize_run(
@@ -140,6 +174,14 @@ def test_stage_c_gain_is_positive_when_candidate_is_better(tmp_path):
                 for epoch in range(95, 100)
             },
         )
+        # Review P0-2: the anchor causal gate requires B0A runs for O1.
+        _write_run(
+            tmp_path, "b0a", "d6_b0a_e100", seed, _flat_macro(99, 1.01),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 1.0, "women_oral_TDLo": 1.0, "human_oral_TDLo": 1.0}
+                for epoch in range(95, 100)
+            },
+        )
         _write_run(
             tmp_path, "o1", "d6_o1_e100", seed, _flat_macro(99, 1.00),
             endpoint_by_epoch={
@@ -152,6 +194,7 @@ def test_stage_c_gain_is_positive_when_candidate_is_better(tmp_path):
     gate = trace["stage_c"]["gate"]
     assert gate["paired_mean_stable_gain"] == pytest.approx(0.10)
     assert gate["positive_seeds"] == 5
+    assert gate["anchor_gate_pass"] is True
     assert gate["gate_pass"] is True
 
 
@@ -393,3 +436,105 @@ def test_o1_requires_anchor_control(tmp_path):
     summary = {row["candidate"]: row for row in csv_rows(tmp_path / "D6A_MICROSCREEN_SUMMARY.csv")}
     assert summary["o1"]["meets_original_minimum"] in ("False", "")
     assert "o1" not in top2
+
+
+def test_stage_c_o1_fails_when_it_does_not_beat_anchor(tmp_path):
+    # Review P0-2 synthetic: B0=1.10, B0A=0.95, O1=1.00 — O1 beats B0 but
+    # loses to the anchor-only control, so the causal gate must fail.
+    seeds = [42, 43, 44, 45, 46]
+    for seed in seeds:
+        _write_run(
+            tmp_path, "b0", "d6_b0_e100", seed, _flat_macro(99, 1.10),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 1.0, "women_oral_TDLo": 1.0, "human_oral_TDLo": 1.0}
+                for epoch in range(95, 100)
+            },
+        )
+        _write_run(
+            tmp_path, "b0a", "d6_b0a_e100", seed, _flat_macro(99, 0.95),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 0.8, "women_oral_TDLo": 0.8, "human_oral_TDLo": 0.8}
+                for epoch in range(95, 100)
+            },
+        )
+        _write_run(
+            tmp_path, "o1", "d6_o1_e100", seed, _flat_macro(99, 1.00),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 0.9, "women_oral_TDLo": 0.9, "human_oral_TDLo": 0.9}
+                for epoch in range(95, 100)
+            },
+        )
+    trace = {}
+    stage_c(tmp_path, "o1", seeds, tmp_path, trace)
+    gate = trace["stage_c"]["gate"]
+    assert gate["paired_mean_stable_gain"] > 0
+    assert gate["anchor_semantic_gain_mean"] < 0
+    assert gate["anchor_gate_pass"] is False
+    assert gate["gate_pass"] is False
+
+
+def test_stage_c_o1_requires_all_five_anchor_pairs(tmp_path):
+    # Review P0-2/§17: B0A missing seed46 → the anchor gate cannot be
+    # verified and the candidate must fail even though it beats B0 everywhere.
+    seeds = [42, 43, 44, 45, 46]
+    for seed in seeds:
+        _write_run(
+            tmp_path, "b0", "d6_b0_e100", seed, _flat_macro(99, 1.10),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 1.0, "women_oral_TDLo": 1.0, "human_oral_TDLo": 1.0}
+                for epoch in range(95, 100)
+            },
+        )
+        _write_run(
+            tmp_path, "o1", "d6_o1_e100", seed, _flat_macro(99, 1.00),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 0.9, "women_oral_TDLo": 0.9, "human_oral_TDLo": 0.9}
+                for epoch in range(95, 100)
+            },
+        )
+    for seed in seeds[:-1]:  # B0A missing seed46
+        _write_run(
+            tmp_path, "b0a", "d6_b0a_e100", seed, _flat_macro(99, 1.01),
+            endpoint_by_epoch={
+                epoch: {"man_oral_TDLo": 1.0, "women_oral_TDLo": 1.0, "human_oral_TDLo": 1.0}
+                for epoch in range(95, 100)
+            },
+        )
+    trace = {}
+    stage_c(tmp_path, "o1", seeds, tmp_path, trace)
+    gate = trace["stage_c"]["gate"]
+    assert gate["complete_anchor_pairs"] is False
+    assert gate["gate_pass"] is False
+
+
+def test_selector_rejects_wrong_d6_candidate_metadata(tmp_path):
+    # Review P1-5/§31-§32: a directory named o1 whose metadata claims o2 must
+    # be rejected instead of silently ranked as O1.
+    from scripts.d6_aggregate import summarize_run
+
+    _write_run(tmp_path, "o1", "d6_o1_e40", 42, _flat_macro(39, 1.0))
+    metadata_path = tmp_path / "o1" / "d6_o1_e40" / "seed_42" / "run_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["d6_candidate"] = "o2"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    run_dir = tmp_path / "o1" / "d6_o1_e40" / "seed_42"
+    row = summarize_run(run_dir, "o1", 42, expected_last_epoch=39)
+    assert row["status"] == "CONTRACT_VIOLATION"
+
+
+def test_endpoint_stable_requires_all_five_epochs(tmp_path):
+    # Review P1-9: a partial endpoint trajectory inside the stable window must
+    # abort instead of producing a finite mean.
+    from scripts.d6_aggregate import endpoint_stable
+
+    run_dir = tmp_path / "run"
+    rows_dir = run_dir / "diagnostics"
+    rows_dir.mkdir(parents=True, exist_ok=True)
+    with (rows_dir / "human3_path_metrics.csv").open("w", encoding="utf-8") as handle:
+        handle.write("epoch,task,path,rmse\n")
+        for epoch in (95, 96, 97, 98):  # 99 missing
+            for task in HUMAN_TASKS:
+                handle.write(f"{epoch},{task},final,1.0\n")
+    with pytest.raises(SystemExit, match="INCOMPLETE_ENDPOINT_TRAJECTORY"):
+        endpoint_stable(run_dir, epochs={95, 96, 97, 98, 99})

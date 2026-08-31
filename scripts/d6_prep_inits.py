@@ -156,7 +156,12 @@ def _teacher_state_path(run_dir: Path) -> Path:
 
 
 def _load_teacher_checkpoint(run_dir: Path, expected_epoch: int) -> tuple[Path, dict]:
-    """Review P1-3: strict checkpoint-level teacher contract."""
+    """Review P1-3: strict checkpoint-level teacher contract.
+
+    D6 teachers must come from validation-only runs without conformal
+    fitting — a teacher that has already seen calibration/test (or was
+    selected with CQR) must never enter a counterfactual pipeline.
+    """
 
     checkpoint_path = _teacher_state_path(run_dir)
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -173,6 +178,14 @@ def _load_teacher_checkpoint(run_dir: Path, expected_epoch: int) -> tuple[Path, 
             f"teacher checkpoint epoch mismatch: {checkpoint_path} has epoch "
             f"{observed_epoch}, expected {expected_epoch} (fixed last-epoch contract)"
         )
+    configuration = dict(payload.get("configuration") or {})
+    if configuration.get("train_eval_scope") != "validation_only":
+        raise SystemExit(
+            "D6 teacher must be trained with validation-only evaluation scope, found "
+            f"{configuration.get('train_eval_scope')!r} (review P1-3)"
+        )
+    if bool(configuration.get("fit_conformal", True)):
+        raise SystemExit("D6 teacher must use --no-fit_conformal (review P1-3)")
     task_names = list(payload.get("task_names", []))
     if sorted(task_names) != sorted(ANIMAL_SOURCE_TASKS):
         human_present = [name for name in task_names if name in HUMAN_TARGET_TASKS]
@@ -189,7 +202,12 @@ def _load_teacher_checkpoint(run_dir: Path, expected_epoch: int) -> tuple[Path, 
     return checkpoint_path, payload
 
 
-def _verify_teacher_pair(real_dir: Path, shuffle_dir: Path, expected_epoch: int) -> dict:
+def _verify_teacher_pair(
+    real_dir: Path,
+    shuffle_dir: Path,
+    expected_epoch: int,
+    expected_model_seed: int,
+) -> dict:
     """Review P1-2/P1-3: matched real/shuffle teacher pair contract."""
 
     real_path, real_payload = _load_teacher_checkpoint(real_dir, expected_epoch)
@@ -229,6 +247,15 @@ def _verify_teacher_pair(real_dir: Path, shuffle_dir: Path, expected_epoch: int)
         (real_payload.get("reproducibility") or {}).get("base_seed"),
         (shuffle_payload.get("reproducibility") or {}).get("base_seed"),
     )
+    # Review P1-1: the teacher pair must also be trained at the same model
+    # seed as the human run (Stage B/C seed-paired protocol).
+    for label in ("real", "shuffle"):
+        payload = real_payload if label == "real" else shuffle_payload
+        pair_seed = (payload.get("reproducibility") or {}).get("base_seed")
+        if pair_seed is not None and int(pair_seed) != int(expected_model_seed):
+            mismatch.append(
+                f"{label} teacher base seed {pair_seed} != expected model seed {expected_model_seed}"
+            )
     real_configuration = dict(real_payload.get("configuration") or {})
     shuffle_configuration = dict(shuffle_payload.get("configuration") or {})
     # Review P0-3: compare only the scientific training fields; orchestration
@@ -264,7 +291,29 @@ def _verify_teacher_pair(real_dir: Path, shuffle_dir: Path, expected_epoch: int)
             raise SystemExit(f"missing run_metadata.json under {run_dir}")
         metadata_by_label[label] = json.loads(metadata_path.read_text(encoding="utf-8"))
         init_hashes[label] = metadata_by_label[label].get("initial_model_sha256")
+    # Review P1-2: a missing initial hash on either side makes the
+    # counterfactual delta unverifiable — fail fast instead of passing on
+    # None == None.
+    for label in ("real", "shuffle"):
+        if not init_hashes[label]:
+            mismatch.append(f"{label} teacher lacks initial_model_sha256")
     require_equal("initial_model_sha256", init_hashes["real"], init_hashes["shuffle"])
+
+    # Review P1-11: cross-check the shuffle manifest file against the hash
+    # recorded in the run metadata — provenance is more than "a string".
+    shuffle_manifest_path = Path(shuffle_dir) / "D6_ANIMAL_SHUFFLE_MANIFEST.json"
+    if shuffle_manifest_path.exists():
+        manifest = json.loads(shuffle_manifest_path.read_text(encoding="utf-8"))
+        require_equal(
+            "D6_ANIMAL_SHUFFLE_MANIFEST.animal_shuffle_mapping_sha256",
+            manifest.get("animal_shuffle_mapping_sha256"),
+            metadata_by_label["shuffle"].get("animal_shuffle_mapping_sha256"),
+        )
+        require_equal(
+            "D6_ANIMAL_SHUFFLE_MANIFEST.animal_shuffle_seed",
+            manifest.get("animal_shuffle_seed"),
+            metadata_by_label["shuffle"].get("animal_shuffle_seed"),
+        )
 
     # Review P1-2: the shuffle mapping identity is part of the counterfactual
     # contract — the shuffle teacher must record it.
@@ -573,7 +622,12 @@ def main() -> None:
 
     if args.mode == "card_table":
         # Review P1-2: CARD deltas are only meaningful for a matched pair.
-        matched = _verify_teacher_pair(teacher_real_dir, teacher_shuffle_dir, args.expected_teacher_epoch)
+        matched = _verify_teacher_pair(
+            teacher_real_dir,
+            teacher_shuffle_dir,
+            args.expected_teacher_epoch,
+            expected_model_seed=args.human_seed,
+        )
         provenance.update(matched)
         template_config = matched["teacher_configuration"]
         model_real, _, teacher_tasks = _build_model(args.human_seed, "animal56", device, template_config)
@@ -626,7 +680,12 @@ def main() -> None:
     matched_init_hash = None
 
     if args.mode != "b1":
-        matched = _verify_teacher_pair(teacher_real_dir, teacher_shuffle_dir, args.expected_teacher_epoch)
+        matched = _verify_teacher_pair(
+            teacher_real_dir,
+            teacher_shuffle_dir,
+            args.expected_teacher_epoch,
+            expected_model_seed=args.human_seed,
+        )
         provenance.update(matched)
         matched_init_hash = matched["teacher_initial_model_sha256"]
         template_config = matched["teacher_configuration"]
@@ -689,11 +748,13 @@ def main() -> None:
         merged = apply_csdt(theta_anchor, state_real, state_shuffle, args.alpha)
 
         if args.delta_csv:
+            # Review P2: the semantic delta is applied on top of the anchor,
+            # so the ratio denominator is the anchor backbone norm.
             rows = []
-            for key in sorted(theta0):
+            for key in sorted(theta_anchor):
                 if not key.startswith(BACKBONE_PREFIX):
                     continue
-                theta0_norm = float(theta0[key].float().norm())
+                anchor_norm = float(theta_anchor[key].float().norm())
                 real_norm = float(state_real[key].float().norm())
                 shuffle_norm = float(state_shuffle[key].float().norm())
                 delta_norm = float((state_real[key].float() - state_shuffle[key].float()).norm())
@@ -701,11 +762,11 @@ def main() -> None:
                     {
                         "layer": key,
                         "parameter_group": key,
-                        "theta0_norm": theta0_norm,
+                        "anchor_norm": anchor_norm,
                         "real_norm": real_norm,
                         "shuffle_norm": shuffle_norm,
                         "semantic_delta_norm": delta_norm,
-                        "semantic_delta_ratio": (delta_norm / theta0_norm) if theta0_norm > 0 else float("nan"),
+                        "semantic_delta_ratio": (delta_norm / anchor_norm) if anchor_norm > 0 else float("nan"),
                         "alpha": args.alpha,
                     }
                 )
