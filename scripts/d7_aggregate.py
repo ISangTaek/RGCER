@@ -183,10 +183,12 @@ def summarize_run(run_dir: Path | None, candidate: str, seed: int, expected_last
     args_payload = _read_json(run_dir / "args.json")
     metadata = _read_json(run_dir / "run_metadata.json")
     # Fifth-review P1-6: carry the data identity for the stage cross-check.
+    # split_seed follows the D6 convention (run metadata) so identities from
+    # both summarizers compare equal for identical data lineages.
     row["identity"] = {
         "manifest_sha256": metadata.get("manifest_sha256"),
         "datastore_fingerprint": metadata.get("datastore_fingerprint"),
-        "split_seed": args_payload.get("split_seed"),
+        "split_seed": metadata.get("split_seed"),
     }
     trajectory_rows = trajectory(run_dir, expected_last_epoch)
     if not trajectory_rows:
