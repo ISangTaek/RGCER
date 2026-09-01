@@ -609,6 +609,7 @@ def _write_d7_candidate_run(root, candidate, stable, endpoints):
         "manifest_sha256": "manifest-test",
         "datastore_fingerprint": "datastore-test",
         "feature_schema_version": "schema-test",
+        "split_seed": 42,
     }
     metadata["d7_artifact_contract"] = {
         "mode": ARTIFACT_CANDIDATES[candidate],
