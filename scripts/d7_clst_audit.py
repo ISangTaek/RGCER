@@ -91,7 +91,12 @@ def _layer_outputs(model, batches, device, expected_ids=None):
         with torch.no_grad():
             for batch in batches:
                 batch = batch.to(device)
-                hidden = model.encoder.backbone(batch)[:, 0, :].detach().float().cpu()
+                output = model.encoder.backbone(batch)
+                if output.dim() == 3:
+                    # (batch, tokens, dim) -> CLS pooling; the real Graphormer
+                    # backbone already returns the pooled (batch, dim) tensor.
+                    output = output[:, 0, :]
+                hidden = output.detach().float().cpu()
                 for position, sample_id in enumerate(batch.sample_id):
                     final[str(sample_id)] = hidden[position]
     finally:
