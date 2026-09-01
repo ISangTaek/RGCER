@@ -39,7 +39,21 @@ from d6_prep_inits import (  # noqa: E402  (checkpoint loader only — NOT the o
     _build_model,
     _human_loaders,
     _load_teacher_checkpoint,
+    _verify_teacher_pair,
 )
+
+
+def verify_audit_teachers(real_dir, shuffle_dir, expected_epoch: int, expected_model_seed: int) -> dict:
+    """Fifth-review P1-5 (§40-§43): the audit MUST consume a matched
+    real/shuffle teacher pair — otherwise initialization/split noise could be
+    misread as a semantic difference.  Reuses the full D6 pair contract."""
+
+    return _verify_teacher_pair(
+        Path(real_dir),
+        Path(shuffle_dir),
+        expected_epoch,
+        expected_model_seed=expected_model_seed,
+    )
 
 
 def _fixed_probe_batches(train_loaders: dict, probe_size: int):
@@ -141,7 +155,12 @@ def main() -> None:
     shuffle_path, shuffle_payload = _load_teacher_checkpoint(
         Path(args.teacher_shuffle_dir), args.expected_teacher_epoch
     )
-    template_config = dict(real_payload.get("configuration") or {})
+    # §40-§43: prove the pair is matched (init hash / seed / manifest /
+    # datastore / sanity table) BEFORE any representation comparison.
+    matched = verify_audit_teachers(
+        args.teacher_real_dir, args.teacher_shuffle_dir, args.expected_teacher_epoch, args.human_seed
+    )
+    template_config = matched["teacher_configuration"]
 
     model_real = _build_model(args.human_seed, "animal56", device, template_config)[0]
     model_real.load_state_dict(real_payload["model_state"], strict=True)
@@ -228,6 +247,16 @@ def main() -> None:
         "teacher_real_checkpoint": str(real_path),
         "teacher_shuffle_checkpoint": str(shuffle_path),
         "max_final_pooled_difference": max(final_diff_norms.values()),
+        # §43: matched-teacher provenance evidence.
+        "matched_teacher_provenance": {
+            "teacher_initial_model_sha256": matched.get("teacher_initial_model_sha256"),
+            "split_manifest_hash": matched.get("split_manifest_hash"),
+            "datastore_fingerprint": matched.get("datastore_fingerprint"),
+            "feature_schema_version": matched.get("feature_schema_version"),
+            "animal_shuffle_mapping_sha256": matched.get("animal_shuffle_mapping_sha256"),
+            "animal_shuffle_seed": matched.get("animal_shuffle_seed"),
+            "teacher_real_epoch": matched.get("teacher_real_epoch"),
+        },
     }
     output_json = Path(args.output_json)
     output_json.parent.mkdir(parents=True, exist_ok=True)

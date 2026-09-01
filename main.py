@@ -104,13 +104,19 @@ def _sha256_file(path):
 
 # Review P0-2 (fourth round §17): every artifact-consuming D6 candidate must
 # present a provenance sidecar generated in exactly this mode.  D7 reuses the
-# same validator for its CSDT variants (plan §19/§25).
+# same validator: the S-family MUST start from the seed-matched B1
+# (sequential-transfer) initialization — a scratch backbone would turn the
+# representation-preservation question into a meaningless one (fifth review
+# P0-1).
 D6_PROVENANCE_MODE = {
     "b0a": "anchor",
     "b1": "b1",
     "o1": "csdt",
     "o2": "clst",
     "o3": "card_table",
+    "s1": "b1",
+    "s2": "b1",
+    "s3": "b1",
     "o4": "csdt",
     "o5": "csdt_bounded",
 }
@@ -276,8 +282,22 @@ def _write_run_metadata(params, task_names, trainer):
         "initial_model_sha256": initial_model_sha256,
         "manifest_sha256": data_metadata.get("split_manifest_hash"),
         "datastore_fingerprint": data_metadata.get("datastore_fingerprint"),
+        "feature_schema_version": data_metadata.get(
+            "feature_schema_version", FEATURE_SCHEMA_VERSION
+        ),
         "checkpoint_version": 6 if data_metadata else 4,
     }
+    # D7 P2-1 (fifth review): the trainable-count summary is written before
+    # the epoch loop applies the freeze schedule, so record the schedule
+    # explicitly instead of letting architecture_summary.txt mislead.
+    freeze_epochs = int(getattr(params, "freeze_backbone_epochs", 0) or 0)
+    if freeze_epochs > 0:
+        metadata["effective_backbone_freeze_schedule"] = (
+            f"backbone FROZEN epochs 0..{freeze_epochs - 1}; unfrozen "
+            f"{freeze_epochs}..{getattr(params, 'epochs', '?') - 1} with "
+            f"backbone_lr_multiplier={getattr(params, 'backbone_lr_multiplier', 1.0)}; "
+            "verify via gradient_norms.csv, not the trainable parameter count"
+        )
     # Review P1-5: formal CARD runs must pin the delta-table identity.
     if float(getattr(params, "card_lambda_delta", 0.0)) > 0:
         card_path = Path(params.card_delta_table)
@@ -731,12 +751,17 @@ def main(params):
                 data_metadata=getattr(trainer, "data_metadata", None) or {},
             )
         )
-    # D7 O4/O5 (plan §19/§25): same provenance discipline — the CSDT variant
-    # artifact must be bound to this run's data identity before training.
+    # D7 (plan §7): EVERY candidate must prove its initialization artifact —
+    # the S-family consumes the seed-matched B1 (sequential-transfer) init so
+    # it really starts from the Animal56 pretrained backbone (fifth review
+    # P0-1), while O4/O5 consume their CSDT variants.
     d7_candidate = getattr(params, "d7_candidate", "none")
-    if d7_candidate in {"o4", "o5"}:
+    if d7_candidate != "none":
         if getattr(params, "init_state_path", None) is None:
-            raise ValueError(f"--d7_candidate {d7_candidate} requires --init_state_path")
+            raise ValueError(
+                f"--d7_candidate {d7_candidate} requires a prepared seed-matched "
+                "initialization artifact (--init_state_path)"
+            )
         params.d7_artifact_contract = _d6_artifact_contract(
             _validate_d6_artifact_provenance(
                 provenance_path=Path(str(params.init_state_path) + ".provenance.json"),
@@ -819,12 +844,23 @@ def main(params):
             train_loaders, val_loaders, calibration_loaders, test_loaders = _scoped_loader_dicts(
                 loaders, eval_scope
             )
-            if getattr(params, "d7_candidate", "none") != "none":
+            if (
+                getattr(params, "d7_candidate", "none") != "none"
+                or getattr(params, "d7_drift_reference", "none") == "b1"
+            ):
                 # D7 §43-§48: attach the drift tracker AFTER the init overlay
                 # so the baseline IS the pretrained backbone; the tracker
-                # itself snapshots epoch-0 state and the human3 train probe.
+                # itself snapshots the baseline and the human3 train probe.
+                # P1-3: the B1 reference can also rerun with drift-only
+                # logging (--d7_drift_reference b1) so catastrophic-forgetting
+                # evidence exists for the reference itself.
                 from d7_diagnostics import D7DriftTracker, parse_feature_drift_epochs
 
+                drift_anchor_type = (
+                    "counterfactual_init"
+                    if getattr(params, "d7_candidate", "none") in {"o4", "o5"}
+                    else "animal_pretrained"
+                )
                 trainer.d7_drift_tracker = D7DriftTracker(
                     model=trainer.model,
                     train_loaders=train_loaders,
@@ -838,6 +874,7 @@ def main(params):
                     feature_drift_epochs=parse_feature_drift_epochs(
                         getattr(params, "feature_drift_epochs", "0,5,10,15,19")
                     ),
+                    anchor_type=drift_anchor_type,
                 )
             history = trainer.train(
                 train_dataloaders_dict=train_loaders,
@@ -1196,7 +1233,16 @@ def build_parser():
         "--feature_drift_epochs",
         default="0,5,10,15,19",
         help="D7 §48: comma-separated epochs at which feature drift is "
-        "computed (parameter drift logs every epoch).",
+        "computed AFTER those training epochs complete (parameter drift logs "
+        "every epoch).",
+    )
+    parser.add_argument(
+        "--d7_drift_reference",
+        choices=["none", "b1"],
+        default="none",
+        help="D7 P1-3 (fifth review): rerun the B1 reference with drift "
+        "logging enabled so catastrophic-forgetting evidence exists for the "
+        "reference itself; performance still counts as the B1 reference.",
     )
 
     parser.add_argument("--weighting", choices=["EW", "UW", "DWA"], default="EW")
@@ -1393,6 +1439,34 @@ def validate_params(params):
                     "--d7_candidate s3 requires backbone_lr_multiplier < 1.0 for the "
                     "unfrozen phase (plan §15)"
                 )
+        if d7_candidate in {"s1", "s2", "s3"}:
+            # Fifth-review P0-1: the preservation family MUST start from the
+            # seed-matched Animal56 pretrained (B1) initialization — a scratch
+            # backbone would test freezing/lr on a random network instead.
+            if not init_state:
+                raise ValueError(
+                    f"--d7_candidate {d7_candidate} requires --init_state_path "
+                    "from a seed-matched Animal56→Human3 B1 initialization artifact"
+                )
+            sidecar = Path(str(init_state) + ".provenance.json")
+            if not sidecar.is_file():
+                raise FileNotFoundError(
+                    f"D7 preservation candidate is missing init provenance: {sidecar}"
+                )
+            try:
+                provenance = json.loads(sidecar.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Init provenance sidecar is not valid JSON: {sidecar}") from exc
+            if provenance.get("mode") != "b1":
+                raise ValueError(
+                    f"--d7_candidate {d7_candidate} requires a B1/sequential-transfer "
+                    f"initialization artifact, found mode={provenance.get('mode')!r}"
+                )
+            if int(provenance.get("human_seed", -1)) != int(params.seed):
+                raise ValueError(
+                    "D7 preservation init provenance human_seed does not match --seed"
+                )
+            params.require_init_provenance = True
         if d7_candidate in {"o4", "o5"}:
             if freeze != 0 or multiplier != 1.0:
                 raise ValueError(

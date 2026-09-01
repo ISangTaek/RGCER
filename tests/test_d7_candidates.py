@@ -242,8 +242,10 @@ def test_drift_tracker_epoch0_row_is_zero_drift(tmp_path):
 
         def forward(self, batch):
             # Graphormer-shaped output: (batch, tokens, dim); CLS pooling
-            # takes [:, 0, :].
-            return torch.ones(len(batch.sample_id), 2, 4)
+            # takes [:, 0, :].  The tokens pass through the weights so a
+            # parameter update actually changes the representation.
+            tokens = torch.ones(len(batch.sample_id), 2, 4)
+            return self.layer(tokens)
 
     class _TinyEncoder(nn.Module):
         def __init__(self):
@@ -266,31 +268,94 @@ def test_drift_tracker_epoch0_row_is_zero_drift(tmp_path):
         feature_drift_epochs={0},
     )
     assert tracker.probe_ids == ["s1", "s2", "s3"]
-    row = tracker.log_epoch(0, model)
-    assert float(row["backbone_param_drift"]) == 0.0
-    assert float(row["early_block_drift"]) == 0.0
-    assert float(row["late_block_drift"]) == 0.0
-    assert float(row["feature_drift"]) == 0.0
-    # drift after an actual update is visible
+    # Fifth-review P1-4: construction logs the BASELINE row (epoch=-1,
+    # state=baseline, drift exactly 0) — no epoch-0 row yet.
+    baseline = tracker.rows[0]
+    assert baseline["epoch"] == -1
+    assert baseline["state"] == "baseline"
+    assert float(baseline["backbone_param_drift"]) == 0.0
+    assert float(baseline["feature_drift"]) == 0.0
+    # epoch-0 row is logged AFTER the first training epoch — a real update
+    # makes it non-zero while staying aligned with validation epoch 0.
     with torch.no_grad():
         model.encoder.backbone.layer.weight.add_(0.5)
+    row0 = tracker.log_epoch(0, model)
+    assert row0["state"] == "post_epoch"
+    assert float(row0["backbone_param_drift"]) > 0.0
+    assert float(row0["feature_drift"]) > 0.0  # epoch 0 is in the schedule
+    with torch.no_grad():
+        model.encoder.backbone.layer.bias.add_(0.3)
     row1 = tracker.log_epoch(1, model)
-    assert float(row1["backbone_param_drift"]) > 0.0
-    # CSV written and parseable
+    assert float(row1["backbone_param_drift"]) > float(row0["backbone_param_drift"])
+    assert row1["feature_drift"] == ""  # epoch 1 not in the schedule
+    # CSV written and parseable; drift/validation epochs align 1:1
     import csv as _csv
 
     with (tmp_path / "d7_representation_drift.csv").open() as handle:
         rows = list(_csv.DictReader(handle))
-    assert [int(row["epoch"]) for row in rows] == [0, 1]
+    assert [int(row["epoch"]) for row in rows] == [-1, 0, 1]
+    assert [row["state"] for row in rows] == ["baseline", "post_epoch", "post_epoch"]
+
+
+def test_drift_and_validation_epoch_are_aligned():
+    # §64: the trainer must call log_epoch AFTER validation, so drift row t
+    # and validation row t observe the same model state.
+    import inspect
+
+    from trainer import Trainer
+
+    source = inspect.getsource(Trainer.train)
+    drift_position = source.index("drift_tracker.log_epoch")
+    validation_position = source.index('self._evaluate(val_dataloaders_dict, mode="validation"')
+    assert validation_position < drift_position
+
+
+def test_drift_anchor_type_is_recorded(tmp_path):
+    # Fifth-review P2-2: O4/O5 baselines are counterfactual inits — their
+    # drift magnitudes must never be silently compared with S-family rows.
+    class _AnchorBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.Linear(4, 4)
+
+        def forward(self, batch):
+            return torch.ones(len(batch.sample_id), 2, 4)
+
+    class _AnchorModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = nn.Module()
+            self.encoder.backbone = _AnchorBackbone()
+
+    model = _AnchorModel()
+    loaders = {"task_a": [_ProbeBatch(["s1"])]}
+    for anchor_type in ("animal_pretrained", "counterfactual_init"):
+        tracker = D7DriftTracker(
+            model=model,
+            train_loaders=loaders,
+            device=torch.device("cpu"),
+            output_dir=tmp_path / anchor_type,
+            anchor_type=anchor_type,
+        )
+        assert tracker.rows[0]["drift_anchor_type"] == anchor_type
+    with pytest.raises(ValueError):
+        D7DriftTracker(
+            model=model,
+            train_loaders=loaders,
+            device=torch.device("cpu"),
+            output_dir=None,
+            anchor_type="bogus",
+        )
 
 
 # ----------------------------------------------------------------------
 # D7 run contract (plan §93, §96: validation-only contract)
 # ----------------------------------------------------------------------
 from scripts.d7_aggregate import check_d7_run_contract  # noqa: E402
+from scripts.d7_aggregate import ARTIFACT_CANDIDATES  # noqa: E402
 
 
-def _write_d7_run(root, candidate, seed, epochs, freeze, multiplier, contract=True):
+def _write_d7_run(root, candidate, seed, epochs, freeze, multiplier, contract=True, mode=None):
     run_dir = root / candidate / f"d7_{candidate}_e{epochs}" / f"seed_{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "args.json").write_text(
@@ -304,6 +369,7 @@ def _write_d7_run(root, candidate, seed, epochs, freeze, multiplier, contract=Tr
                 "epochs": epochs,
                 "freeze_backbone_epochs": freeze,
                 "backbone_lr_multiplier": multiplier,
+                "split_seed": 42,
             }
         ),
         encoding="utf-8",
@@ -312,16 +378,32 @@ def _write_d7_run(root, candidate, seed, epochs, freeze, multiplier, contract=Tr
         "d7_candidate": candidate,
         "manifest_sha256": "m",
         "datastore_fingerprint": "f",
+        "feature_schema_version": "schema-test",
     }
-    if candidate in ("o4", "o5") and contract:
+    # Fifth-review P0-1: EVERY D7 candidate carries an artifact contract
+    # (S-family mode=b1; CSDT family per variant).
+    if contract and candidate in ARTIFACT_CANDIDATES:
         metadata["d7_artifact_contract"] = {
-            "mode": "csdt" if candidate == "o4" else "csdt_bounded",
+            "mode": mode or ARTIFACT_CANDIDATES[candidate],
             "human_seed": seed,
             "split_manifest_hash": "m",
             "datastore_fingerprint": "f",
+            "feature_schema_version": "schema-test",
         }
     (run_dir / "run_metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
     return run_dir
+
+
+def _write_b1_sidecar(tmp_path, mode="b1", seed=42, name="s_init.pt"):
+    """Create a stub init artifact + provenance sidecar for validate_params."""
+
+    init_state = tmp_path / name
+    init_state.write_bytes(b"stub")
+    provenance = {"mode": mode, "human_seed": seed}
+    (tmp_path / (name + ".provenance.json")).write_text(
+        json.dumps(provenance), encoding="utf-8"
+    )
+    return str(init_state)
 
 
 def test_d7_run_contract_accepts_valid_s2_run(tmp_path):
@@ -400,20 +482,26 @@ def _write_d7_candidate_run(root, candidate, stable, endpoints):
                 "train_eval_scope": "validation_only",
                 "fit_conformal": False,
                 "epochs": 20,
+                "split_seed": 42,
                 "freeze_backbone_epochs": {"s1": 20, "s2": 0, "s3": 5}.get(candidate, 0),
                 "backbone_lr_multiplier": 0.1 if candidate in ("s2", "s3") else 1.0,
             }
         ),
         encoding="utf-8",
     )
-    metadata = {"d7_candidate": candidate, "manifest_sha256": "m", "datastore_fingerprint": "f"}
-    if candidate in ("o4", "o5"):
-        metadata["d7_artifact_contract"] = {
-            "mode": "csdt" if candidate == "o4" else "csdt_bounded",
-            "human_seed": 42,
-            "split_manifest_hash": "m",
-            "datastore_fingerprint": "f",
-        }
+    metadata = {
+        "d7_candidate": candidate,
+        "manifest_sha256": "manifest-test",
+        "datastore_fingerprint": "datastore-test",
+        "feature_schema_version": "schema-test",
+    }
+    metadata["d7_artifact_contract"] = {
+        "mode": ARTIFACT_CANDIDATES[candidate],
+        "human_seed": 42,
+        "split_manifest_hash": "manifest-test",
+        "datastore_fingerprint": "datastore-test",
+        "feature_schema_version": "schema-test",
+    }
     (run_dir / "run_metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
     diagnostics = run_dir / "diagnostics"
     diagnostics.mkdir(parents=True, exist_ok=True)
@@ -570,13 +658,80 @@ def _base_params():
     return params
 
 
-def test_validate_params_accepts_valid_s2():
+def test_validate_params_s2_requires_b1_init_sidecar(tmp_path):
     from main import validate_params
 
     params = _base_params()
     params.d7_candidate = "s2"
     params.freeze_backbone_epochs = 0
     params.backbone_lr_multiplier = 0.1
+    # Fifth-review P0-1: no init artifact -> the run must not even start.
+    with pytest.raises(ValueError, match="initialization artifact"):
+        validate_params(params)
+    params.init_state_path = _write_b1_sidecar(tmp_path)
+    validate_params(params)  # valid B1 sidecar -> cheap checks pass
+
+
+def test_validate_params_s1_requires_b1_init(tmp_path):
+    from main import validate_params
+
+    params = _base_params()
+    params.d7_candidate = "s1"
+    params.freeze_backbone_epochs = 20
+    with pytest.raises(ValueError, match="requires --init_state_path"):
+        validate_params(params)
+    params.init_state_path = _write_b1_sidecar(tmp_path)
+    validate_params(params)
+
+
+def test_validate_params_s3_requires_b1_init(tmp_path):
+    from main import validate_params
+
+    params = _base_params()
+    params.d7_candidate = "s3"
+    params.freeze_backbone_epochs = 5
+    params.backbone_lr_multiplier = 0.1
+    with pytest.raises(ValueError, match="requires --init_state_path"):
+        validate_params(params)
+    params.init_state_path = _write_b1_sidecar(tmp_path)
+    validate_params(params)
+
+
+def test_validate_params_s2_rejects_csdt_init(tmp_path):
+    # §18: a CSDT artifact is not a preservation-family initialization.
+    from main import validate_params
+
+    params = _base_params()
+    params.d7_candidate = "s2"
+    params.freeze_backbone_epochs = 0
+    params.backbone_lr_multiplier = 0.1
+    params.init_state_path = _write_b1_sidecar(tmp_path, mode="csdt")
+    with pytest.raises(ValueError, match="B1/sequential-transfer"):
+        validate_params(params)
+
+
+def test_validate_params_s_family_rejects_wrong_seed_sidecar(tmp_path):
+    from main import validate_params
+
+    params = _base_params()
+    params.d7_candidate = "s1"
+    params.freeze_backbone_epochs = 20
+    params.init_state_path = _write_b1_sidecar(tmp_path, seed=44)
+    with pytest.raises(ValueError, match="human_seed"):
+        validate_params(params)
+
+
+def test_validate_params_accepts_valid_s2(tmp_path):
+    # Fifth-review §13: the pre-review version of this test accepted S2 with
+    # NO init artifact — that protected the wrong behaviour.  A valid S2 must
+    # carry a seed-matched B1 initialization sidecar.
+    from main import validate_params
+
+    params = _base_params()
+    params.d7_candidate = "s2"
+    params.freeze_backbone_epochs = 0
+    params.backbone_lr_multiplier = 0.1
+    params.init_state_path = _write_b1_sidecar(tmp_path)
     validate_params(params)  # must not raise
 
 

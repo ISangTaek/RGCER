@@ -1,16 +1,22 @@
-"""D7 representation-preservation diagnostics (plan §43-§48, §77).
+"""D7 representation-preservation diagnostics (plan §43-§48, §77; fifth review P1-3/P1-4).
 
-``D7DriftTracker`` is attached to a Trainer after the init overlay and before
-``train()``.  It captures the post-overlay backbone state and the animal-teacher
-probe representations as the BASELINE (for S1/S2/S3/B1 the overlay IS the
-pretrained backbone, so epoch-0 drift is exactly 0 by construction), then per
-epoch records:
+``D7DriftTracker`` is attached to a Trainer after the init overlay.  It
+captures the post-overlay backbone state and the animal-teacher probe
+representations as the BASELINE (for S1/S2/S3/B1 the overlay IS the pretrained
+backbone, so the baseline drift is exactly 0 by construction), then:
 
-- backbone_param_drift  ||theta_t - theta_init|| / (||theta_init|| + eps) over
-  all backbone tensors, early blocks (layers 0-3) and late blocks (layers 4-7)
-- feature_drift         mean(1 - cos(h_t, h_init)) over a FIXED human3 TRAIN
-  probe set (first N unique sorted sample_ids — never validation), computed
-  only on the configured epochs (default 0/5/10/15/19)
+- baseline row:  epoch=-1, state=baseline — logged at construction
+- per-epoch row: logged AFTER each epoch's validation (state=post_epoch), so
+  drift row epoch t and validation row epoch t refer to the SAME model state
+
+For each row it records backbone parameter drift ||theta_t - theta_init|| /
+(||theta_init|| + eps) over all backbone tensors, early blocks (layers 0-3)
+and late blocks (layers 4-7), plus feature drift mean(1 - cos(h_t, h_init))
+over a FIXED human3 TRAIN probe set (first N unique sorted sample_ids — never
+validation) on the configured epochs.  ``drift_anchor_type`` records whether
+the baseline is the animal-pretrained init (S-family/B1) or a counterfactual
+modified init (O4/O5) so absolute drift magnitudes are never compared across
+anchor types (fifth review P2-2).
 
 Rows are appended to ``<save_path>/diagnostics/d7_representation_drift.csv``.
 The human3_rmse column is joined by the aggregator from epoch_summary.csv so
@@ -143,6 +149,8 @@ def feature_drift(current: dict, reference: dict) -> float:
 
 DRIFT_FIELDS = (
     "epoch",
+    "state",
+    "drift_anchor_type",
     "backbone_param_drift",
     "early_block_drift",
     "late_block_drift",
@@ -151,8 +159,17 @@ DRIFT_FIELDS = (
 
 
 class D7DriftTracker:
-    """Attached as ``trainer.d7_drift_tracker``; call ``log_epoch`` at each
-    epoch boundary from the training loop."""
+    """Attached as ``trainer.d7_drift_tracker``.
+
+    Epoch alignment (fifth review P1-4): the constructor logs the BASELINE row
+    (epoch=-1, state=baseline — the untouched post-overlay state) and the
+    trainer calls ``log_epoch`` AFTER each epoch's validation, so
+
+        drift row epoch t  ==  validation row epoch t
+
+    refer to the SAME model state.  Feature-drift epochs (§48) are therefore
+    interpreted as "after completing these training epochs".
+    """
 
     def __init__(
         self,
@@ -163,8 +180,12 @@ class D7DriftTracker:
         output_dir,
         probe_size: int = 128,
         feature_drift_epochs=None,
+        anchor_type: str = "animal_pretrained",
     ):
+        if anchor_type not in ("animal_pretrained", "counterfactual_init"):
+            raise ValueError(f"unknown drift anchor type: {anchor_type!r}")
         self.device = device
+        self.anchor_type = anchor_type
         self.feature_drift_epochs = (
             set(feature_drift_epochs)
             if feature_drift_epochs is not None
@@ -189,19 +210,25 @@ class D7DriftTracker:
         self.probe_batches = collect_probe_batches(train_loaders, self.probe_ids)
         self.reference_representations = pooled_representations(model, self.probe_batches, device)
         self.rows: list[dict] = []
-        # The trainer logs at the START of each epoch: an "epoch t" row is the
-        # state after t completed epochs, so epoch 0 is the untouched
-        # post-overlay baseline (drift exactly 0, plan §96).
+        # Baseline row: the untouched post-overlay state, epoch=-1 (§38).
+        self._append_row(-1, "baseline", model, compute_feature=False)
 
-    def log_epoch(self, epoch: int, model) -> dict:
-        state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
-        all_drift, early_drift, late_drift = backbone_parameter_drift(state, self.init_state)
-        feature = ""
-        if int(epoch) in self.feature_drift_epochs:
+    def _append_row(self, epoch: int, state: str, model, *, compute_feature: bool) -> dict:
+        state_dict = {key: value.detach().cpu() for key, value in model.state_dict().items()}
+        all_drift, early_drift, late_drift = backbone_parameter_drift(state_dict, self.init_state)
+        if state == "baseline":
+            # The baseline IS the reference — its feature drift is 0 by
+            # definition (fifth-review P1-4 alignment).
+            feature = "0.00000000"
+        elif compute_feature and int(epoch) in self.feature_drift_epochs:
             current = pooled_representations(model, self.probe_batches, self.device)
             feature = f"{feature_drift(current, self.reference_representations):.8f}"
+        else:
+            feature = ""
         row = {
             "epoch": int(epoch),
+            "state": state,
+            "drift_anchor_type": self.anchor_type,
             "backbone_param_drift": f"{all_drift:.8f}",
             "early_block_drift": f"{early_drift:.8f}",
             "late_block_drift": f"{late_drift:.8f}",
@@ -217,3 +244,7 @@ class D7DriftTracker:
                 writer.writeheader()
                 writer.writerows(self.rows)
         return row
+
+    def log_epoch(self, epoch: int, model) -> dict:
+        """Log the POST-epoch state so it aligns with validation epoch t."""
+        return self._append_row(epoch, "post_epoch", model, compute_feature=True)

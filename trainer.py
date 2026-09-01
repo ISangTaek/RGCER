@@ -1658,20 +1658,19 @@ class Trainer:
         for epoch in range(start_epoch, total_epochs):
             self.loss_balancer.train_loss_buffer = self.train_loss_buffer
             # D7 S1/S3 (plan §15): the freeze schedule is evaluated at the
-            # START of every epoch, so "epoch t" state == after t updates.
+            # START of every epoch so a resume reproduces the same schedule.
             self._apply_backbone_freeze(epoch)
-            # D7 §43-§48: representation drift is logged at the same boundary;
-            # an "epoch t" row is the state after t completed epochs (epoch 0
-            # row == untouched post-overlay baseline).
-            drift_tracker = getattr(self, "d7_drift_tracker", None)
-            if drift_tracker is not None:
-                drift_tracker.log_epoch(epoch, self.model)
             train_result = self._train_epoch(train_dataloaders_dict, epoch)
             for index, task in enumerate(self.task_name):
                 if np.isfinite(train_result["loss"][task]):
                     self.train_loss_buffer[index, epoch] = train_result["loss"][task]
             self._print_metrics("train", epoch, train_result)
             validation_result = self._evaluate(val_dataloaders_dict, mode="validation", epoch=epoch)
+            # D7 P1-4 (fifth review): log drift AFTER validation so drift row
+            # epoch t and validation row epoch t describe the SAME model state.
+            drift_tracker = getattr(self, "d7_drift_tracker", None)
+            if drift_tracker is not None:
+                drift_tracker.log_epoch(epoch, self.model)
             history.append({"epoch": epoch, "train": train_result, "validation": validation_result})
             # The best checkpoint is chosen by the selection scope (human3 by
             # default on ToxAcute), not by the all-task macro score, so an
