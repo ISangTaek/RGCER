@@ -6,6 +6,9 @@ Modes:
            model; consumes only the real teacher (review P0-1/P0-4).
 - csdt : theta_init = theta0 + alpha * (theta_real - theta_shuffle), shared
          Graphormer backbone only; heads stay seed-matched fresh (§64).
+- csdt_bounded : D7 O5 bounded CSDT — theta_anchor + s_g * (real - shuffle)
+         with s_g = min(1, tau / r_g) per backbone group, so no group's
+         semantic perturbation exceeds tau of its anchor norm (plan §25-§26).
 - b1   : standard sequential transfer initialisation - copy the real
          teacher's shared backbone into theta0 (diagnostic baseline).
 - clst : layer-selective transfer - rank backbone blocks by the
@@ -564,6 +567,52 @@ def apply_csdt(theta0: dict, real: dict, shuffle: dict, alpha: float) -> dict:
     return merged
 
 
+def apply_csdt_bounded(theta_anchor: dict, real: dict, shuffle: dict, tau: float):
+    """D7 O5 bounded CSDT (plan §25-§26): per-group semantic trust region.
+
+    For every backbone group g:
+        r_g = ||theta_real_g - theta_shuffle_g|| / (||theta_anchor_g|| + eps)
+        s_g = min(1, tau / (r_g + eps))
+        theta_init_g = theta_anchor_g + s_g * (theta_real_g - theta_shuffle_g)
+
+    so no group's semantic perturbation exceeds ``tau`` of its anchor norm.
+    Returns (merged_state, per_group_rows) — the rows feed
+    O5_BOUNDED_CSDT_DELTA.csv (plan §76).
+    """
+
+    if tau <= 0:
+        raise ValueError(f"tau must be > 0, found {tau!r}")
+    eps = 1e-12
+    merged = {key: value.detach().clone() for key, value in theta_anchor.items()}
+    rows = []
+    for key in sorted(theta_anchor):
+        if not key.startswith(BACKBONE_PREFIX) or key not in real or key not in shuffle:
+            continue
+        anchor = theta_anchor[key].float()
+        raw_delta = real[key].float() - shuffle[key].float()
+        anchor_norm = float(anchor.norm())
+        raw_delta_norm = float(raw_delta.norm())
+        raw_ratio = raw_delta_norm / (anchor_norm + eps)
+        scale = min(1.0, tau / (raw_ratio + eps))
+        bounded = scale * raw_delta
+        merged[key] = (anchor + bounded).to(theta_anchor[key].dtype)
+        bounded_norm = float(bounded.norm())
+        rows.append(
+            {
+                "parameter_group": key,
+                "anchor_norm": anchor_norm,
+                "raw_delta_norm": raw_delta_norm,
+                "raw_delta_ratio": raw_ratio,
+                "tau": tau,
+                "scale_factor": scale,
+                "bounded_delta_norm": bounded_norm,
+                "bounded_delta_ratio": bounded_norm / (anchor_norm + eps),
+                "was_clipped": int(raw_ratio > tau + 1e-12),
+            }
+        )
+    return merged, rows
+
+
 def apply_b1(theta0: dict, real: dict) -> dict:
     """Sequential transfer: copy the real teacher's whole shared backbone."""
 
@@ -780,7 +829,7 @@ def _human_loaders(params):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "mode", choices=["anchor", "csdt", "clst", "b1", "card_table"]
+        "mode", choices=["anchor", "csdt", "csdt_bounded", "clst", "b1", "card_table"]
     )
     parser.add_argument("--teacher_real_dir", required=True)
     parser.add_argument("--teacher_shuffle_dir", default=None)
@@ -792,6 +841,9 @@ def main() -> None:
     )
     parser.add_argument("--human_seed", type=int, default=42)
     parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument(
+        "--tau", type=float, default=0.1, help="D7 O5 bounded CSDT trust region (plan §25)."
+    )
     parser.add_argument("--clst_top_k", type=int, default=2)
     parser.add_argument("--gpu_id", default="cpu")
     parser.add_argument("--output", required=True, help="init state .pt (or CARD npz table)")
@@ -807,7 +859,7 @@ def main() -> None:
         )
     teacher_real_dir = Path(args.teacher_real_dir)
     teacher_shuffle_dir = Path(args.teacher_shuffle_dir) if args.teacher_shuffle_dir else None
-    if args.mode in {"csdt", "clst", "card_table"} and teacher_shuffle_dir is None:
+    if args.mode in {"csdt", "csdt_bounded", "clst", "card_table"} and teacher_shuffle_dir is None:
         raise SystemExit(f"{args.mode} requires --teacher_shuffle_dir")
     if args.mode == "card_table" and not str(args.output).endswith(".npz"):
         # Review P1-4: np.savez silently appends .npz, which would break the
@@ -818,6 +870,7 @@ def main() -> None:
         "mode": args.mode,
         "human_seed": args.human_seed,
         "alpha": args.alpha,
+        "tau": args.tau,
         "clst_top_k": args.clst_top_k,
         "expected_teacher_epoch": args.expected_teacher_epoch,
         "teacher_real_run_dir": str(teacher_real_dir),
@@ -886,7 +939,7 @@ def main() -> None:
     # Review P0-1 (fourth round §7): three explicit teacher branches —
     # csdt/clst verify the matched real/shuffle pair, while anchor/b1 consume
     # ONLY the real teacher and must never require a shuffle directory.
-    if args.mode in {"csdt", "clst"}:
+    if args.mode in {"csdt", "csdt_bounded", "clst"}:
         matched = _verify_teacher_pair(
             teacher_real_dir,
             teacher_shuffle_dir,
@@ -923,17 +976,18 @@ def main() -> None:
     # Review P0-4: regenerate the teachers' common initial backbone and build
     # the teacher-coordinate anchor (heads fresh, backbone = teacher init).
     theta_anchor = None
-    if args.mode in {"anchor", "csdt"}:
+    if args.mode in {"anchor", "csdt", "csdt_bounded"}:
         # Review §10: the anchor hash always comes from the verified
         # provenance (teacher_initial_model_sha256), never re-read ad hoc.
         expected_init_hash = matched_init_hash
         if not expected_init_hash:
             raise SystemExit("teacher verification did not yield initial_model_sha256")
         # D6 P0-4 root fix: load the recorded initial-state snapshots instead
-        # of trying to reproduce the run's RNG lineage; csdt additionally
-        # proves the shuffle teacher started from the SAME initial state.
+        # of trying to reproduce the run's RNG lineage; the CSDT variants
+        # additionally prove the shuffle teacher started from the SAME
+        # initial state.
         animal_init_state = _load_teacher_anchor_state(teacher_real_dir, expected_init_hash)
-        if args.mode == "csdt":
+        if args.mode in {"csdt", "csdt_bounded"}:
             _load_teacher_anchor_state(teacher_shuffle_dir, expected_init_hash)
         theta_anchor = build_anchor_state(model_human, animal_init_state)
         provenance["teacher_anchor_initial_model_sha256"] = expected_init_hash
@@ -945,15 +999,31 @@ def main() -> None:
     if args.mode == "anchor":
         # §22-§23: B0A anchor-only control — no semantic delta applied.
         merged = theta_anchor
-    elif args.mode == "csdt":
+    elif args.mode in {"csdt", "csdt_bounded"}:
         # Review P0-4/§21: CSDT must apply the counterfactual delta in the
         # teacher coordinate (alpha=0 reproduces the anchor exactly).
         model_shuffle, _, _ = _build_model(args.human_seed, "animal56", torch.device("cpu"), template_config)
         model_shuffle.load_state_dict(shuffle_checkpoint["model_state"], strict=True)
         state_shuffle = model_shuffle.state_dict()
-        merged = apply_csdt(theta_anchor, state_real, state_shuffle, args.alpha)
+        if args.mode == "csdt":
+            merged = apply_csdt(theta_anchor, state_real, state_shuffle, args.alpha)
+        else:
+            merged, bounded_rows = apply_csdt_bounded(
+                theta_anchor, state_real, state_shuffle, args.tau
+            )
+            clipped = sum(int(row["was_clipped"]) for row in bounded_rows)
+            provenance["o5_num_clipped_groups"] = clipped
+            provenance["o5_fraction_clipped"] = (
+                clipped / len(bounded_rows) if bounded_rows else 0.0
+            )
+            if args.delta_csv:
+                _write_rows(args.delta_csv, bounded_rows)
+            print(
+                f"csdt_bounded: {len(bounded_rows)} backbone groups; tau={args.tau}; "
+                f"clipped {clipped} ({provenance['o5_fraction_clipped']:.2%})"
+            )
 
-        if args.delta_csv:
+        if args.mode == "csdt" and args.delta_csv:
             # Review P2: the semantic delta is applied on top of the anchor,
             # so the ratio denominator is the anchor backbone norm.
             rows = []
@@ -964,6 +1034,7 @@ def main() -> None:
                 real_norm = float(state_real[key].float().norm())
                 shuffle_norm = float(state_shuffle[key].float().norm())
                 delta_norm = float((state_real[key].float() - state_shuffle[key].float()).norm())
+                effective_norm = args.alpha * delta_norm
                 rows.append(
                     {
                         "layer": key,
@@ -974,6 +1045,8 @@ def main() -> None:
                         "semantic_delta_norm": delta_norm,
                         "semantic_delta_ratio": (delta_norm / anchor_norm) if anchor_norm > 0 else float("nan"),
                         "alpha": args.alpha,
+                        "effective_delta_norm": effective_norm,
+                        "effective_delta_ratio": (effective_norm / anchor_norm) if anchor_norm > 0 else float("nan"),
                     }
                 )
             _write_rows(args.delta_csv, rows)

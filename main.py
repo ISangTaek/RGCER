@@ -103,13 +103,16 @@ def _sha256_file(path):
 
 
 # Review P0-2 (fourth round §17): every artifact-consuming D6 candidate must
-# present a provenance sidecar generated in exactly this mode.
+# present a provenance sidecar generated in exactly this mode.  D7 reuses the
+# same validator for its CSDT variants (plan §19/§25).
 D6_PROVENANCE_MODE = {
     "b0a": "anchor",
     "b1": "b1",
     "o1": "csdt",
     "o2": "clst",
     "o3": "card_table",
+    "o4": "csdt",
+    "o5": "csdt_bounded",
 }
 
 
@@ -254,6 +257,11 @@ def _write_run_metadata(params, task_names, trainer):
         "git_commit": _git_commit_hash(),
         # Review §30: D6 aggregator second-line identity verification.
         "d6_candidate": getattr(params, "d6_candidate", "none"),
+        # D7 representation-preservation provenance (plan §73/§77).
+        "d7_candidate": getattr(params, "d7_candidate", "none"),
+        "d7_artifact_contract": getattr(params, "d7_artifact_contract", None),
+        "freeze_backbone_epochs": getattr(params, "freeze_backbone_epochs", 0),
+        "backbone_lr_multiplier": getattr(params, "backbone_lr_multiplier", 1.0),
         # D6 shuffle/counterfactual provenance (review P1-5, §51).
         "shuffle_animal_train_labels": bool(
             getattr(params, "shuffle_animal_train_labels", False)
@@ -723,6 +731,21 @@ def main(params):
                 data_metadata=getattr(trainer, "data_metadata", None) or {},
             )
         )
+    # D7 O4/O5 (plan §19/§25): same provenance discipline — the CSDT variant
+    # artifact must be bound to this run's data identity before training.
+    d7_candidate = getattr(params, "d7_candidate", "none")
+    if d7_candidate in {"o4", "o5"}:
+        if getattr(params, "init_state_path", None) is None:
+            raise ValueError(f"--d7_candidate {d7_candidate} requires --init_state_path")
+        params.d7_artifact_contract = _d6_artifact_contract(
+            _validate_d6_artifact_provenance(
+                provenance_path=Path(str(params.init_state_path) + ".provenance.json"),
+                artifact_path=Path(params.init_state_path),
+                candidate=d7_candidate,
+                seed=params.seed,
+                data_metadata=getattr(trainer, "data_metadata", None) or {},
+            )
+        )
     _write_run_metadata(params, task_names, trainer)
     if getattr(params, "init_state_path", None):
         # D6 CSDT/CLST/sequential-transfer initialisation (plan §64-§65): the
@@ -796,6 +819,26 @@ def main(params):
             train_loaders, val_loaders, calibration_loaders, test_loaders = _scoped_loader_dicts(
                 loaders, eval_scope
             )
+            if getattr(params, "d7_candidate", "none") != "none":
+                # D7 §43-§48: attach the drift tracker AFTER the init overlay
+                # so the baseline IS the pretrained backbone; the tracker
+                # itself snapshots epoch-0 state and the human3 train probe.
+                from d7_diagnostics import D7DriftTracker, parse_feature_drift_epochs
+
+                trainer.d7_drift_tracker = D7DriftTracker(
+                    model=trainer.model,
+                    train_loaders=train_loaders,
+                    device=trainer.device,
+                    output_dir=(
+                        Path(params.save_path) / "diagnostics"
+                        if getattr(params, "save_path", None)
+                        else None
+                    ),
+                    probe_size=int(getattr(params, "feature_drift_probe_size", 128)),
+                    feature_drift_epochs=parse_feature_drift_epochs(
+                        getattr(params, "feature_drift_epochs", "0,5,10,15,19")
+                    ),
+                )
             history = trainer.train(
                 train_dataloaders_dict=train_loaders,
                 val_dataloaders_dict=val_loaders,
@@ -1120,6 +1163,41 @@ def build_parser():
         help="D6 micro-screen candidate identity; enables the per-candidate "
         "init/provenance contracts (review P1-4, §27-§30).",
     )
+    parser.add_argument(
+        "--d7_candidate",
+        choices=["none", "s1", "s2", "s3", "o4", "o5"],
+        default="none",
+        help="D7 representation-preservation candidate identity (plan §7); "
+        "enables the freeze/LR contracts, artifact provenance checks and "
+        "drift logging.",
+    )
+    parser.add_argument(
+        "--freeze_backbone_epochs",
+        type=int,
+        default=0,
+        help="D7 S1/S3: freeze the whole Graphormer backbone for the first N "
+        "epochs (requires_grad=False only). 0 = never freeze (plan §8/§15).",
+    )
+    parser.add_argument(
+        "--backbone_lr_multiplier",
+        type=float,
+        default=1.0,
+        help="D7 S2/S3: Graphormer backbone LR = base LR * this multiplier; "
+        "heads keep the base LR (plan §11).",
+    )
+    parser.add_argument(
+        "--feature_drift_probe_size",
+        type=int,
+        default=128,
+        help="D7 §47: fixed human3 TRAIN probe set size (first N unique "
+        "sorted sample_ids; never validation).",
+    )
+    parser.add_argument(
+        "--feature_drift_epochs",
+        default="0,5,10,15,19",
+        help="D7 §48: comma-separated epochs at which feature drift is "
+        "computed (parameter drift logs every epoch).",
+    )
 
     parser.add_argument("--weighting", choices=["EW", "UW", "DWA"], default="EW")
     parser.add_argument("--optim", choices=["adam", "adamw"], default="adamw")
@@ -1258,6 +1336,97 @@ def validate_params(params):
             raise ValueError("--d6_candidate o3 starts from scratch: no --init_state_path")
         if card_lambda <= 0:
             raise ValueError("--d6_candidate o3 requires --card_lambda_delta > 0")
+    # D7 representation-preservation contracts (plan §7, §95-§96).
+    d7_candidate = getattr(params, "d7_candidate", "none")
+    if d6_candidate != "none" and d7_candidate != "none":
+        raise ValueError("--d6_candidate and --d7_candidate are mutually exclusive")
+    if d7_candidate != "none":
+        if params.dataset != "toxacute":
+            raise ValueError("D7 candidates run on the toxacute dataset")
+        if params.toxacute_task_scope != "human3":
+            raise ValueError("D7 candidates fine-tune the human3 task scope only")
+        if params.arch != "Graphormer":
+            raise ValueError("D7 candidates use the plain Graphormer architecture")
+        if getattr(params, "fit_conformal", True):
+            raise ValueError("D7 candidates must run with --no-fit_conformal")
+        if getattr(params, "train_eval_scope", "full") != "validation_only":
+            raise ValueError("D7 candidates must run with validation-only evaluation")
+        if getattr(params, "shuffle_animal_train_labels", False):
+            raise ValueError("D7 candidates must not shuffle animal labels")
+        if card_lambda > 0:
+            raise ValueError("D7 runs must not enable CARD")
+        freeze = int(getattr(params, "freeze_backbone_epochs", 0) or 0)
+        multiplier = float(getattr(params, "backbone_lr_multiplier", 1.0) or 1.0)
+        if freeze < 0 or freeze > int(params.epochs):
+            raise ValueError(
+                f"freeze_backbone_epochs must be within [0, epochs={params.epochs}]"
+            )
+        if multiplier <= 0:
+            raise ValueError("backbone_lr_multiplier must be > 0")
+        if d7_candidate == "s1":
+            if freeze != int(params.epochs):
+                raise ValueError(
+                    "--d7_candidate s1 freezes the backbone for the WHOLE run: "
+                    f"freeze_backbone_epochs must equal --epochs ({params.epochs})"
+                )
+            if multiplier != 1.0:
+                raise ValueError(
+                    "--d7_candidate s1 keeps the base head LR protocol; the backbone is "
+                    "frozen so --backbone_lr_multiplier must stay 1.0"
+                )
+        if d7_candidate == "s2":
+            if freeze != 0:
+                raise ValueError("--d7_candidate s2 never freezes: freeze_backbone_epochs must be 0")
+            if multiplier >= 1.0:
+                raise ValueError(
+                    "--d7_candidate s2 requires a reduced backbone LR "
+                    "(--backbone_lr_multiplier < 1.0, plan §12)"
+                )
+        if d7_candidate == "s3":
+            if freeze != 5:
+                raise ValueError(
+                    "--d7_candidate s3 freezes exactly the first 5 epochs "
+                    "(plan §15): freeze_backbone_epochs must be 5"
+                )
+            if multiplier >= 1.0:
+                raise ValueError(
+                    "--d7_candidate s3 requires backbone_lr_multiplier < 1.0 for the "
+                    "unfrozen phase (plan §15)"
+                )
+        if d7_candidate in {"o4", "o5"}:
+            if freeze != 0 or multiplier != 1.0:
+                raise ValueError(
+                    "--d7_candidate o4/o5 change ONLY the initialisation: no freeze / "
+                    "LR multiplier allowed"
+                )
+            if not init_state:
+                raise ValueError(f"--d7_candidate {d7_candidate} requires --init_state_path")
+            sidecar = Path(str(init_state) + ".provenance.json")
+            if not sidecar.is_file():
+                raise FileNotFoundError(f"Candidate init provenance sidecar missing: {sidecar}")
+            try:
+                provenance = json.loads(sidecar.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Init provenance sidecar is not valid JSON: {sidecar}") from exc
+            expected_mode = D6_PROVENANCE_MODE[d7_candidate]
+            if provenance.get("mode") != expected_mode:
+                raise ValueError(
+                    f"--d7_candidate {d7_candidate} requires init mode "
+                    f"{expected_mode!r}, found {provenance.get('mode')!r}"
+                )
+            if int(provenance.get("human_seed", -1)) != int(params.seed):
+                raise ValueError("Init provenance human_seed does not match --seed")
+            if d7_candidate == "o4" and float(provenance.get("alpha", -1)) != 0.1:
+                raise ValueError(
+                    "--d7_candidate o4 requires the shrunk CSDT artifact generated with "
+                    f"alpha=0.1 (plan §19), found alpha={provenance.get('alpha')!r}"
+                )
+            if d7_candidate == "o5" and float(provenance.get("tau", -1)) != 0.1:
+                raise ValueError(
+                    "--d7_candidate o5 requires the bounded CSDT artifact generated with "
+                    f"tau=0.1 (plan §27), found tau={provenance.get('tau')!r}"
+                )
+            params.require_init_provenance = True
     params.effective_rgcer_config = resolve_effective_rgcer_config(params)
 
 

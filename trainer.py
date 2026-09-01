@@ -203,10 +203,70 @@ class Trainer:
         if optimizer_class is None:
             raise ValueError(f"Unsupported optimizer: {optim_name}")
         parameters = list(self.model.parameters()) + list(self.loss_balancer.parameters())
-        return optimizer_class(
+        optimizer = optimizer_class(
             parameters,
             **{key: value for key, value in optim_param.items() if key != "optim"},
         )
+        multiplier = float(getattr(self.args, "backbone_lr_multiplier", 1.0) or 1.0)
+        if multiplier != 1.0:
+            # D7 S2/S3 (plan §11-§15): the Graphormer backbone gets a reduced
+            # LR while the heads keep the base LR.  Regroup AFTER construction
+            # so every other hyperparameter (weight decay, betas, eps) is
+            # inherited unchanged.
+            backbone_ids = {
+                id(parameter)
+                for name, parameter in self.model.named_parameters()
+                if name.startswith("encoder.backbone.")
+            }
+            base_group = {
+                key: value
+                for key, value in optimizer.param_groups[0].items()
+                if key != "params"
+            }
+            backbone_group = dict(base_group)
+            backbone_group["lr"] = base_group["lr"] * multiplier
+            head_params = []
+            backbone_params = []
+            for group in optimizer.param_groups:
+                for parameter in group["params"]:
+                    (backbone_params if id(parameter) in backbone_ids else head_params).append(
+                        parameter
+                    )
+            if not backbone_params:
+                raise ValueError(
+                    "backbone_lr_multiplier set but no encoder.backbone.* parameters found"
+                )
+            backbone_group["params"] = backbone_params
+            # head_params already contains the loss-balancer parameters (they
+            # were part of the original groups and never match the backbone
+            # prefix) — appending them again would duplicate them.
+            head_group = dict(base_group)
+            head_group["params"] = head_params
+            return optimizer_class([backbone_group, head_group])
+        return optimizer
+
+    def _apply_backbone_freeze(self, epoch: int) -> None:
+        """D7 S1/S3 (plan §8-§17): freeze the whole Graphormer backbone for the
+        first ``freeze_backbone_epochs`` epochs (requires_grad=False only — no
+        architectural change).  Called at the START of every epoch so a resume
+        reproduces the same schedule."""
+
+        freeze_epochs = int(getattr(self.args, "freeze_backbone_epochs", 0) or 0)
+        if freeze_epochs <= 0:
+            return
+        frozen = int(epoch) < freeze_epochs
+        state = getattr(self, "_backbone_freeze_state", None)
+        if state is frozen:
+            return
+        for name, parameter in self.model.named_parameters():
+            if name.startswith("encoder.backbone."):
+                parameter.requires_grad = not frozen
+        self._backbone_freeze_state = frozen
+        print(
+            f"backbone freeze schedule: epoch={epoch} "
+            f"{'FROZEN' if frozen else 'UNFROZEN (lr multiplier applies)'}"
+        )
+
 
     def _is_regression(self, task):
         return "RMSE" in self.task_dict[task].get("metrics", [])
@@ -1597,6 +1657,15 @@ class Trainer:
             self.train_loss_buffer = expanded
         for epoch in range(start_epoch, total_epochs):
             self.loss_balancer.train_loss_buffer = self.train_loss_buffer
+            # D7 S1/S3 (plan §15): the freeze schedule is evaluated at the
+            # START of every epoch, so "epoch t" state == after t updates.
+            self._apply_backbone_freeze(epoch)
+            # D7 §43-§48: representation drift is logged at the same boundary;
+            # an "epoch t" row is the state after t completed epochs (epoch 0
+            # row == untouched post-overlay baseline).
+            drift_tracker = getattr(self, "d7_drift_tracker", None)
+            if drift_tracker is not None:
+                drift_tracker.log_epoch(epoch, self.model)
             train_result = self._train_epoch(train_dataloaders_dict, epoch)
             for index, task in enumerate(self.task_name):
                 if np.isfinite(train_result["loss"][task]):
