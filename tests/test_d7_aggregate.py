@@ -76,6 +76,7 @@ def _write_d7_run(
         "manifest_sha256": manifest,
         "datastore_fingerprint": fingerprint,
         "feature_schema_version": "schema-test",
+        "split_seed": 42,
     }
     if contract:
         metadata["d7_artifact_contract"] = {
