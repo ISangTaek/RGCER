@@ -430,6 +430,28 @@ def test_d7_probe_selection_does_not_advance_train_loader_generator():
     assert _torch.equal(generator.get_state(), state_before)
 
 
+def test_pooled_representations_accepts_pooled_2d_backbone(tmp_path):
+    # The real Graphormer backbone returns the already-pooled (batch, dim)
+    # tensor; the probe must accept both layouts.
+    from d7_diagnostics import pooled_representations
+
+    class _PooledBackbone(torch.nn.Module):
+        def forward(self, batch):
+            return torch.arange(1.0, 5.0).repeat(len(batch.sample_id), 1) * 2.0
+
+    class _PooledModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = torch.nn.Module()
+            self.encoder.backbone = _PooledBackbone()
+
+    model = _PooledModel()
+    batches = [_ProbeBatch(["s1", "s2"])]
+    reps = pooled_representations(model, batches, torch.device("cpu"), expected_ids=["s1", "s2"])
+    assert set(reps) == {"s1", "s2"}
+    assert reps["s1"].shape[0] == 4
+
+
 def test_d7_probe_exact_set_mismatch_fails():
     # §22: pooled_representations must fail loudly if observed ids deviate.
     from d7_diagnostics import pooled_representations
