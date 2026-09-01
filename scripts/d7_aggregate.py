@@ -23,7 +23,13 @@ import argparse
 import csv
 import json
 import math
+import sys
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    # Allow direct execution: `python scripts/d7_aggregate.py stage-a ...`
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.d6_aggregate import (
     HUMAN_TASKS,

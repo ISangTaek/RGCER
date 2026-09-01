@@ -334,3 +334,17 @@ def test_clst_direct_audit_uses_exact_probe_set():
     assert total == 8
     observed = {sid for batch in batches for sid in batch.sample_id}
     assert observed == set(probe_ids)
+
+def test_d7_aggregate_runs_as_direct_script():
+    # The selector must be executable exactly as the manual invokes it
+    # (`python scripts/d7_aggregate.py ...`) — sys.path bootstrap included.
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "scripts/d7_aggregate.py", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
