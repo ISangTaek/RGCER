@@ -64,6 +64,9 @@ WOMEN_PROTECTION = 0.08
 # Fifth review §54: Stage-B women gate — the candidate's women mean may sit at
 # most this far above the B1 women mean.
 WOMEN_GATE_MARGIN = 0.03
+# Sixth-review P0: S2/S3 backbone LR is part of the experiment definition —
+# exactly 0.1x the head LR; anything else is not S2/S3.
+D7_BACKBONE_LR_MULTIPLIER = 0.1
 
 
 def _read_json(path) -> dict:
@@ -98,16 +101,34 @@ def check_d7_run_contract(run_dir: Path, candidate: str, seed: int, expected_las
     _check("run_metadata.d7_candidate", metadata.get("d7_candidate"), candidate)
     freeze = args_payload.get("freeze_backbone_epochs")
     multiplier = args_payload.get("backbone_lr_multiplier")
+
+    def _multiplier_matches(value, expected: float) -> bool:
+        return isinstance(value, (int, float)) and math.isclose(
+            float(value), expected, rel_tol=0.0, abs_tol=1e-12
+        )
+
     if candidate == "s1":
         _check("args.freeze_backbone_epochs", freeze, expected_last_epoch + 1)
+        if not _multiplier_matches(multiplier, 1.0):
+            violations.append(
+                f"args.backbone_lr_multiplier: found {multiplier!r}, expected 1.0"
+            )
     if candidate == "s2":
         _check("args.freeze_backbone_epochs", freeze, 0)
-        if not (isinstance(multiplier, (int, float)) and 0 < float(multiplier) < 1.0):
-            violations.append(f"args.backbone_lr_multiplier: found {multiplier!r}, expected 0<m<1")
+        if not _multiplier_matches(multiplier, D7_BACKBONE_LR_MULTIPLIER):
+            violations.append(
+                "args.backbone_lr_multiplier: found "
+                f"{multiplier!r}, expected exactly {D7_BACKBONE_LR_MULTIPLIER} "
+                "(protocol lock, not an LR grid search)"
+            )
     if candidate == "s3":
         _check("args.freeze_backbone_epochs", freeze, 5)
-        if not (isinstance(multiplier, (int, float)) and 0 < float(multiplier) < 1.0):
-            violations.append(f"args.backbone_lr_multiplier: found {multiplier!r}, expected 0<m<1")
+        if not _multiplier_matches(multiplier, D7_BACKBONE_LR_MULTIPLIER):
+            violations.append(
+                "args.backbone_lr_multiplier: found "
+                f"{multiplier!r}, expected exactly {D7_BACKBONE_LR_MULTIPLIER} "
+                "(protocol lock, not an LR grid search)"
+            )
     if candidate in CSDT_FAMILY:
         _check("args.freeze_backbone_epochs", freeze, 0)
         _check("args.backbone_lr_multiplier", multiplier, 1.0)

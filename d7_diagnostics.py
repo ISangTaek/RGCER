@@ -53,38 +53,77 @@ def select_probe_ids(candidate_ids, limit: int) -> list[str]:
     return unique[: int(limit)]
 
 
-def collect_probe_batches(train_loaders: dict, probe_ids, collator=None):
-    """Iterate the given TRAIN loader dict only, returning the minimal set of
-    collated batches whose union covers the probe ids.  Val/calibration/test
-    loaders are never passed in, so they cannot be touched."""
+def train_sample_ids(train_loaders: dict) -> list[str]:
+    """Deterministic human3 train sample ids, read straight from the task
+    datasets (never by iterating a shuffled DataLoader).  For the formal
+    ToxAcuteTaskDataset ``get_sample_id`` reads the store index only — it does
+    not open LMDB graphs."""
 
-    wanted = set(probe_ids)
-    seen: set[str] = set()
-    batches = []
+    sample_ids: set[str] = set()
     for task in sorted(train_loaders):
         loader = train_loaders.get(task)
         if loader is None:
             continue
-        for batch in loader:
-            if getattr(batch, "get", lambda *_: None)("is_empty", False):
+        dataset = loader.dataset
+        for index in range(len(dataset)):
+            if hasattr(dataset, "get_sample_id"):
+                sample_id = dataset.get_sample_id(index)
+            else:
+                sample_id = getattr(dataset[index], "sample_id")
+            sample_ids.add(str(sample_id))
+    if not sample_ids:
+        raise ValueError("D7 probe selection found no Human3 train sample IDs")
+    return sorted(sample_ids)
+
+
+def collect_probe_batches(train_loaders: dict, probe_ids, *, batch_size: int = 64):
+    """Sixth-review P1 (§17-§20): build EXACT probe batches containing ONLY
+    the requested molecules — no shuffled-batch neighbours.  Items are pulled
+    by sample_id straight from the datasets and re-collated in probe order
+    with the loaders' own collate_fn, so training loader generators are never
+    advanced and the probe set stays bit-identical across runs."""
+
+    wanted_order = [str(value) for value in probe_ids]
+    wanted = set(wanted_order)
+    items: dict[str, object] = {}
+    collate_fn = None
+    for task in sorted(train_loaders):
+        loader = train_loaders.get(task)
+        if loader is None:
+            continue
+        if collate_fn is None:
+            collate_fn = getattr(loader, "collate_fn", None)
+        dataset = loader.dataset
+        for index in range(len(dataset)):
+            if hasattr(dataset, "get_sample_id"):
+                sample_id = str(dataset.get_sample_id(index))
+            else:
+                sample_id = str(getattr(dataset[index], "sample_id"))
+            if sample_id not in wanted or sample_id in items:
                 continue
-            batch_ids = [str(value) for value in (getattr(batch, "sample_id", None) or [])]
-            if not any(sample_id in wanted and sample_id not in seen for sample_id in batch_ids):
-                continue
-            batches.append(batch)
-            seen.update(sample_id for sample_id in batch_ids if sample_id in wanted)
-            if wanted <= seen:
-                return batches
-    missing = sorted(wanted - seen)
+            # Backbone diagnostics do not use task label semantics; any human3
+            # task copy of the molecule is sufficient.
+            items[sample_id] = dataset[index]
+            if len(items) == len(wanted):
+                break
+        if len(items) == len(wanted):
+            break
+    missing = [sample_id for sample_id in wanted_order if sample_id not in items]
     if missing:
         raise RuntimeError(
-            f"probe set incomplete: missing {len(missing)} human3 train ids "
-            f"(e.g. {missing[:3]})"
+            f"D7 probe set incomplete: missing {len(missing)} IDs; "
+            f"examples={missing[:3]}"
         )
-    return batches
+    if collate_fn is None:
+        raise RuntimeError("D7 probe collection found no collator")
+    ordered_items = [items[sample_id] for sample_id in wanted_order]
+    return [
+        collate_fn(ordered_items[start : start + batch_size])
+        for start in range(0, len(ordered_items), batch_size)
+    ]
 
 
-def pooled_representations(model, batches, device) -> dict[str, torch.Tensor]:
+def pooled_representations(model, batches, device, expected_ids=None) -> dict[str, torch.Tensor]:
     """CLS-pooled backbone representation per sample id (no grad, eval)."""
 
     was_training = model.training
@@ -100,6 +139,19 @@ def pooled_representations(model, batches, device) -> dict[str, torch.Tensor]:
     finally:
         if was_training:
             model.train()
+    if expected_ids is not None:
+        # Sixth-review P1 (§22): the probe statistics must cover EXACTLY the
+        # selected molecules — a stray batch neighbour would pollute the
+        # mechanism measurement.
+        expected = {str(value) for value in expected_ids}
+        observed = set(representations)
+        if observed != expected:
+            raise RuntimeError(
+                "D7 probe representation ID mismatch: "
+                f"expected={len(expected)} observed={len(observed)} "
+                f"extra={sorted(observed - expected)[:3]} "
+                f"missing={sorted(expected - observed)[:3]}"
+            )
     return representations
 
 
@@ -196,19 +248,11 @@ class D7DriftTracker:
             key: value.detach().cpu().clone() for key, value in model.state_dict().items()
         }
         self.init_state = init_state
-        self.probe_ids = select_probe_ids(
-            (
-                sample_id
-                for loader in train_loaders.values()
-                if loader is not None
-                for batch in loader
-                if not getattr(batch, "get", lambda *_: None)("is_empty", False)
-                for sample_id in (getattr(batch, "sample_id", None) or [])
-            ),
-            probe_size,
-        )
+        self.probe_ids = select_probe_ids(train_sample_ids(train_loaders), probe_size)
         self.probe_batches = collect_probe_batches(train_loaders, self.probe_ids)
-        self.reference_representations = pooled_representations(model, self.probe_batches, device)
+        self.reference_representations = pooled_representations(
+            model, self.probe_batches, device, expected_ids=self.probe_ids
+        )
         self.rows: list[dict] = []
         # Baseline row: the untouched post-overlay state, epoch=-1 (§38).
         self._append_row(-1, "baseline", model, compute_feature=False)
@@ -221,7 +265,9 @@ class D7DriftTracker:
             # definition (fifth-review P1-4 alignment).
             feature = "0.00000000"
         elif compute_feature and int(epoch) in self.feature_drift_epochs:
-            current = pooled_representations(model, self.probe_batches, self.device)
+            current = pooled_representations(
+                model, self.probe_batches, self.device, expected_ids=self.probe_ids
+            )
             feature = f"{feature_drift(current, self.reference_representations):.8f}"
         else:
             feature = ""

@@ -319,3 +319,18 @@ def test_d7_clst_audit_accepts_matched_pair(tmp_path):
         "animal_shuffle_mapping_sha256",
     ):
         assert matched.get(key) not in (None, ""), key
+
+def test_clst_direct_audit_uses_exact_probe_set():
+    # Sixth-review §26: audit n_samples must equal the probe size exactly —
+    # never the whole loader batch that happened to contain a probe molecule.
+    from scripts.d7_clst_audit import _fixed_probe_batches
+    from tests.test_d7_candidates import _StubLoader
+
+    loaders = {"task_a": _StubLoader([f"id{i}" for i in range(12)])}
+    batches, probe_ids = _fixed_probe_batches(loaders, probe_size=8)
+    assert len(probe_ids) == 8
+    assert probe_ids == sorted(probe_ids)
+    total = sum(len(batch.sample_id) for batch in batches)
+    assert total == 8
+    observed = {sid for batch in batches for sid in batch.sample_id}
+    assert observed == set(probe_ids)

@@ -258,7 +258,10 @@ def test_drift_tracker_epoch0_row_is_zero_drift(tmp_path):
             self.encoder = _TinyEncoder()
 
     model = _TinyModel()
-    loaders = {"task_a": [_ProbeBatch(["s2", "s1"])], "task_b": [_ProbeBatch(["s1", "s3"])]}
+    loaders = {
+        "task_a": _StubLoader(["s2", "s1"]),
+        "task_b": _StubLoader(["s1", "s3"]),
+    }
     tracker = D7DriftTracker(
         model=model,
         train_loaders=loaders,
@@ -328,7 +331,7 @@ def test_drift_anchor_type_is_recorded(tmp_path):
             self.encoder.backbone = _AnchorBackbone()
 
     model = _AnchorModel()
-    loaders = {"task_a": [_ProbeBatch(["s1"])]}
+    loaders = {"task_a": _StubLoader(["s1"])}
     for anchor_type in ("animal_pretrained", "counterfactual_init"):
         tracker = D7DriftTracker(
             model=model,
@@ -346,6 +349,95 @@ def test_drift_anchor_type_is_recorded(tmp_path):
             output_dir=None,
             anchor_type="bogus",
         )
+
+
+# ----------------------------------------------------------------------
+# Sixth-review P1: exact probe set (§25-§26)
+# ----------------------------------------------------------------------
+class _ProbeDataset(torch.utils.data.Dataset):
+    """Synthetic human3 train dataset with cheap get_sample_id."""
+
+    def __init__(self, ids):
+        self.ids = [str(value) for value in ids]
+
+    def __len__(self):
+        return len(self.ids)
+
+    def get_sample_id(self, index):
+        return self.ids[index]
+
+    def __getitem__(self, index):
+        return {"sample_id": self.ids[index]}
+
+
+class _StubLoader:
+    """Minimal loader surface used by the probe helpers: .dataset/.collate_fn."""
+
+    def __init__(self, ids, collate_fn=None):
+        self.dataset = _ProbeDataset(ids)
+        self.collate_fn = collate_fn or (lambda items: _ProbeBatch([item["sample_id"] for item in items]))
+
+
+def test_d7_probe_batches_contain_exact_probe_ids():
+    # §25: a batch containing a probe molecule AND an extra molecule must
+    # contribute ONLY the probe molecule to probe statistics.
+    from d7_diagnostics import collect_probe_batches, pooled_representations, select_probe_ids, train_sample_ids
+
+    # Sorted train ids: ["a_probe", "b_extra", "c_tail"]; the probe is ONLY
+    # "a_probe", while the batch that carries it also carries "b_extra".
+    loaders = {"task_a": _StubLoader(["a_probe", "b_extra", "c_tail"])}
+    probe_ids = select_probe_ids(train_sample_ids(loaders), 1)
+    assert probe_ids == ["a_probe"]
+    batches = collect_probe_batches(loaders, probe_ids)
+    model = _ProbeModelForProbe()
+    representations = pooled_representations(model, batches, torch.device("cpu"), expected_ids=probe_ids)
+    assert set(representations) == {"a_probe"}
+    assert "b_extra" not in representations
+    assert "c_tail" not in representations
+
+
+class _ProbeModelForProbe(torch.nn.Module):
+    class _Backbone(torch.nn.Module):
+        def forward(self, batch):
+            tokens = torch.ones(len(batch.sample_id), 2, 4)
+            return tokens * torch.arange(1.0, 5.0)
+
+    def __init__(self):
+        super().__init__()
+        self.encoder = torch.nn.Module()
+        self.encoder.backbone = self._Backbone()
+
+
+def test_d7_probe_selection_does_not_advance_train_loader_generator():
+    # §25: diagnostics must not disturb the formal training loaders.
+    import torch as _torch
+
+    dataset = _ProbeDataset([f"id{i}" for i in range(8)])
+
+    def collate(items):
+        return _ProbeBatch([item["sample_id"] for item in items])
+
+    generator = _torch.Generator().manual_seed(7)
+    loader = _torch.utils.data.DataLoader(
+        dataset, batch_size=2, shuffle=True, generator=generator, collate_fn=collate
+    )
+    state_before = generator.get_state().clone()
+    loaders = {"task_a": loader}
+    from d7_diagnostics import collect_probe_batches, train_sample_ids
+
+    train_sample_ids(loaders)
+    collect_probe_batches(loaders, [f"id{i}" for i in range(4)])
+    assert _torch.equal(generator.get_state(), state_before)
+
+
+def test_d7_probe_exact_set_mismatch_fails():
+    # §22: pooled_representations must fail loudly if observed ids deviate.
+    from d7_diagnostics import pooled_representations
+
+    model = _ProbeModelForProbe()
+    batches = [_ProbeBatch(["s1", "intruder"])]
+    with pytest.raises(RuntimeError, match="probe representation ID mismatch"):
+        pooled_representations(model, batches, torch.device("cpu"), expected_ids=["s1"])
 
 
 # ----------------------------------------------------------------------
@@ -397,6 +489,7 @@ def _write_d7_run(root, candidate, seed, epochs, freeze, multiplier, contract=Tr
 def _write_b1_sidecar(tmp_path, mode="b1", seed=42, name="s_init.pt"):
     """Create a stub init artifact + provenance sidecar for validate_params."""
 
+    tmp_path.mkdir(parents=True, exist_ok=True)
     init_state = tmp_path / name
     init_state.write_bytes(b"stub")
     provenance = {"mode": mode, "human_seed": seed}
@@ -754,6 +847,62 @@ def test_validate_params_s3_requires_exactly_five_frozen_epochs():
     params.backbone_lr_multiplier = 0.1
     with pytest.raises(ValueError, match="first 5 epochs"):
         validate_params(params)
+
+
+def test_validate_params_s2_rejects_multiplier_other_than_point_one(tmp_path):
+    # Sixth-review P0: Stage A is direction screening, not an LR search —
+    # only backbone_lr_multiplier == 0.1 is S2.
+    from main import validate_params
+
+    for bad_multiplier in (0.05, 0.2, 0.3):
+        params = _base_params()
+        params.d7_candidate = "s2"
+        params.freeze_backbone_epochs = 0
+        params.backbone_lr_multiplier = bad_multiplier
+        params.init_state_path = _write_b1_sidecar(
+            tmp_path / f"m{bad_multiplier}", name=f"s2_{bad_multiplier}.pt"
+        )
+        with pytest.raises(ValueError, match="not an LR grid search"):
+            validate_params(params)
+    params = _base_params()
+    params.d7_candidate = "s2"
+    params.freeze_backbone_epochs = 0
+    params.backbone_lr_multiplier = 0.1
+    params.init_state_path = _write_b1_sidecar(tmp_path, name="s2_ok.pt")
+    validate_params(params)  # 0.1 accepted
+
+
+def test_validate_params_s3_rejects_multiplier_other_than_point_one(tmp_path):
+    from main import validate_params
+
+    for bad_multiplier in (0.05, 0.2):
+        params = _base_params()
+        params.d7_candidate = "s3"
+        params.freeze_backbone_epochs = 5
+        params.backbone_lr_multiplier = bad_multiplier
+        params.init_state_path = _write_b1_sidecar(
+            tmp_path / f"m{bad_multiplier}", name=f"s3_{bad_multiplier}.pt"
+        )
+        with pytest.raises(ValueError, match="backbone_lr_multiplier=0.1"):
+            validate_params(params)
+    params = _base_params()
+    params.d7_candidate = "s3"
+    params.freeze_backbone_epochs = 5
+    params.backbone_lr_multiplier = 0.1
+    params.init_state_path = _write_b1_sidecar(tmp_path, name="s3_ok.pt")
+    validate_params(params)
+
+
+def test_d7_run_contract_rejects_s2_multiplier_0_2(tmp_path):
+    run_dir = _write_d7_run(tmp_path, "s2", 42, 20, freeze=0, multiplier=0.2)
+    violations = check_d7_run_contract(run_dir, "s2", 42, 19)
+    assert any("backbone_lr_multiplier" in violation for violation in violations)
+
+
+def test_d7_run_contract_rejects_s3_multiplier_0_05(tmp_path):
+    run_dir = _write_d7_run(tmp_path, "s3", 42, 20, freeze=5, multiplier=0.05)
+    violations = check_d7_run_contract(run_dir, "s3", 42, 19)
+    assert any("backbone_lr_multiplier" in violation for violation in violations)
 
 
 def test_validate_params_rejects_d6_and_d7_together():

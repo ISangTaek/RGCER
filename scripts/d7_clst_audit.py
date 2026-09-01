@@ -57,28 +57,19 @@ def verify_audit_teachers(real_dir, shuffle_dir, expected_epoch: int, expected_m
 
 
 def _fixed_probe_batches(train_loaders: dict, probe_size: int):
-    """Plan §32/§47: one fixed set of human3 TRAIN batches covering the first
-    `probe_size` unique sorted sample_ids."""
+    """§32/§47 + sixth review §23: fixed probe set built EXACTLY from the
+    first `probe_size` sorted unique human3 train ids — read from the task
+    datasets, never from shuffled loader batches, so no extra molecule can
+    leak into the audit statistics."""
 
-    from d7_diagnostics import collect_probe_batches, select_probe_ids
+    from d7_diagnostics import collect_probe_batches, select_probe_ids, train_sample_ids
 
-    seen = set()
-    candidate = []
-    for loader in train_loaders.values():
-        if loader is None:
-            continue
-        for batch in loader:
-            if getattr(batch, "get", lambda *_: None)("is_empty", False):
-                continue
-            for sample_id in (getattr(batch, "sample_id", None) or []):
-                if str(sample_id) not in seen:
-                    seen.add(str(sample_id))
-                    candidate.append(str(sample_id))
-    probe_ids = select_probe_ids(candidate, probe_size)
-    return collect_probe_batches(train_loaders, probe_ids), probe_ids
+    probe_ids = select_probe_ids(train_sample_ids(train_loaders), probe_size)
+    batches = collect_probe_batches(train_loaders, probe_ids)
+    return batches, probe_ids
 
 
-def _layer_outputs(model, batches, device):
+def _layer_outputs(model, batches, device, expected_ids=None):
     """Direct forward capture: run the backbone once per batch and record each
     layer's CLS-pooled output plus the final pooled representation."""
 
@@ -112,6 +103,23 @@ def _layer_outputs(model, batches, device):
     for index in range(len(layers)):
         tensors = stores[index][index]
         per_layer.append(torch.cat(tensors, dim=0))
+    if expected_ids is not None:
+        # Sixth-review §24: the audit statistics must cover EXACTLY the
+        # selected probe molecules.
+        expected = {str(value) for value in expected_ids}
+        if set(final) != expected:
+            raise RuntimeError(
+                "D7-0 audit probe ID mismatch: "
+                f"expected={len(expected)} observed={len(final)} "
+                f"extra={sorted(set(final) - expected)[:3]} "
+                f"missing={sorted(expected - set(final))[:3]}"
+            )
+        for index, pooled in enumerate(per_layer):
+            if pooled.shape[0] != len(expected):
+                raise RuntimeError(
+                    f"D7-0 audit layer {index} n_samples={pooled.shape[0]} "
+                    f"!= probe size {len(expected)}"
+                )
     return per_layer, final
 
 
@@ -189,8 +197,8 @@ def main() -> None:
     batches, probe_ids = _fixed_probe_batches(loaders["train"], args.probe_size)
     print(f"D7-0 audit on {len(probe_ids)} fixed human3 train molecules")
 
-    real_layers, real_final = _layer_outputs(model_real, batches, device)
-    shuffle_layers, shuffle_final = _layer_outputs(model_shuffle, batches, device)
+    real_layers, real_final = _layer_outputs(model_real, batches, device, expected_ids=probe_ids)
+    shuffle_layers, shuffle_final = _layer_outputs(model_shuffle, batches, device, expected_ids=probe_ids)
 
     rows = [
         _row(index, real_layers[index], shuffle_layers[index])
@@ -228,7 +236,7 @@ def main() -> None:
                 parameter.add_(1e-4)
             perturbed_tensor_name = f"encoder.backbone.layers.0.{name}"
             break
-    perturbed_layers, _ = _layer_outputs(model_perturbed, batches, device)
+    perturbed_layers, _ = _layer_outputs(model_perturbed, batches, device, expected_ids=probe_ids)
     sanity_rows = []
     for index in range(len(real_layers)):
         difference = float(

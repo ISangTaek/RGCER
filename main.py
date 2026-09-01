@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import warnings
 from pathlib import Path
@@ -108,6 +109,11 @@ def _sha256_file(path):
 # (sequential-transfer) initialization — a scratch backbone would turn the
 # representation-preservation question into a meaningless one (fifth review
 # P0-1).
+# D7 protocol lock (sixth review P0): the preservation-family fine-tuning LR
+# is part of the experiment DEFINITION, not a searchable hyperparameter —
+# S2/S3 run the backbone at exactly 0.1x the base LR.
+D7_BACKBONE_LR_MULTIPLIER = 0.1
+
 D6_PROVENANCE_MODE = {
     "b0a": "anchor",
     "b1": "b1",
@@ -1423,10 +1429,11 @@ def validate_params(params):
         if d7_candidate == "s2":
             if freeze != 0:
                 raise ValueError("--d7_candidate s2 never freezes: freeze_backbone_epochs must be 0")
-            if multiplier >= 1.0:
+            if not math.isclose(multiplier, D7_BACKBONE_LR_MULTIPLIER, rel_tol=0.0, abs_tol=1e-12):
                 raise ValueError(
-                    "--d7_candidate s2 requires a reduced backbone LR "
-                    "(--backbone_lr_multiplier < 1.0, plan §12)"
+                    "--d7_candidate s2 requires backbone_lr_multiplier=0.1 "
+                    "(D7 micro-screen protocol; this is not an LR grid search, "
+                    f"found {multiplier!r})"
                 )
         if d7_candidate == "s3":
             if freeze != 5:
@@ -1434,10 +1441,10 @@ def validate_params(params):
                     "--d7_candidate s3 freezes exactly the first 5 epochs "
                     "(plan §15): freeze_backbone_epochs must be 5"
                 )
-            if multiplier >= 1.0:
+            if not math.isclose(multiplier, D7_BACKBONE_LR_MULTIPLIER, rel_tol=0.0, abs_tol=1e-12):
                 raise ValueError(
-                    "--d7_candidate s3 requires backbone_lr_multiplier < 1.0 for the "
-                    "unfrozen phase (plan §15)"
+                    "--d7_candidate s3 requires backbone_lr_multiplier=0.1 after the "
+                    f"five-epoch frozen phase (found {multiplier!r})"
                 )
         if d7_candidate in {"s1", "s2", "s3"}:
             # Fifth-review P0-1: the preservation family MUST start from the
