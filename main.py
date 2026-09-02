@@ -438,6 +438,14 @@ def _device_from_params(params):
     return torch.device("cpu")
 
 
+# Eighth-D8 review (§58-§60): multiple _resolve_data_store() calls used to
+# create independent ToxAcuteDataStore instances with independent LMDB env
+# caches — a second lmdb.open() on the same shard path raised "already open
+# in this process".  A module-level singleton per root ensures all data
+# access shares one env cache.
+_resolved_store_cache: dict[str, "ToxAcuteDataStore"] = {}
+
+
 def _resolve_data_store(params, task_names, *, required=False):
     """Resolve the formal V2 root while retaining a deprecated V1 alias."""
 
@@ -459,7 +467,15 @@ def _resolve_data_store(params, task_names, *, required=False):
         if required:
             raise ValueError("--data_store_dir is required for ToxAcute train/test/data_check")
         return None
+    cache_key = str(Path(requested).resolve())
+    if cache_key in _resolved_store_cache:
+        store = _resolved_store_cache[cache_key]
+        params.data_store_dir = str(requested)
+        params.datastore_metadata = store.metadata
+        params.datastore_context = store.context
+        return store
     store = ToxAcuteDataStore.resolve(requested)
+    _resolved_store_cache[cache_key] = store
     expected_max_path = getattr(params, "max_path_distance", None)
     auxiliary_names = set(getattr(params, "auxiliary_task_names", []))
     expected_tasks = [task for task in task_names if task not in auxiliary_names]
