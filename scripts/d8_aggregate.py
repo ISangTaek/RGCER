@@ -232,9 +232,30 @@ def _final_feature_drift(run_dir: Path):
         return None
 
 
+def _final_param_drift(run_dir: Path):
+    """P1-4: final post-epoch backbone parameter drift (diagnostic output for
+    ChatGPT review — deliberately NOT a gate threshold)."""
+
+    drift_csv = run_dir / "diagnostics" / "d7_representation_drift.csv"
+    if not drift_csv.is_file():
+        return None
+    rows = [row for row in csv.DictReader(drift_csv.open(encoding="utf-8")) if row.get("state") == "post_epoch"]
+    if not rows:
+        return None
+    value = rows[-1].get("backbone_param_drift")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _functional_forgetting(run_dir: Path):
     data = _read_json(run_dir / "functional_forgetting.json")
     if not data:
+        return None
+    # Fifth-D8 review P0-6 (§35): only evaluator output with VERIFIED matched
+    # teacher provenance may participate in mechanism gates.
+    if data.get("provenance_verified") is not True:
         return None
     return {
         "relative": data.get("functional_forgetting_relative"),
@@ -326,7 +347,7 @@ def d8_0(d6_root: Path, d7_root: Path, seeds: list[int], output_dir: Path, trace
     if stats_b1["mean"] > 0 and s1_best_mean > b1_best_mean:
         selection_sensitive = True
 
-    gate_pass = bool(
+    performance_gate_pass = bool(
         stats_b1["mean"] > GATE_MEAN_VS_B1
         and stats_b1["positive"] >= math.ceil(GATE_POSITIVE_FRACTION * len(seeds))
         and stats_b1["median"] > 0
@@ -336,7 +357,42 @@ def d8_0(d6_root: Path, d7_root: Path, seeds: list[int], output_dir: Path, trace
         and women_ok
         and human_ok
     )
-    stop_reason = None if gate_pass else "S1 failed the 5-seed formal gate (§16-§18); STOP before D8-A"
+
+    # Fifth-D8 review P1-3 (§49-§54): the functional forgetting audit is a
+    # REQUIRED D8-0 deliverable — B1 and S1 need complete provenance-verified
+    # evidence on every seed, and every S1 seed must show the §25 exact-zero
+    # invariant.  Kept OUT of the performance gate so diagnostics never change
+    # method selection; D8-A may only start when BOTH pass.
+    audit_by_ref: dict[str, dict[int, dict]] = {"b1": {}, "s1": {}}
+    functional_audit_complete = True
+    functional_invariant_failure = False
+    for reference in ("b1", "s1"):
+        stage_dir = "d6_stage_b" if reference == "b1" else "d7_stage_b"
+        tag = f"d6_{reference}_e40" if reference == "b1" else f"d7_{reference}_e40"
+        root = d6_root if reference == "b1" else d7_root
+        for seed in seeds:
+            run_dir = candidate_run_dir(root / stage_dir, reference, tag, seed)
+            forgetting = _functional_forgetting(run_dir)
+            if forgetting is None:
+                functional_audit_complete = False
+                continue
+            audit_by_ref[reference][seed] = forgetting
+    for seed in seeds:
+        entry = audit_by_ref["s1"].get(seed)
+        if entry is None or entry.get("exact_zero") is not True:
+            functional_invariant_failure = True
+            functional_audit_complete = False
+    gate_pass = bool(performance_gate_pass and functional_audit_complete)
+    if not performance_gate_pass:
+        stop_reason = "S1 failed the 5-seed formal gate (§16-§18); STOP before D8-A"
+    elif not functional_audit_complete:
+        stop_reason = (
+            "functional forgetting audit incomplete"
+            + (" / FUNCTIONAL_INVARIANT_FAILURE" if functional_invariant_failure else "")
+            + " — complete the audit before D8-A"
+        )
+    else:
+        stop_reason = None
 
     summary_rows = []
     for reference, by_seed in references.items():
@@ -410,6 +466,14 @@ def d8_0(d6_root: Path, d7_root: Path, seeds: list[int], output_dir: Path, trace
                     "delta_max": forgetting["delta_max"],
                 }
             )
+    # P1-3: completeness + invariant are first-class gate fields.
+    ff_complete = {
+        "functional_audit_complete": functional_audit_complete,
+        "functional_invariant_failure": functional_invariant_failure,
+        "b1_files_found": len(audit_by_ref["b1"]),
+        "s1_files_found": len(audit_by_ref["s1"]),
+        "required_files_per_reference": len(seeds),
+    }
     _write_csv(
         output_dir / "D8_0_FUNCTIONAL_FORGETTING.csv",
         ["candidate", "seed", "functional_forgetting_abs", "functional_forgetting_relative",
@@ -464,12 +528,21 @@ def d8_0(d6_root: Path, d7_root: Path, seeds: list[int], output_dir: Path, trace
         "women_gate": women_ok,
         "human_endpoint_gate": human_ok,
         "selection_sensitive": selection_sensitive,
+        "performance_gate_pass": performance_gate_pass,
+        "functional_audit_complete": functional_audit_complete,
+        "functional_invariant_failure": functional_invariant_failure,
         "s1_best_mean": s1_best_mean,
         "b1_best_mean": b1_best_mean,
         "b0_stable_by_seed": {seed: references["b0"][seed]["stable_rmse"] for seed in seeds},
         "b1_stable_by_seed": {seed: references["b1"][seed]["stable_rmse"] for seed in seeds},
         "s1_stable_by_seed": {seed: references["s1"][seed]["stable_rmse"] for seed in seeds},
     }
+    _write_csv(
+        output_dir / "D8_0_AUDIT_COMPLETENESS.csv",
+        ["functional_audit_complete", "functional_invariant_failure",
+         "b1_files_found", "s1_files_found", "required_files_per_reference"],
+        [ff_complete],
+    )
     (output_dir / "D8_0_GATE.json").write_text(
         json.dumps(trace["d8_0"], indent=2, sort_keys=True), encoding="utf-8"
     )
@@ -505,72 +578,78 @@ def d8_a(d8_root: Path, d7_root: Path, seeds: list[int], output_dir: Path, trace
     gates = {}
     for candidate in D8_CANDIDATES:
         per_seed = candidate_rows[candidate]
-        gains = {}
-        endpoints_ok = True
-        women_values = {"candidate": [], "s1": []}
-        human_values = {"candidate": [], "s1": []}
-        non_worse_endpoints = 0
-        for seed in seeds:
-            if per_seed[seed].get("status") != "PASS":
-                continue
-            gains[seed] = float(s1_refs[seed]["stable_rmse"]) - float(per_seed[seed]["stable_rmse"])
-            worse = 0
-            for task in HUMAN_TASKS:
-                key = f"{task.split('_')[0]}_rmse"
-                candidate_value = per_seed[seed].get(key)
-                s1_value = s1_refs[seed].get(key)
-                if candidate_value is None or s1_value is None:
-                    continue
-                candidate_value, s1_value = float(candidate_value), float(s1_value)
-                if candidate_value > s1_value:
-                    worse += 1
-                if task == HUMAN_TASKS[1]:
-                    women_values["candidate"].append(candidate_value)
-                    women_values["s1"].append(s1_value)
-                if task == HUMAN_TASKS[2]:
-                    human_values["candidate"].append(candidate_value)
-                    human_values["s1"].append(s1_value)
-            if worse <= 1:
-                non_worse_endpoints += 1
+        passing_seeds = [seed for seed in seeds if per_seed[seed].get("status") == "PASS"]
+        gains = {
+            seed: float(s1_refs[seed]["stable_rmse"]) - float(per_seed[seed]["stable_rmse"])
+            for seed in passing_seeds
+        }
         complete = len(gains) == len(seeds)
         mean_gain = _finite_mean(list(gains.values()))
         positive = sum(1 for value in gains.values() if value > 0)
-        women_mean_candidate = _finite_mean(women_values["candidate"]) if women_values["candidate"] else float("nan")
-        women_mean_s1 = _finite_mean(women_values["s1"]) if women_values["s1"] else float("nan")
+
+        # Sixth-D8 review P0-2 (§12-§13): the endpoint gate is defined on
+        # CROSS-SEED endpoint MEANS, never on per-seed wins.
+        endpoint_gate = {}
+        endpoint_non_worse = 0
+        for task in HUMAN_TASKS:
+            key = f"{task.split('_')[0]}_rmse"
+            candidate_mean = _finite_mean([float(per_seed[seed][key]) for seed in passing_seeds])
+            s1_mean = _finite_mean([float(s1_refs[seed][key]) for seed in passing_seeds])
+            non_worse = candidate_mean <= s1_mean
+            endpoint_gate[task] = {
+                "candidate_mean": candidate_mean,
+                "s1_mean": s1_mean,
+                "gain_vs_s1": s1_mean - candidate_mean,
+                "non_worse": non_worse,
+            }
+            if non_worse:
+                endpoint_non_worse += 1
+        endpoint_gate_pass = endpoint_non_worse >= 2
+        women_entry = endpoint_gate[HUMAN_TASKS[1]]
         women_gate = bool(
-            women_values["candidate"]
-            and women_mean_candidate <= women_mean_s1 + D8A_WOMEN_MARGIN
+            women_entry["candidate_mean"] <= women_entry["s1_mean"] + D8A_WOMEN_MARGIN
         )
-        human_worsen = (
-            _finite_mean(human_values["candidate"]) - _finite_mean(human_values["s1"])
-            if human_values["candidate"] and human_values["s1"]
-            else float("nan")
-        )
-        human_gate = not (human_worsen > D8A_HUMAN_ENDPOINT_BLOCK)
-        final_feature_drift = None
+        human_entry = endpoint_gate[HUMAN_TASKS[2]]
+        human_worsen = human_entry["candidate_mean"] - human_entry["s1_mean"]
+        human_gate = human_worsen <= D8A_HUMAN_ENDPOINT_BLOCK
+
+        # Sixth-D8 review P0-3 (§17-§18): feature drift must be present and
+        # within threshold for BOTH development seeds — never just the first.
+        feature_drift_by_seed = {}
+        param_drift_by_seed = {}
         for seed in seeds:
             run_dir = d8_root / "d8_stage_a" / candidate / f"d8_{candidate}_e20" / f"seed_{seed}"
-            final_feature_drift = _final_feature_drift(run_dir)
-            if final_feature_drift is not None:
-                break
-        representation_gate = (
-            final_feature_drift is not None and final_feature_drift <= D8A_FEATURE_DRIFT_MAX
+            feature_value = _final_feature_drift(run_dir)
+            if feature_value is not None:
+                feature_drift_by_seed[seed] = feature_value
+            param_value = _final_param_drift(run_dir)
+            if param_value is not None:
+                param_drift_by_seed[seed] = param_value
+        complete_feature_drift = len(feature_drift_by_seed) == len(seeds)
+        representation_gate = bool(
+            complete_feature_drift
+            and all(value <= D8A_FEATURE_DRIFT_MAX for value in feature_drift_by_seed.values())
         )
-        forgetting_values = []
+
+        # Sixth-D8 review P0-5 (§25): functional forgetting evidence must be
+        # complete over both seeds as well.
+        forgetting_by_seed = {}
         for seed in seeds:
             run_dir = d8_root / "d8_stage_a" / candidate / f"d8_{candidate}_e20" / f"seed_{seed}"
             forgetting = _functional_forgetting(run_dir)
             if forgetting and forgetting.get("relative") is not None:
-                forgetting_values.append(float(forgetting["relative"]))
+                forgetting_by_seed[seed] = float(forgetting["relative"])
+        complete_forgetting = len(forgetting_by_seed) == len(seeds)
         functional_gate = bool(
-            forgetting_values
-            and all(value <= D8A_REL_FORGETTING_MAX for value in forgetting_values)
+            complete_forgetting
+            and all(value <= D8A_REL_FORGETTING_MAX for value in forgetting_by_seed.values())
         )
+
         gate_pass = bool(
             complete
             and mean_gain >= D8A_MIN_MEAN_GAIN
             and positive == len(seeds)
-            and non_worse_endpoints >= 2
+            and endpoint_gate_pass
             and women_gate
             and human_gate
             and representation_gate
@@ -580,15 +659,20 @@ def d8_a(d8_root: Path, d7_root: Path, seeds: list[int], output_dir: Path, trace
             "complete_seed_pairs": complete,
             "mean_gain_vs_s1": mean_gain,
             "positive_seeds": positive,
-            "endpoints_non_worse": non_worse_endpoints,
+            "endpoint_gate": endpoint_gate,
+            "endpoint_non_worse": endpoint_non_worse,
+            "endpoint_gate_pass": endpoint_gate_pass,
             "women_gate": women_gate,
-            "women_mean_candidate": women_mean_candidate,
-            "women_mean_s1": women_mean_s1,
-            "human_endpoint_worsen": human_worsen,
+            "human_worsen": human_worsen,
             "human_gate": human_gate,
-            "final_feature_drift": final_feature_drift,
+            "feature_drift_by_seed": feature_drift_by_seed,
+            "max_feature_drift": max(feature_drift_by_seed.values()) if feature_drift_by_seed else None,
+            "mean_feature_drift": _finite_mean(list(feature_drift_by_seed.values())) if feature_drift_by_seed else None,
+            "complete_feature_drift": complete_feature_drift,
             "representation_gate": representation_gate,
-            "functional_forgetting_relative": forgetting_values or None,
+            "final_backbone_param_drift_by_seed": param_drift_by_seed,
+            "forgetting_by_seed": forgetting_by_seed,
+            "complete_forgetting": complete_forgetting,
             "functional_gate": functional_gate,
             "gate_pass": gate_pass,
         }
@@ -721,6 +805,7 @@ def d8_b(d8_root: Path, d7_root: Path, d6_root: Path, candidate: str, seeds: lis
 
     gains = {}
     endpoint_non_worse = 0
+    endpoint_gate = {}
     women_stats = {}
     human_stats = {}
     for task in HUMAN_TASKS:
@@ -730,6 +815,11 @@ def d8_b(d8_root: Path, d7_root: Path, d6_root: Path, candidate: str, seeds: lis
         s1_mean = _finite_mean(
             [float(s1_refs[seed].get(f"{task.split('_')[0]}_rmse")) for seed in seeds]
         )
+        endpoint_gate[task] = {
+            "candidate_mean": candidate_mean,
+            "s1_mean": s1_mean,
+            "non_worse": candidate_mean <= s1_mean,
+        }
         if task == HUMAN_TASKS[1]:
             women_stats = {
                 "candidate_women_mean": candidate_mean,
@@ -753,23 +843,31 @@ def d8_b(d8_root: Path, d7_root: Path, d6_root: Path, candidate: str, seeds: lis
     stats = _paired_stats(list(gains.values()))
     women_non_worse = women_stats.get("women_non_worse", False)
     human_ok = human_stats.get("human_worsen", 0.0) <= D8B_HUMAN_MEAN_BLOCK
-    final_feature_drift = None
+    # Sixth-D8 review P0-4 (§19-§21): ALL five seeds need mechanism evidence —
+    # one good seed must never carry a 5-seed confirmation.
+    feature_drift_by_seed = {}
+    param_drift_by_seed = {}
     for seed in seeds:
         run_dir = d8_root / "d8_stage_b" / candidate / f"d8_{candidate}_e40" / f"seed_{seed}"
-        final_feature_drift = _final_feature_drift(run_dir)
-        if final_feature_drift is not None:
-            break
-    forgetting_values = []
+        feature_value = _final_feature_drift(run_dir)
+        if feature_value is not None:
+            feature_drift_by_seed[seed] = feature_value
+        param_value = _final_param_drift(run_dir)
+        if param_value is not None:
+            param_drift_by_seed[seed] = param_value
+    complete_feature_drift = len(feature_drift_by_seed) == len(seeds)
+    forgetting_by_seed = {}
     for seed in seeds:
         run_dir = d8_root / "d8_stage_b" / candidate / f"d8_{candidate}_e40" / f"seed_{seed}"
         forgetting = _functional_forgetting(run_dir)
         if forgetting and forgetting.get("relative") is not None:
-            forgetting_values.append(float(forgetting["relative"]))
+            forgetting_by_seed[seed] = float(forgetting["relative"])
+    complete_forgetting = len(forgetting_by_seed) == len(seeds)
     mechanism_gate = bool(
-        final_feature_drift is not None
-        and final_feature_drift <= D8B_FEATURE_DRIFT_MAX
-        and forgetting_values
-        and all(value <= D8B_REL_FORGETTING_MAX for value in forgetting_values)
+        complete_feature_drift
+        and all(value <= D8B_FEATURE_DRIFT_MAX for value in feature_drift_by_seed.values())
+        and complete_forgetting
+        and all(value <= D8B_REL_FORGETTING_MAX for value in forgetting_by_seed.values())
     )
     gate_pass = bool(
         complete
@@ -791,10 +889,15 @@ def d8_b(d8_root: Path, d7_root: Path, d6_root: Path, candidate: str, seeds: lis
         "median": stats["median"],
         "positive_seeds": stats["positive"],
         "endpoint_non_worse": endpoint_non_worse,
+        "endpoint_gate": endpoint_gate,
         "women_non_worse": women_non_worse,
         "human_worsen": human_stats.get("human_worsen"),
-        "final_feature_drift": final_feature_drift,
-        "functional_forgetting_relative": forgetting_values or None,
+        "feature_drift_by_seed": feature_drift_by_seed,
+        "max_feature_drift": max(feature_drift_by_seed.values()) if feature_drift_by_seed else None,
+        "complete_feature_drift": complete_feature_drift,
+        "final_backbone_param_drift_by_seed": param_drift_by_seed,
+        "forgetting_by_seed": forgetting_by_seed,
+        "complete_forgetting": complete_forgetting,
         "mechanism_gate": mechanism_gate,
         "s1_stable_by_seed": {seed: s1_refs[seed]["stable_rmse"] for seed in seeds},
     }

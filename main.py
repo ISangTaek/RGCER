@@ -960,6 +960,13 @@ def main(params):
                     f"threshold={params.retention_damage_threshold} "
                     f"teacher={teacher_path}"
                 )
+                # D8 P1-2 (§46-§47): restore the retention trigger state from
+                # the resumed checkpoint — a resumed O6 run must never re-train
+                # the last block for even one epoch after the trigger fired.
+                pending_retention = getattr(trainer, "pending_d8_retention_state", None)
+                if pending_retention is not None:
+                    trainer.d8_retention_controller.load_state_dict(pending_retention)
+                    trainer.pending_d8_retention_state = None
             history = trainer.train(
                 train_dataloaders_dict=train_loaders,
                 val_dataloaders_dict=val_loaders,

@@ -152,6 +152,7 @@ def _write_d8_candidate_run(
                         "functional_forgetting_relative": forgetting_relative,
                         "functional_forgetting_abs": 0.04,
                         "functional_forgetting_exact_zero": False,
+                        "provenance_verified": True,
                         "animal_tasks_worsened": 2,
                         "animal_tasks_improved": 1,
                         "animal_tasks_unchanged": 53,
@@ -229,6 +230,8 @@ def test_d8_0_gate_passes_when_s1_locks_the_win(tmp_path):
         _write_d6_ref(d6_root, "b0", seed, 1.40 + 0.01 * index)
         _write_d6_ref(d6_root, "b1", seed, 1.25 + 0.01 * index)
         _write_d7_s1_run(d7_root, seed, 1.09, endpoints=s1_endpoints)
+        _write_functional_forgetting_json(d6_root, "b1", seed, exact_zero=False)
+        _write_functional_forgetting_json(d7_root, "s1", seed, exact_zero=True)
     trace = {}
     result = d8_0(d6_root, d7_root, D6_SEEDS, tmp_path, trace)
     assert result["gate_pass"] is True
@@ -434,3 +437,189 @@ def _write_d7_s1_run_with_endpoints(root, seed, stable, women):
         lines.append(f"{epoch},{task},{path_name},{value}\n")
     path.write_text("".join(lines), encoding="utf-8")
     return run_dir
+
+# ----------------------------------------------------------------------
+# Sixth-D8 review P0-2: endpoint gate on cross-seed MEANS (§9-§14)
+# ----------------------------------------------------------------------
+def test_d8_a_endpoint_gate_uses_endpoint_means_across_seeds(tmp_path):
+    from scripts.d8_aggregate import d8_a
+
+    d7_root = tmp_path / "d7"
+    d8_root = tmp_path / "d8"
+    per_seed_endpoints = {
+        42: {"man_oral_TDLo": 0.8, "women_oral_TDLo": 1.4, "human_oral_TDLo": 1.7},
+        45: {"man_oral_TDLo": 1.4, "women_oral_TDLo": 1.4, "human_oral_TDLo": 1.0},
+    }
+    for seed in D8_A_SEEDS:
+        # S1 reference at (1.0, 1.48, 1.30); candidate wins 2/3 WITHIN each
+        # seed, but the cross-seed means only keep women non-worse.
+        _write_s1_20e(d7_root, seed, 1.07)
+        _write_d8_candidate_run(d8_root, "a1", seed, 1.05, endpoints=per_seed_endpoints[seed])
+        _write_d8_candidate_run(d8_root, "a2", seed, 1.10)
+        _write_d8_candidate_run(d8_root, "o6", seed, 1.10)
+    trace = {}
+    result = d8_a(d8_root, d7_root, D8_A_SEEDS, tmp_path, trace)
+    gate = result["gates"]["a1"]
+    assert gate["endpoint_non_worse"] == 1  # only women survives the mean gate
+    assert gate["endpoint_gate_pass"] is False
+    assert gate["gate_pass"] is False
+    assert gate["mean_gain_vs_s1"] == pytest.approx(0.02)  # macro alone would pass
+
+
+# ----------------------------------------------------------------------
+# Sixth-D8 review P0-3/P0-4: feature drift completeness (§17-§21)
+# ----------------------------------------------------------------------
+def test_d8_a_requires_feature_drift_for_both_seeds(tmp_path):
+    from scripts.d8_aggregate import d8_a
+
+    d7_root = tmp_path / "d7"
+    d8_root = tmp_path / "d8"
+    for seed in D8_A_SEEDS:
+        _write_s1_20e(d7_root, seed, 1.07)
+    drift_by_seed = {42: 0.01, 45: 0.08}
+    for seed, drift in drift_by_seed.items():
+        _write_d8_candidate_run(d8_root, "a1", seed, 1.05, feature_drift=drift)
+    _write_d8_candidate_run(d8_root, "a2", 42, 1.10)
+    _write_d8_candidate_run(d8_root, "o6", 42, 1.10)
+    trace = {}
+    result = d8_a(d8_root, d7_root, D8_A_SEEDS, tmp_path, trace)
+    gate = result["gates"]["a1"]
+    assert gate["representation_gate"] is False
+    assert gate["complete_feature_drift"] is True
+    assert gate["max_feature_drift"] == pytest.approx(0.08)
+    assert gate["gate_pass"] is False
+
+
+def test_d8_b_requires_feature_drift_for_all_five_seeds(tmp_path):
+    from scripts.d8_aggregate import d8_b
+
+    d6_root = tmp_path / "d6"
+    d7_root = tmp_path / "d7"
+    d8_root = tmp_path / "d8"
+    for index, seed in enumerate(D6_SEEDS):
+        _write_d6_ref(d6_root, "b0", seed, 1.40)
+        _write_d6_ref(d6_root, "b1", seed, 1.25)
+        _write_d7_s1_run_with_endpoints(d7_root, seed, 1.09, women=1.30)
+        # seed 45 silently omits the drift file -> mechanism evidence 4/5.
+        with_drift = seed != 45
+        _write_d8_candidate_run(
+            d8_root, "o6", seed, 1.06, epochs=40,
+            women=1.25, feature_drift=0.01, with_mechanism=with_drift,
+        )
+    trace = {}
+    result = d8_b(d8_root, d7_root, d6_root, "o6", D6_SEEDS, tmp_path, trace)
+    assert result["complete_feature_drift"] is False
+    assert result["mechanism_gate"] is False
+    assert result["gate_pass"] is False
+
+
+# ----------------------------------------------------------------------
+# Sixth-D8 review P0-5: functional forgetting completeness (§22-§26)
+# ----------------------------------------------------------------------
+def test_d8_a_requires_functional_forgetting_for_both_seeds(tmp_path):
+    from scripts.d8_aggregate import d8_a
+
+    d7_root = tmp_path / "d7"
+    d8_root = tmp_path / "d8"
+    for seed in D8_A_SEEDS:
+        _write_s1_20e(d7_root, seed, 1.07)
+        _write_d8_candidate_run(d8_root, "a1", seed, 1.05, with_mechanism=(seed == 42))
+        _write_d8_candidate_run(d8_root, "a2", seed, 1.10)
+        _write_d8_candidate_run(d8_root, "o6", seed, 1.10)
+    trace = {}
+    result = d8_a(d8_root, d7_root, D8_A_SEEDS, tmp_path, trace)
+    gate = result["gates"]["a1"]
+    assert gate["complete_forgetting"] is False
+    assert gate["functional_gate"] is False
+    assert gate["gate_pass"] is False
+
+
+def test_d8_b_requires_functional_forgetting_for_all_five_seeds(tmp_path):
+    from scripts.d8_aggregate import d8_b
+
+    d6_root = tmp_path / "d6"
+    d7_root = tmp_path / "d7"
+    d8_root = tmp_path / "d8"
+    for index, seed in enumerate(D6_SEEDS):
+        _write_d6_ref(d6_root, "b0", seed, 1.40)
+        _write_d6_ref(d6_root, "b1", seed, 1.25)
+        _write_d7_s1_run_with_endpoints(d7_root, seed, 1.09, women=1.30)
+        _write_d8_candidate_run(
+            d8_root, "o6", seed, 1.06, epochs=40, women=1.25,
+            forgetting_relative=0.03, with_mechanism=(seed != 45),
+        )
+    trace = {}
+    result = d8_b(d8_root, d7_root, d6_root, "o6", D6_SEEDS, tmp_path, trace)
+    assert result["complete_forgetting"] is False
+    assert result["mechanism_gate"] is False
+    assert result["gate_pass"] is False
+
+
+# ----------------------------------------------------------------------
+# Sixth-D8 review P1-3: D8-0 audit completeness (§49-§54)
+# ----------------------------------------------------------------------
+def _write_functional_forgetting_json(root, reference, seed, *, exact_zero, verified=True):
+    if reference == "b1":
+        run_dir = root / "d6_stage_b" / "b1" / "d6_b1_e40" / f"seed_{seed}"
+    else:
+        run_dir = root / "d7_stage_b" / "s1" / "d7_s1_e40" / f"seed_{seed}"
+    payload = {
+        "functional_forgetting_relative": 0.0 if exact_zero else 0.20,
+        "functional_forgetting_abs": 0.0 if exact_zero else 0.25,
+        "functional_forgetting_exact_zero": exact_zero,
+        "provenance_verified": verified,
+        "per_task_delta": {f"t{i}": 0.0 if exact_zero else 0.01 for i in range(56)},
+        "animal_tasks_worsened": 0 if exact_zero else 56,
+        "animal_tasks_improved": 0,
+        "animal_tasks_unchanged": 56 if exact_zero else 0,
+        "delta_q25": 0.0, "delta_median": 0.0, "delta_q75": 0.0,
+        "delta_q90": 0.0, "delta_max": 0.0 if exact_zero else 0.05,
+    }
+    (run_dir / "functional_forgetting.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+
+def _d8_0_world(tmp_path):
+    d6_root = tmp_path / "d6"
+    d7_root = tmp_path / "d7"
+    s1_endpoints = {"man_oral_TDLo": 0.95, "women_oral_TDLo": 1.35, "human_oral_TDLo": 1.28}
+    for index, seed in enumerate(D6_SEEDS):
+        _write_d6_ref(d6_root, "b0", seed, 1.40)
+        _write_d6_ref(d6_root, "b1", seed, 1.25 + 0.005 * index)
+        _write_d7_s1_run(d7_root, seed, 1.09, endpoints=s1_endpoints)
+    return d6_root, d7_root
+
+
+def test_d8_0_requires_complete_s1_b1_functional_audit(tmp_path):
+    from scripts.d8_aggregate import d8_0
+
+    d6_root, d7_root = _d8_0_world(tmp_path)
+    # B1 audit present for only 4/5 seeds, S1 complete and exact-zero.
+    for index, seed in enumerate(D6_SEEDS):
+        _write_functional_forgetting_json(d6_root, "b1", seed, exact_zero=False)
+        if seed != 46:
+            _write_functional_forgetting_json(d7_root, "s1", seed, exact_zero=True)
+    trace = {}
+    result = d8_0(d6_root, d7_root, D6_SEEDS, tmp_path, trace)
+    assert result["performance_gate_pass"] is True
+    assert result["functional_audit_complete"] is False
+    assert result["gate_pass"] is False
+    assert "functional forgetting audit incomplete" in result["stop_reason"]
+
+
+def test_d8_0_requires_s1_exact_zero_functional_forgetting(tmp_path):
+    from scripts.d8_aggregate import d8_0
+
+    d6_root, d7_root = _d8_0_world(tmp_path)
+    for index, seed in enumerate(D6_SEEDS):
+        _write_functional_forgetting_json(d6_root, "b1", seed, exact_zero=False)
+        # S1 audit complete, but one seed violates the exact-zero invariant.
+        _write_functional_forgetting_json(
+            d7_root, "s1", seed, exact_zero=(seed != 45)
+        )
+    trace = {}
+    result = d8_0(d6_root, d7_root, D6_SEEDS, tmp_path, trace)
+    assert result["functional_invariant_failure"] is True
+    assert result["functional_audit_complete"] is False
+    assert result["gate_pass"] is False

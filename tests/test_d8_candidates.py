@@ -11,6 +11,7 @@ import json
 import pytest
 import torch
 from torch import nn
+from pathlib import Path
 
 from d8_retention import (
     D8RetentionController,
@@ -309,13 +310,20 @@ def test_o6_trigger_freezes_next_epoch_and_never_unfreezes(tmp_path):
         controller.pre_epoch(epoch, model)
         assert all(parameter.requires_grad is False for parameter in last_block.parameters())
         assert model.encoder.backbone.layers[0].weight.requires_grad is False
-    # The trigger telemetry records the firing epoch.
+    # The trigger fires at the END of epoch 5: that row still reports the
+    # trainable state during the epoch; epoch 6's row (P1-1) reports the REAL
+    # continued damage with triggered=1.
     assert controller.trigger_epoch == 5
-    assert [int(row["triggered"]) for row in controller.rows] == [0, 0, 1]
-    assert [row["state"] for row in controller.rows] == ["baseline", "post_epoch", "post_epoch"]
+    row6 = controller.log_epoch(6, model)
+    assert int(row6["triggered"]) == 1
+    assert float(row6["retention_damage_train"]) > 0.0  # real damage, not zeroed
+    assert [int(row["triggered"]) for row in controller.rows] == [0, 0, 0, 1]
+    assert [row["state"] for row in controller.rows] == [
+        "baseline", "post_epoch", "post_epoch", "post_epoch",
+    ]
     csv_rows = (tmp_path / "d8_retention_trigger.csv").read_text().strip().splitlines()
-    assert len(csv_rows) == 4  # baseline + 3 logged epochs
-    assert '"triggered"' in csv_rows[0] or "triggered" in csv_rows[0]
+    assert len(csv_rows) == 5  # header + baseline + 3 logged epochs
+    assert "triggered" in csv_rows[0]
 
 
 def test_o6_below_threshold_never_triggers(tmp_path):
@@ -371,3 +379,197 @@ def test_d8_run_contract_rejects_wrong_multiplier(tmp_path):
     (run_dir / "run_metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
     violations = check_d8_run_contract(run_dir, "a1", 42, 19)
     assert any("backbone_lr_multiplier" in violation for violation in violations)
+
+# ----------------------------------------------------------------------
+# Sixth-D8 review P0-1: SSE/N aggregation over ALL batches (§6-§8)
+# ----------------------------------------------------------------------
+def test_evaluate_animal_rmse_aggregates_all_batches():
+    # batch1: 2 samples with error 0; batch2: 1 sample with error 3.
+    # Correct endpoint RMSE = sqrt(9/3) = sqrt(3); the broken implementation
+    # that kept only the LAST batch reported 3.0.
+    from d8_retention import evaluate_animal_rmse
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = _StubEncoder(_ConstBackbone(scale=1.0))
+            self.decoders = nn.ModuleDict({"t1": _MedianDecoder("t1")})
+
+    model = _Model()
+    # decoded median = backbone[:, 0] = 1.0 -> y must be 1.0 for zero error
+    batch1 = _TaskBatch(["a", "b"], [1.0, 1.0])
+    batch2 = _TaskBatch(["c"], [-2.0])  # error = 1 - (-2) = 3
+    macro, per_task = evaluate_animal_rmse(
+        model, [("t1", batch1), ("t1", batch2)], torch.device("cpu"),
+        {"t1": {"mean": 0.0, "std": 1.0}}, ["t1"],
+    )
+    assert per_task["t1"] == pytest.approx(3 ** 0.5)
+    assert macro == pytest.approx(3 ** 0.5)
+
+
+# ----------------------------------------------------------------------
+# Sixth-D8 review P1-1: post-trigger damage is REAL, never zeroed (§36-§40)
+# ----------------------------------------------------------------------
+def test_o6_post_trigger_damage_is_not_reset_to_zero(tmp_path):
+    controller, model = _controller_world(tmp_path)
+    controller.log_epoch(0, model)  # damage 0, no trigger
+    controller._teacher_model.decoders["t1"].offset = 1.0
+    controller._teacher_model.decoders["t2"].offset = 1.0
+    controller.log_epoch(5, model)  # damage 1.0 -> trigger
+    assert controller.triggered is True
+    # Real continued drift: perturb the (already drifted) backbone — the
+    # post-trigger log must reflect the TRUE damage, not a synthetic 0.
+    with torch.no_grad():
+        model.encoder.backbone.scale.add_(2.0)
+    row = controller.log_epoch(6, model)
+    assert float(row["retention_damage_train"]) > 0.0
+    assert float(row["retention_damage_train"]) == pytest.approx(3.0)
+
+
+# ----------------------------------------------------------------------
+# Sixth-D8 review P1-2: O6 trigger state survives resume (§41-§48)
+# ----------------------------------------------------------------------
+def test_o6_resume_preserves_trigger_state(tmp_path):
+    controller, model = _controller_world(tmp_path)
+    controller._teacher_model.decoders["t1"].offset = 1.0
+    controller._teacher_model.decoders["t2"].offset = 1.0
+    controller.log_epoch(5, model)
+    assert controller.triggered is True
+
+    state = controller.state_dict()
+    assert state["triggered"] is True and state["trigger_epoch"] == 5
+
+    fresh = D8RetentionController(
+        model=model,
+        teacher_model=controller._teacher_model,
+        animal_tasks=controller.animal_tasks,
+        task_scalers=controller.task_scalers,
+        device=torch.device("cpu"),
+        probe_batches=controller.probe_batches,
+        output_dir=tmp_path / "resumed",
+        threshold=0.02,
+    )
+    fresh.load_state_dict(state)
+    assert fresh.triggered is True
+    assert fresh.trigger_epoch == 5
+    # §68: the first resumed epoch start keeps the last block frozen.
+    fresh.pre_epoch(6, model)
+    assert all(
+        parameter.requires_grad is False
+        for parameter in model.encoder.backbone.layers[7].parameters()
+    )
+    # threshold mismatch must fail loudly
+    with pytest.raises(ValueError, match="threshold mismatch"):
+        fresh.load_state_dict({**state, "threshold": 0.05})
+
+
+def test_trainer_checkpoint_carries_retention_state():
+    # §45: the checkpoint payload must embed the controller state so a resume
+    # can restore it; the field stays optional for non-O6 runs.
+    import inspect
+
+    from trainer import Trainer
+
+    source = inspect.getsource(Trainer._checkpoint_payload)
+    assert "d8_retention_state" in source
+    load_source = inspect.getsource(Trainer.load_checkpoint)
+    assert "pending_d8_retention_state" in load_source
+
+
+# ----------------------------------------------------------------------
+# Sixth-D8 review P0-6: matched-teacher provenance binding (§27-§34)
+# ----------------------------------------------------------------------
+import hashlib  # noqa: E402
+
+from scripts.d8_functional_forgetting import (  # noqa: E402
+    _load_run_backbone,
+    verify_run_provenance,
+    verify_teacher_bundle,
+)
+
+
+def _functional_forgetting_world(
+    tmp_path,
+    *,
+    teacher_seed=42,
+    sidecar_sha=None,
+    sidecar_seed=42,
+    contract_manifest="m",
+    run_payload_manifest="m",
+    with_run_checkpoint=True,
+):
+    from tests.test_d6_counterfactual import _teacher_payload, _write_teacher
+
+    teacher_dir = _write_teacher(tmp_path, "teacher", _teacher_payload(False, seed=teacher_seed))
+    checkpoint_sha = hashlib.sha256((teacher_dir / "teacher_last.pt").read_bytes()).hexdigest()
+
+    init_path = tmp_path / "b1_init.pt"
+    init_path.write_bytes(b"stub-init")
+    provenance = {
+        "mode": "b1",
+        "teacher_real_run_dir": str(teacher_dir),
+        "teacher_real_checkpoint_sha256": sidecar_sha if sidecar_sha is not None else checkpoint_sha,
+        "expected_teacher_epoch": 29,
+        "teacher_initial_model_sha256": "teacher-init-hash",
+        "human_seed": sidecar_seed,
+        "output_sha256": hashlib.sha256(init_path.read_bytes()).hexdigest(),
+    }
+    (tmp_path / "b1_init.pt.provenance.json").write_text(json.dumps(provenance), encoding="utf-8")
+
+    run_dir = tmp_path / "run"
+    (run_dir / "diagnostics").mkdir(parents=True)
+    (run_dir / "run_metadata.json").write_text(
+        json.dumps(
+            {
+                "seed": 42,
+                "d7_candidate": "o6",
+                "d7_artifact_contract": {
+                    "mode": "b1",
+                    "human_seed": 42,
+                    "split_manifest_hash": contract_manifest,
+                    "datastore_fingerprint": "f",
+                    "feature_schema_version": "s",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "args.json").write_text(
+        json.dumps({"init_state_path": str(init_path)}), encoding="utf-8"
+    )
+    if with_run_checkpoint:
+        torch.save(
+            {
+                "model_state": {"encoder.backbone.w": torch.zeros(1)},
+                "split_manifest_hash": run_payload_manifest,
+                "data_config": {"datastore_fingerprint": "f"},
+                "feature_schema_version": "s",
+            },
+            run_dir / "graphormer_last.pt",
+        )
+    return run_dir, teacher_dir
+
+
+def test_functional_forgetting_rejects_wrong_teacher_seed(tmp_path):
+    run_dir, teacher_dir = _functional_forgetting_world(tmp_path, teacher_seed=43)
+    bundle = verify_run_provenance(run_dir, teacher_dir)
+    payload = torch.load(Path(teacher_dir) / "teacher_last.pt", weights_only=False)
+    with pytest.raises(ValueError, match="base_seed"):
+        verify_teacher_bundle(bundle, Path(teacher_dir) / "teacher_last.pt", payload)
+
+
+def test_functional_forgetting_rejects_wrong_teacher_checkpoint(tmp_path):
+    run_dir, teacher_dir = _functional_forgetting_world(tmp_path, sidecar_sha="0" * 64)
+    bundle = verify_run_provenance(run_dir, teacher_dir)
+    payload = torch.load(Path(teacher_dir) / "teacher_last.pt", weights_only=False)
+    with pytest.raises(ValueError, match="sha256 does not match"):
+        verify_teacher_bundle(bundle, Path(teacher_dir) / "teacher_last.pt", payload)
+
+
+def test_functional_forgetting_rejects_wrong_manifest(tmp_path):
+    run_dir, teacher_dir = _functional_forgetting_world(
+        tmp_path, contract_manifest="m", run_payload_manifest="other-manifest"
+    )
+    bundle = verify_run_provenance(run_dir, teacher_dir)
+    with pytest.raises(ValueError, match="data identity|split_manifest_hash"):
+        _load_run_backbone(run_dir, bundle["contract"])

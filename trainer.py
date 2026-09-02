@@ -1441,6 +1441,14 @@ class Trainer:
                     self.best_checkpoint_path.name if self.best_checkpoint_path else None
                 ),
             },
+            # D8 P1-2 (fifth D8 review §41-§47): the O6 retention trigger must
+            # survive job interruption — a resumed run must never re-train the
+            # last block for even one epoch.
+            "d8_retention_state": (
+                self.d8_retention_controller.state_dict()
+                if getattr(self, "d8_retention_controller", None) is not None
+                else None
+            ),
         }
         if include_historical_best and self._best_training_state is not None:
             payload["best_training_state"] = copy.deepcopy(self._best_training_state)
@@ -1490,6 +1498,10 @@ class Trainer:
             )
         if list(checkpoint["task_names"]) != self.task_name:
             raise ValueError("Checkpoint task_names do not match the current experiment")
+        # D8 P1-2: the retention controller does not exist yet at this point
+        # (it is attached in main() after the init overlay) — park the state
+        # so main() can restore it right after creating the controller.
+        self.pending_d8_retention_state = checkpoint.get("d8_retention_state")
         stored_repro = checkpoint.get("reproducibility")
         if formal_v2 and stored_repro is None:
             raise ValueError("Formal v6 checkpoints must embed a reproducibility block")

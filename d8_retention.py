@@ -125,7 +125,11 @@ def evaluate_animal_rmse(model, task_batches, device, task_scalers, animal_tasks
 
     was_training = model.training
     model.eval()
-    per_task: dict[str, float] = {}
+    # Sixth-D8 review P0-1: an endpoint usually spans several validation
+    # batches — aggregate by SUMMED SQUARED ERROR / COUNT so the reported
+    # RMSE covers the whole endpoint set, never "the last batch".
+    sum_sq_error = {task: 0.0 for task in animal_tasks}
+    count = {task: 0 for task in animal_tasks}
     try:
         with torch.no_grad():
             for task, batch in task_batches:
@@ -140,13 +144,18 @@ def evaluate_animal_rmse(model, task_batches, device, task_scalers, animal_tasks
                 target = batch.y.reshape(-1, 1).float()
                 if target.shape != median.shape:
                     target = target.reshape(median.shape)
-                rmse = float(torch.sqrt(((median - target) ** 2).mean()))
-                per_task[task] = rmse
+                error = median - target
+                sum_sq_error[task] += float(error.pow(2).sum().detach().cpu())
+                count[task] += int(error.numel())
     finally:
         if was_training:
             model.train()
+    per_task: dict[str, float] = {}
     for task in animal_tasks:
-        per_task.setdefault(task, float("nan"))
+        if count[task] <= 0:
+            per_task[task] = float("nan")
+        else:
+            per_task[task] = (sum_sq_error[task] / count[task]) ** 0.5
     ordered = [per_task[task] for task in animal_tasks]
     return macro_rmse(ordered), per_task
 
@@ -290,17 +299,15 @@ class D8RetentionController:
         backbone_state = {
             key: value.detach().cpu() for key, value in model.state_dict().items()
         }
-        if self.triggered:
-            current_rmse = self.teacher_probe_rmse
-            damage = 0.0
-            trainable = False
-        else:
-            hybrid = build_hybrid_model(self._teacher_model_for_hybrid(), backbone_state)
-            current_rmse, _ = evaluate_animal_rmse(
-                hybrid, self.probe_batches, self.device, self.task_scalers, self.animal_tasks
-            )
-            damage = current_rmse / (self.teacher_probe_rmse + 1e-12) - 1.0
-            trainable = True
+        # Fifth-D8-review P1-1 (§36-§39): the trigger only stops FUTURE
+        # updates — the already-drifted last block keeps its real source
+        # damage.  Always evaluate the hybrid; never write a synthetic 0.
+        hybrid = build_hybrid_model(self._teacher_model_for_hybrid(), backbone_state)
+        current_rmse, _ = evaluate_animal_rmse(
+            hybrid, self.probe_batches, self.device, self.task_scalers, self.animal_tasks
+        )
+        damage = current_rmse / (self.teacher_probe_rmse + 1e-12) - 1.0
+        trainable = not self.triggered
         row = {
             "epoch": int(epoch),
             "state": state,
@@ -325,6 +332,35 @@ class D8RetentionController:
     def _teacher_model_for_hybrid(self):
         return self._teacher_model
 
+    def state_dict(self) -> dict:
+        """P1-2 (§44): trigger state survives job interruption via the
+        checkpoint payload."""
+
+        return {
+            "triggered": bool(self.triggered),
+            "trigger_epoch": self.trigger_epoch,
+            "rows": list(self.rows),
+            "threshold": float(self.threshold),
+            "teacher_probe_rmse": float(self.teacher_probe_rmse),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        if state is None:
+            return
+        if float(state["threshold"]) != float(self.threshold):
+            raise ValueError(
+                f"retention threshold mismatch: checkpoint has "
+                f"{state['threshold']!r}, controller runs {self.threshold!r}"
+            )
+        self.triggered = bool(state["triggered"])
+        self.trigger_epoch = state.get("trigger_epoch")
+        self.rows = list(state.get("rows") or [])
+        if self.triggered:
+            print(
+                f"O6 retention state restored from checkpoint: triggered at "
+                f"epoch {self.trigger_epoch} — last block stays frozen"
+            )
+
     def pre_epoch(self, epoch: int, model) -> None:
         """§55/§68: once triggered, the last block stays frozen from the NEXT
         epoch onwards — re-assert every epoch start (idempotent)."""
@@ -333,14 +369,13 @@ class D8RetentionController:
             freeze_last_block(model)
 
     def log_epoch(self, epoch: int, model) -> dict:
+        was_triggered = self.triggered
         row = self._append_row(epoch, "post_epoch", model)
         damage = float(row["retention_damage_train"])
-        if not self.triggered and damage > self.threshold:
+        if not was_triggered and damage > self.threshold:
             self.triggered = True
             self.trigger_epoch = int(epoch)
             frozen = freeze_last_block(model)
-            row["backbone_trainable"] = 0
-            row["triggered"] = 1
             print(
                 f"O6 source-retention trigger: epoch={epoch} damage={damage:.4f} "
                 f"> {self.threshold} — last block frozen from next epoch "
