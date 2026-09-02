@@ -245,12 +245,45 @@ class Trainer:
             return optimizer_class([backbone_group, head_group])
         return optimizer
 
+    def _apply_trainable_last_blocks(self) -> None:
+        """D8 A1/A2 (plan §39-§43): freeze the whole Graphormer backbone
+        EXCEPT the last K blocks (heads always trainable).  Applied once per
+        epoch start; idempotent.  O6's retention controller may additionally
+        freeze those last blocks after the retention trigger."""
+
+        blocks = int(getattr(self.args, "trainable_last_blocks", 0) or 0)
+        if blocks <= 0:
+            return
+        state = getattr(self, "_last_blocks_scope_state", None)
+        if state == blocks:
+            return
+        layers = self.model.encoder.backbone.layers
+        n_layers = len(layers)
+        trainable_indices = set(range(n_layers - blocks, n_layers))
+        for name, parameter in self.model.named_parameters():
+            if name.startswith("encoder.backbone."):
+                trainable = False
+                if name.startswith("encoder.backbone.layers."):
+                    try:
+                        trainable = int(name.split(".")[3]) in trainable_indices
+                    except (IndexError, ValueError):
+                        trainable = False
+                parameter.requires_grad = trainable
+        self._last_blocks_scope_state = blocks
+        print(
+            f"trainable scope: last {blocks} backbone block(s) trainable "
+            f"(layers {sorted(trainable_indices)}), everything else frozen"
+        )
+
     def _apply_backbone_freeze(self, epoch: int) -> None:
         """D7 S1/S3 (plan §8-§17): freeze the whole Graphormer backbone for the
         first ``freeze_backbone_epochs`` epochs (requires_grad=False only — no
         architectural change).  Called at the START of every epoch so a resume
         reproduces the same schedule."""
 
+        if int(getattr(self.args, "trainable_last_blocks", 0) or 0) > 0:
+            self._apply_trainable_last_blocks()
+            return
         freeze_epochs = int(getattr(self.args, "freeze_backbone_epochs", 0) or 0)
         if freeze_epochs <= 0:
             return
@@ -1660,6 +1693,11 @@ class Trainer:
             # D7 S1/S3 (plan §15): the freeze schedule is evaluated at the
             # START of every epoch so a resume reproduces the same schedule.
             self._apply_backbone_freeze(epoch)
+            # D8 O6 (§55/§68): once the retention trigger has fired, the last
+            # block is re-frozen at every epoch start (idempotent, permanent).
+            retention_controller = getattr(self, "d8_retention_controller", None)
+            if retention_controller is not None:
+                retention_controller.pre_epoch(epoch, self.model)
             train_result = self._train_epoch(train_dataloaders_dict, epoch)
             for index, task in enumerate(self.task_name):
                 if np.isfinite(train_result["loss"][task]):
@@ -1671,6 +1709,8 @@ class Trainer:
             drift_tracker = getattr(self, "d7_drift_tracker", None)
             if drift_tracker is not None:
                 drift_tracker.log_epoch(epoch, self.model)
+            if retention_controller is not None:
+                retention_controller.log_epoch(epoch, self.model)
             history.append({"epoch": epoch, "train": train_result, "validation": validation_result})
             # The best checkpoint is chosen by the selection scope (human3 by
             # default on ToxAcute), not by the all-task macro score, so an

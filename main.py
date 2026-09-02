@@ -125,6 +125,9 @@ D6_PROVENANCE_MODE = {
     "s3": "b1",
     "o4": "csdt",
     "o5": "csdt_bounded",
+    "a1": "b1",
+    "a2": "b1",
+    "o6": "b1",
 }
 
 
@@ -274,6 +277,9 @@ def _write_run_metadata(params, task_names, trainer):
         "d7_artifact_contract": getattr(params, "d7_artifact_contract", None),
         "freeze_backbone_epochs": getattr(params, "freeze_backbone_epochs", 0),
         "backbone_lr_multiplier": getattr(params, "backbone_lr_multiplier", 1.0),
+        "trainable_last_blocks": getattr(params, "trainable_last_blocks", 0),
+        "retention_probe_per_task": getattr(params, "retention_probe_per_task", 16),
+        "retention_damage_threshold": getattr(params, "retention_damage_threshold", 0.02),
         # D6 shuffle/counterfactual provenance (review P1-5, §51).
         "shuffle_animal_train_labels": bool(
             getattr(params, "shuffle_animal_train_labels", False)
@@ -882,6 +888,78 @@ def main(params):
                     ),
                     anchor_type=drift_anchor_type,
                 )
+            if getattr(params, "d7_candidate", "none") == "o6":
+                # D8 O6/SRTA (plan §49-§57): build the deterministic Animal56
+                # TRAIN retention probe and attach the retention controller.
+                from d8_retention import (
+                    D8RetentionController,
+                    build_probe_manifest,
+                    collate_probe_batches,
+                    collect_probe_items,
+                    select_source_retention_probe,
+                )
+
+                if store is None:
+                    raise RuntimeError("O6 retention probe requires the DataStore")
+                probe = select_source_retention_probe(
+                    store, ANIMAL_SOURCE_TASKS, per_task=params.retention_probe_per_task
+                )
+                manifest = build_probe_manifest(probe)
+                params.source_train_probe_manifest_sha256 = manifest["manifest_sha256"]
+                if getattr(params, "save_path", None):
+                    _write_json(
+                        Path(params.save_path) / "D8_SOURCE_RETENTION_TRAIN_PROBE.json",
+                        manifest,
+                    )
+                probe_pairs = collect_probe_items(
+                    store, ANIMAL_SOURCE_TASKS, probe, max_nodes=params.max_nodes_filter
+                )
+                probe_collator = DataCollator(
+                    spatial_pos_max_clip=params.spatial_pos_clip, max_node_filter=None
+                )
+                probe_batches = collate_probe_batches(probe_pairs, probe_collator)
+                sidecar = json.loads(
+                    Path(str(params.init_state_path) + ".provenance.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                from scripts.d6_prep_inits import (
+                    _build_model as _prep_build_model,
+                    _load_teacher_checkpoint as _prep_load_teacher,
+                )
+
+                teacher_path, teacher_payload = _prep_load_teacher(
+                    Path(sidecar["teacher_real_run_dir"]),
+                    int(sidecar["expected_teacher_epoch"]),
+                )
+                template = dict(teacher_payload.get("configuration") or {})
+                teacher_model = _prep_build_model(
+                    int(template.get("seed", params.seed)), "animal56", trainer.device, template
+                )[0]
+                teacher_model.load_state_dict(teacher_payload["model_state"], strict=True)
+                teacher_model.to(trainer.device)
+                for freeze_parameter in teacher_model.parameters():
+                    freeze_parameter.requires_grad = False
+                trainer.d8_retention_controller = D8RetentionController(
+                    model=trainer.model,
+                    teacher_model=teacher_model,
+                    animal_tasks=ANIMAL_SOURCE_TASKS,
+                    task_scalers=dict(teacher_payload.get("task_scalers") or {}),
+                    device=trainer.device,
+                    probe_batches=probe_batches,
+                    output_dir=(
+                        Path(params.save_path) / "diagnostics"
+                        if getattr(params, "save_path", None)
+                        else None
+                    ),
+                    threshold=float(params.retention_damage_threshold),
+                )
+                print(
+                    f"O6 retention controller: probe_total={manifest['probe_total']} "
+                    f"manifest={manifest['manifest_sha256'][:12]}… "
+                    f"threshold={params.retention_damage_threshold} "
+                    f"teacher={teacher_path}"
+                )
             history = trainer.train(
                 train_dataloaders_dict=train_loaders,
                 val_dataloaders_dict=val_loaders,
@@ -1208,7 +1286,7 @@ def build_parser():
     )
     parser.add_argument(
         "--d7_candidate",
-        choices=["none", "s1", "s2", "s3", "o4", "o5"],
+        choices=["none", "s1", "s2", "s3", "o4", "o5", "a1", "a2", "o6"],
         default="none",
         help="D7 representation-preservation candidate identity (plan §7); "
         "enables the freeze/LR contracts, artifact provenance checks and "
@@ -1227,6 +1305,28 @@ def build_parser():
         default=1.0,
         help="D7 S2/S3: Graphormer backbone LR = base LR * this multiplier; "
         "heads keep the base LR (plan §11).",
+    )
+    parser.add_argument(
+        "--trainable_last_blocks",
+        type=int,
+        default=0,
+        help="D8 A1/A2/O6: freeze the whole Graphormer backbone EXCEPT the "
+        "last K blocks (which stay at backbone_lr_multiplier); 0 = use the "
+        "whole-backbone freeze_backbone_epochs schedule instead (plan §39/§42/§46).",
+    )
+    parser.add_argument(
+        "--retention_probe_per_task",
+        type=int,
+        default=16,
+        help="D8 O6 §49: Animal56 TRAIN retention probe molecules per source "
+        "task (deterministic SHA(sample_id) order).",
+    )
+    parser.add_argument(
+        "--retention_damage_threshold",
+        type=float,
+        default=0.02,
+        help="D8 O6 §54: train-probe retention damage D_t that permanently "
+        "freezes the last block (plan-fixed; not validation-tuned).",
     )
     parser.add_argument(
         "--feature_drift_probe_size",
@@ -1415,6 +1515,9 @@ def validate_params(params):
             )
         if multiplier <= 0:
             raise ValueError("backbone_lr_multiplier must be > 0")
+        trainable_last_blocks = int(getattr(params, "trainable_last_blocks", 0) or 0)
+        if trainable_last_blocks < 0:
+            raise ValueError("trainable_last_blocks must be >= 0")
         if d7_candidate == "s1":
             if freeze != int(params.epochs):
                 raise ValueError(
@@ -1425,6 +1528,48 @@ def validate_params(params):
                 raise ValueError(
                     "--d7_candidate s1 keeps the base head LR protocol; the backbone is "
                     "frozen so --backbone_lr_multiplier must stay 1.0"
+                )
+            if trainable_last_blocks != 0:
+                raise ValueError(
+                    "--d7_candidate s1 freezes the ENTIRE backbone: "
+                    "trainable_last_blocks must be 0"
+                )
+        if d7_candidate in {"a1", "a2"}:
+            # D8 A1/A2 (plan §39-§43): last-1/last-2 blocks only, at exactly
+            # 0.01x base LR — adaptation-locus diagnostics, not an LR search.
+            expected_blocks = 1 if d7_candidate == "a1" else 2
+            if trainable_last_blocks != expected_blocks:
+                raise ValueError(
+                    f"--d7_candidate {d7_candidate} requires "
+                    f"trainable_last_blocks={expected_blocks}"
+                )
+            if freeze != 0:
+                raise ValueError(
+                    f"--d7_candidate {d7_candidate} never uses the whole-backbone "
+                    "freeze schedule: freeze_backbone_epochs must be 0"
+                )
+            if not math.isclose(multiplier, 0.01, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(
+                    f"--d7_candidate {d7_candidate} requires backbone_lr_multiplier=0.01 "
+                    f"(protocol lock, found {multiplier!r})"
+                )
+        if d7_candidate == "o6":
+            # D8 O6/SRTA (plan §46-§47): last block trainable at exactly 0.02x
+            # until the source-retention trigger fires.
+            if trainable_last_blocks != 1:
+                raise ValueError(
+                    "--d7_candidate o6 starts with exactly the last block "
+                    "trainable: trainable_last_blocks must be 1"
+                )
+            if freeze != 0:
+                raise ValueError(
+                    "--d7_candidate o6 never uses the whole-backbone freeze "
+                    "schedule: freeze_backbone_epochs must be 0"
+                )
+            if not math.isclose(multiplier, 0.02, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(
+                    "--d7_candidate o6 requires backbone_lr_multiplier=0.02 "
+                    f"(protocol lock, found {multiplier!r})"
                 )
         if d7_candidate == "s2":
             if freeze != 0:
@@ -1446,10 +1591,11 @@ def validate_params(params):
                     "--d7_candidate s3 requires backbone_lr_multiplier=0.1 after the "
                     f"five-epoch frozen phase (found {multiplier!r})"
                 )
-        if d7_candidate in {"s1", "s2", "s3"}:
-            # Fifth-review P0-1: the preservation family MUST start from the
-            # seed-matched Animal56 pretrained (B1) initialization — a scratch
-            # backbone would test freezing/lr on a random network instead.
+        if d7_candidate in {"s1", "s2", "s3", "a1", "a2", "o6"}:
+            # Fifth-review P0-1: the preservation/adaptation family MUST start
+            # from the seed-matched Animal56 pretrained (B1) initialization —
+            # a scratch backbone would test freezing/lr on a random network
+            # instead.
             if not init_state:
                 raise ValueError(
                     f"--d7_candidate {d7_candidate} requires --init_state_path "
