@@ -980,31 +980,19 @@ def main(params):
                         Path(params.save_path) / "D8_SOURCE_RETENTION_TRAIN_PROBE.json",
                         manifest,
                     )
-                # Multiple _resolve_data_store() calls in main() may create
-                # independent store instances; LMDB raises "already open" when
-                # two opens target the same shard path.  Close cached envs on
-                # BOTH the O6 store and the training loaders' store before
-                # probe collection — envs are lazily re-opened and training
-                # hasn't started yet.
-                for _probe_store in (
+                # Multiple _resolve_data_store() calls in main() create
+                # independent ToxAcuteDataStore instances with independent
+                # LMDB env caches — a second lmdb.open() on the same shard
+                # path raises "already open in this process".  Fix: use the
+                # TRAINING loaders' store for probe collection so ALL data
+                # access shares one env cache.
+                training_store = getattr(
+                    getattr(next(iter(loaders.values()), None), "dataset", None),
+                    "store",
                     store,
-                    getattr(
-                        getattr(next(iter(loaders.values()), None), "dataset", None),
-                        "store",
-                        None,
-                    ),
-                ):
-                    if _probe_store is None:
-                        continue
-                    for _cached_env in getattr(_probe_store, "_envs", {}).values():
-                        try:
-                            _cached_env.close()
-                        except Exception:
-                            pass
-                    if hasattr(_probe_store, "_envs"):
-                        _probe_store._envs.clear()
+                )
                 probe_pairs = collect_probe_items(
-                    store, ANIMAL_SOURCE_TASKS, probe, max_nodes=params.max_nodes_filter
+                    training_store, ANIMAL_SOURCE_TASKS, probe, max_nodes=params.max_nodes_filter
                 )
                 probe_collator = DataCollator(
                     spatial_pos_max_clip=params.spatial_pos_clip, max_node_filter=None
