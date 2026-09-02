@@ -102,17 +102,14 @@ def collect_probe_items(store, animal_tasks, probe: dict[str, list[str]], *, max
             )
             pairs.append((task, item))
             seen.add(sample_id)
-    missing = sorted(wanted.keys() - seen) if wanted else []
+    all_wanted = set()
+    for ids in wanted.values():
+        all_wanted |= ids
+    missing = sorted(all_wanted - seen)
     if missing:
-        # Debug: report what each animal task's train indices looked like.
-        debug_lines = []
-        for task in animal_tasks[:3]:
-            indices = store.get_task_indices(task, split="train", max_nodes=max_nodes)
-            sample = [str(store.sample_ids[int(i)]) for i in indices[:3]]
-            debug_lines.append(f"{task}: n={len(indices)} sample={sample}")
         raise RuntimeError(
             f"O6 retention probe set incomplete: missing {len(missing)} ids; "
-            f"examples={missing[:3]}; DEBUG: {'; '.join(debug_lines)}"
+            f"examples={missing[:3]}"
         )
     return pairs
 
