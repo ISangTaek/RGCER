@@ -296,7 +296,7 @@ def main() -> None:
     loaders = _loaders(params, list(ANIMAL_SOURCE_TASKS), collator)
     batches = []
     for task in ANIMAL_SOURCE_TASKS:
-        loader = loaders.get("validation", {}).get(task)
+        loader = loaders.get("val", loaders.get("validation", {})).get(task)
         if loader is None:
             raise RuntimeError(f"animal56 validation loader missing for {task!r}")
         for batch in loader:
