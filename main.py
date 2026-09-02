@@ -980,6 +980,29 @@ def main(params):
                         Path(params.save_path) / "D8_SOURCE_RETENTION_TRAIN_PROBE.json",
                         manifest,
                     )
+                # Multiple _resolve_data_store() calls in main() may create
+                # independent store instances; LMDB raises "already open" when
+                # two opens target the same shard path.  Close cached envs on
+                # BOTH the O6 store and the training loaders' store before
+                # probe collection — envs are lazily re-opened and training
+                # hasn't started yet.
+                for _probe_store in (
+                    store,
+                    getattr(
+                        getattr(next(iter(loaders.values()), None), "dataset", None),
+                        "store",
+                        None,
+                    ),
+                ):
+                    if _probe_store is None:
+                        continue
+                    for _cached_env in getattr(_probe_store, "_envs", {}).values():
+                        try:
+                            _cached_env.close()
+                        except Exception:
+                            pass
+                    if hasattr(_probe_store, "_envs"):
+                        _probe_store._envs.clear()
                 probe_pairs = collect_probe_items(
                     store, ANIMAL_SOURCE_TASKS, probe, max_nodes=params.max_nodes_filter
                 )
