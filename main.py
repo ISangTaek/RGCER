@@ -280,6 +280,16 @@ def _write_run_metadata(params, task_names, trainer):
         "trainable_last_blocks": getattr(params, "trainable_last_blocks", 0),
         "retention_probe_per_task": getattr(params, "retention_probe_per_task", 16),
         "retention_damage_threshold": getattr(params, "retention_damage_threshold", 0.02),
+        # Seventh-D8 review P0-4 (§44): O6 retention teacher + probe identity.
+        "source_train_probe_manifest_sha256": getattr(
+            params, "source_train_probe_manifest_sha256", None
+        ),
+        "o6_retention_teacher_checkpoint_sha256": getattr(
+            params, "o6_retention_teacher_checkpoint_sha256", None
+        ),
+        "o6_retention_teacher_initial_model_sha256": getattr(
+            params, "o6_retention_teacher_initial_model_sha256", None
+        ),
         # D6 shuffle/counterfactual provenance (review P1-5, §51).
         "shuffle_animal_train_labels": bool(
             getattr(params, "shuffle_animal_train_labels", False)
@@ -926,12 +936,50 @@ def main(params):
                 from scripts.d6_prep_inits import (
                     _build_model as _prep_build_model,
                     _load_teacher_checkpoint as _prep_load_teacher,
+                    _verify_single_real_teacher,
                 )
 
+                teacher_dir_path = Path(sidecar["teacher_real_run_dir"])
+                expected_teacher_epoch = int(sidecar["expected_teacher_epoch"])
                 teacher_path, teacher_payload = _prep_load_teacher(
-                    Path(sidecar["teacher_real_run_dir"]),
-                    int(sidecar["expected_teacher_epoch"]),
+                    teacher_dir_path,
+                    expected_teacher_epoch,
                 )
+                # Seventh-D8 review P0-4 (§38-§41): the retention trigger
+                # depends on the teacher checkpoint — bind the LOADED teacher
+                # to the B1 init provenance (full single-real contract +
+                # checkpoint SHA + data identity) before it can influence
+                # training.
+                teacher_contract = _verify_single_real_teacher(
+                    teacher_payload,
+                    teacher_dir_path,
+                    expected_model_seed=int(params.seed),
+                    expected_epoch=expected_teacher_epoch,
+                )
+                if (
+                    teacher_contract["teacher_real_checkpoint_sha256"]
+                    != sidecar.get("teacher_real_checkpoint_sha256")
+                ):
+                    raise ValueError(
+                        "O6 retention teacher checkpoint does not match the B1 "
+                        "init provenance (checkpoint sha256 mismatch)"
+                    )
+                for identity_key in (
+                    "split_manifest_hash",
+                    "datastore_fingerprint",
+                    "feature_schema_version",
+                ):
+                    if teacher_contract.get(identity_key) != sidecar.get(identity_key):
+                        raise ValueError(
+                            f"O6 retention teacher {identity_key} does not match "
+                            "the B1 init provenance"
+                        )
+                params.o6_retention_teacher_checkpoint_sha256 = teacher_contract[
+                    "teacher_real_checkpoint_sha256"
+                ]
+                params.o6_retention_teacher_initial_model_sha256 = teacher_contract[
+                    "teacher_initial_model_sha256"
+                ]
                 template = dict(teacher_payload.get("configuration") or {})
                 teacher_model = _prep_build_model(
                     int(template.get("seed", params.seed)), "animal56", trainer.device, template
@@ -967,6 +1015,11 @@ def main(params):
                 if pending_retention is not None:
                     trainer.d8_retention_controller.load_state_dict(pending_retention)
                     trainer.pending_d8_retention_state = None
+                # Seventh-D8 review P0-4 (§43): the probe manifest hash and the
+                # bound teacher identity are written AFTER the controller is
+                # attached — rewrite run metadata so they are recorded.
+                params.source_train_probe_manifest_sha256 = manifest["manifest_sha256"]
+                _write_run_metadata(params, task_names, trainer)
             history = trainer.train(
                 train_dataloaders_dict=train_loaders,
                 val_dataloaders_dict=val_loaders,
@@ -1577,6 +1630,39 @@ def validate_params(params):
                 raise ValueError(
                     "--d7_candidate o6 requires backbone_lr_multiplier=0.02 "
                     f"(protocol lock, found {multiplier!r})"
+                )
+            # Seventh-D8 review P0-3 (§31): O6 protocol locks — the probe size
+            # and trigger threshold are part of the method DEFINITION.
+            if int(getattr(params, "retention_probe_per_task", 16)) != 16:
+                raise ValueError(
+                    "--d7_candidate o6 requires retention_probe_per_task=16 "
+                    "(D8 protocol lock)"
+                )
+            if not math.isclose(
+                float(getattr(params, "retention_damage_threshold", 0.02)),
+                0.02,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    "--d7_candidate o6 requires retention_damage_threshold=0.02 "
+                    "(D8 protocol lock; not validation-tuned)"
+                )
+        if d7_candidate in {"a1", "a2", "o6"}:
+            # Seventh-D8 review P0-2 (§24): the mechanism gate needs the FINAL
+            # epoch's feature drift — refuse runs whose feature_drift_epochs
+            # do not include the last epoch.
+            from d7_diagnostics import parse_feature_drift_epochs
+
+            requested_feature_epochs = parse_feature_drift_epochs(
+                getattr(params, "feature_drift_epochs", "0,5,10,15,19")
+            )
+            final_epoch = int(params.epochs) - 1
+            if final_epoch not in requested_feature_epochs:
+                raise ValueError(
+                    f"D8 candidate {d7_candidate} requires final feature drift at "
+                    f"epoch {final_epoch}; --feature_drift_epochs currently "
+                    f"resolves to {sorted(requested_feature_epochs)}"
                 )
         if d7_candidate == "s2":
             if freeze != 0:

@@ -57,6 +57,7 @@ def _write_d7_s1_run(root, seed, stable, *, stage="d7_stage_b", epochs=40, endpo
         "d7_artifact_contract": {
             "mode": "b1",
             "human_seed": seed,
+            "artifact_sha256": "artifact-sha",
             "split_manifest_hash": "manifest-test",
             "datastore_fingerprint": "datastore-test",
             "feature_schema_version": "schema-test",
@@ -99,6 +100,7 @@ def _write_d8_candidate_run(
     endpoint_values = dict(endpoints or HUMAN_ENDPOINTS)
     if women is not None:
         endpoint_values["women_oral_TDLo"] = women
+    drift_epochs = "0,5,10,15,19" if epochs == 20 else "0,5,10,15,19,25,30,35,39"
     (run_dir / "args.json").write_text(
         json.dumps(
             {
@@ -112,11 +114,15 @@ def _write_d8_candidate_run(
                 "freeze_backbone_epochs": 0,
                 "trainable_last_blocks": blocks if blocks is not None else scope[0],
                 "backbone_lr_multiplier": multiplier if multiplier is not None else scope[1],
+                "feature_drift_epochs": drift_epochs,
+                "retention_probe_per_task": 16,
+                "retention_damage_threshold": 0.02,
             }
         ),
         encoding="utf-8",
     )
     metadata = {
+        "seed": seed,
         "d7_candidate": candidate,
         "manifest_sha256": "manifest-test",
         "datastore_fingerprint": "datastore-test",
@@ -125,11 +131,20 @@ def _write_d8_candidate_run(
         "d7_artifact_contract": {
             "mode": "b1",
             "human_seed": seed,
+            "artifact_sha256": "artifact-sha",
             "split_manifest_hash": "manifest-test",
             "datastore_fingerprint": "datastore-test",
             "feature_schema_version": "schema-test",
         },
     }
+    if candidate == "o6":
+        metadata.update(
+            {
+                "source_train_probe_manifest_sha256": "probe-sha",
+                "o6_retention_teacher_checkpoint_sha256": "teacher-sha",
+                "o6_retention_teacher_initial_model_sha256": "teacher-init-sha",
+            }
+        )
     (run_dir / "run_metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
     with (diagnostics / "epoch_summary.csv").open("w", encoding="utf-8") as handle:
         handle.write("epoch,val_human3_macro_rmse\n")
@@ -153,6 +168,11 @@ def _write_d8_candidate_run(
                         "functional_forgetting_abs": 0.04,
                         "functional_forgetting_exact_zero": False,
                         "provenance_verified": True,
+                        "candidate_run_seed": seed,
+                        "split_manifest_hash": "manifest-test",
+                        "datastore_fingerprint": "datastore-test",
+                        "feature_schema_version": "schema-test",
+                        "artifact_sha256": "artifact-sha",
                         "animal_tasks_worsened": 2,
                         "animal_tasks_improved": 1,
                         "animal_tasks_unchanged": 53,
@@ -199,6 +219,7 @@ def _write_s1_20e(root, seed, stable, endpoints=None):
         "d7_artifact_contract": {
             "mode": "b1",
             "human_seed": seed,
+            "artifact_sha256": "artifact-sha",
             "split_manifest_hash": "manifest-test",
             "datastore_fingerprint": "datastore-test",
             "feature_schema_version": "schema-test",
@@ -564,6 +585,11 @@ def _write_functional_forgetting_json(root, reference, seed, *, exact_zero, veri
     else:
         run_dir = root / "d7_stage_b" / "s1" / "d7_s1_e40" / f"seed_{seed}"
     payload = {
+        "candidate_run_seed": seed,
+        "split_manifest_hash": "manifest-test",
+        "datastore_fingerprint": "datastore-test",
+        "feature_schema_version": "schema-test",
+        "artifact_sha256": "artifact-sha",
         "functional_forgetting_relative": 0.0 if exact_zero else 0.20,
         "functional_forgetting_abs": 0.0 if exact_zero else 0.25,
         "functional_forgetting_exact_zero": exact_zero,
@@ -623,3 +649,109 @@ def test_d8_0_requires_s1_exact_zero_functional_forgetting(tmp_path):
     assert result["functional_invariant_failure"] is True
     assert result["functional_audit_complete"] is False
     assert result["gate_pass"] is False
+
+# ----------------------------------------------------------------------
+# Seventh-D8 review P0-2 (§26/§67): final feature-drift epoch contract
+# ----------------------------------------------------------------------
+def test_d8_b_contract_requires_final_feature_drift_epoch(tmp_path):
+    from scripts.d8_aggregate import check_d8_run_contract, summarize_d8_run
+
+    run_dir = _write_d8_candidate_run(tmp_path, "o6", 42, 1.06, epochs=40)
+    args_path = run_dir / "args.json"
+    args_payload = json.loads(args_path.read_text(encoding="utf-8"))
+    args_payload["feature_drift_epochs"] = "0,5,10,15,19"  # missing 39
+    args_path.write_text(json.dumps(args_payload), encoding="utf-8")
+    violations = check_d8_run_contract(run_dir, "o6", 42, 39)
+    assert any("feature_drift_epochs" in violation for violation in violations)
+    row = summarize_d8_run(run_dir, "o6", 42, 39)
+    assert row["status"] == "CONTRACT_VIOLATION"
+
+
+def test_d8_a_contract_accepts_epoch19_feature_drift(tmp_path):
+    from scripts.d8_aggregate import check_d8_run_contract
+
+    run_dir = _write_d8_candidate_run(tmp_path, "a1", 42, 1.05, epochs=20)
+    assert check_d8_run_contract(run_dir, "a1", 42, 19) == []
+
+
+# ----------------------------------------------------------------------
+# Seventh-D8 review P0-3 (§32): O6 contract locks
+# ----------------------------------------------------------------------
+def test_d8_o6_contract_rejects_wrong_probe_size(tmp_path):
+    from scripts.d8_aggregate import check_d8_run_contract
+
+    run_dir = _write_d8_candidate_run(tmp_path, "o6", 42, 1.06, epochs=20)
+    args_path = run_dir / "args.json"
+    args_payload = json.loads(args_path.read_text(encoding="utf-8"))
+    args_payload["retention_probe_per_task"] = 15
+    args_path.write_text(json.dumps(args_payload), encoding="utf-8")
+    violations = check_d8_run_contract(run_dir, "o6", 42, 19)
+    assert any("retention_probe_per_task" in violation for violation in violations)
+
+
+def test_d8_o6_contract_rejects_wrong_threshold(tmp_path):
+    from scripts.d8_aggregate import check_d8_run_contract
+
+    run_dir = _write_d8_candidate_run(tmp_path, "o6", 42, 1.06, epochs=20)
+    args_path = run_dir / "args.json"
+    args_payload = json.loads(args_path.read_text(encoding="utf-8"))
+    args_payload["retention_damage_threshold"] = 0.05
+    args_path.write_text(json.dumps(args_payload), encoding="utf-8")
+    violations = check_d8_run_contract(run_dir, "o6", 42, 19)
+    assert any("retention_damage_threshold" in violation for violation in violations)
+
+
+def test_d8_o6_contract_requires_probe_manifest_sha(tmp_path):
+    # P0-4 (§45): O6 run metadata must carry the probe manifest hash and the
+    # bound retention teacher identity.
+    from scripts.d8_aggregate import check_d8_run_contract
+
+    run_dir = _write_d8_candidate_run(tmp_path, "o6", 42, 1.06, epochs=20)
+    metadata_path = run_dir / "run_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    for field in (
+        "source_train_probe_manifest_sha256",
+        "o6_retention_teacher_checkpoint_sha256",
+        "o6_retention_teacher_initial_model_sha256",
+    ):
+        metadata.pop(field, None)
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    violations = check_d8_run_contract(run_dir, "o6", 42, 19)
+    assert any(field in violation for violation in violations for field in
+               ("probe_manifest", "teacher_checkpoint", "teacher_initial"))
+
+
+# ----------------------------------------------------------------------
+# Seventh-D8 review P1-1 (§47-§51): stale functional JSON rejected
+# ----------------------------------------------------------------------
+def test_d8_rejects_stale_functional_json_wrong_seed(tmp_path):
+    from scripts.d8_aggregate import _functional_forgetting
+
+    run_dir = _write_d8_candidate_run(tmp_path, "a1", 42, 1.05)
+    ff_path = run_dir / "functional_forgetting.json"
+    payload = json.loads(ff_path.read_text(encoding="utf-8"))
+    payload["candidate_run_seed"] = 44  # stale file from another seed
+    ff_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert _functional_forgetting(run_dir) is None
+
+
+def test_d8_rejects_stale_functional_json_wrong_manifest(tmp_path):
+    from scripts.d8_aggregate import _functional_forgetting
+
+    run_dir = _write_d8_candidate_run(tmp_path, "a1", 42, 1.05)
+    ff_path = run_dir / "functional_forgetting.json"
+    payload = json.loads(ff_path.read_text(encoding="utf-8"))
+    payload["split_manifest_hash"] = "manifest-other"
+    ff_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert _functional_forgetting(run_dir) is None
+
+
+def test_d8_rejects_stale_functional_json_wrong_artifact(tmp_path):
+    from scripts.d8_aggregate import _functional_forgetting
+
+    run_dir = _write_d8_candidate_run(tmp_path, "a1", 42, 1.05)
+    ff_path = run_dir / "functional_forgetting.json"
+    payload = json.loads(ff_path.read_text(encoding="utf-8"))
+    payload["artifact_sha256"] = "artifact-other"
+    ff_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert _functional_forgetting(run_dir) is None

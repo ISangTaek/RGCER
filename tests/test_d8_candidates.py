@@ -317,7 +317,11 @@ def test_o6_trigger_freezes_next_epoch_and_never_unfreezes(tmp_path):
     row6 = controller.log_epoch(6, model)
     assert int(row6["triggered"]) == 1
     assert float(row6["retention_damage_train"]) > 0.0  # real damage, not zeroed
-    assert [int(row["triggered"]) for row in controller.rows] == [0, 0, 0, 1]
+    # P1-4: the firing epoch row itself carries triggered=1 AND
+    # trigger_fired_this_epoch=1; the next epoch only keeps triggered=1.
+    assert int(controller.rows[2]["trigger_fired_this_epoch"]) == 1
+    assert int(row6["trigger_fired_this_epoch"]) == 0
+    assert [int(row["triggered"]) for row in controller.rows] == [0, 0, 1, 1]
     assert [row["state"] for row in controller.rows] == [
         "baseline", "post_epoch", "post_epoch", "post_epoch",
     ]
@@ -573,3 +577,86 @@ def test_functional_forgetting_rejects_wrong_manifest(tmp_path):
     bundle = verify_run_provenance(run_dir, teacher_dir)
     with pytest.raises(ValueError, match="data identity|split_manifest_hash"):
         _load_run_backbone(run_dir, bundle["contract"])
+
+# ----------------------------------------------------------------------
+# Seventh-D8 review P0-3: O6 protocol locks (§28-§33)
+# ----------------------------------------------------------------------
+from tests.test_d7_candidates import _write_b1_sidecar  # noqa: E402
+
+
+def _o6_params(tmp_path, *, probe_per_task=16, threshold=0.02):
+    from main import build_parser
+
+    params = build_parser().parse_args([])
+    params.dataset = "toxacute"
+    params.arch = "Graphormer"
+    params.toxacute_task_scope = "human3"
+    params.fit_conformal = False
+    params.train_eval_scope = "validation_only"
+    params.shuffle_animal_train_labels = False
+    params.card_lambda_delta = 0.0
+    params.d6_candidate = "none"
+    params.d7_candidate = "o6"
+    params.seed = 42
+    params.epochs = 20
+    params.freeze_backbone_epochs = 0
+    params.backbone_lr_multiplier = 0.02
+    params.trainable_last_blocks = 1
+    params.feature_drift_epochs = "0,5,10,15,19"
+    params.retention_probe_per_task = probe_per_task
+    params.retention_damage_threshold = threshold
+    params.init_state_path = _write_b1_sidecar(tmp_path, name="o6_init.pt")
+    return params
+
+
+def test_o6_rejects_probe_size_not_16(tmp_path):
+    from main import validate_params
+
+    params = _o6_params(tmp_path, probe_per_task=15)
+    with pytest.raises(ValueError, match="retention_probe_per_task=16"):
+        validate_params(params)
+    params = _o6_params(tmp_path, probe_per_task=32)
+    with pytest.raises(ValueError, match="retention_probe_per_task=16"):
+        validate_params(params)
+    validate_params(_o6_params(tmp_path))  # 16 passes
+
+
+def test_o6_rejects_trigger_threshold_not_002(tmp_path):
+    from main import validate_params
+
+    for bad in (0.01, 0.05, 0.123):
+        params = _o6_params(tmp_path, threshold=bad)
+        with pytest.raises(ValueError, match="retention_damage_threshold=0.02"):
+            validate_params(params)
+    validate_params(_o6_params(tmp_path))  # 0.02 passes
+
+
+def test_o6_rejects_retention_teacher_wrong_seed(tmp_path):
+    # P0-4: the retention teacher must be seed-matched to the candidate —
+    # the single-real contract rejects any other base seed.
+    from tests.test_d6_counterfactual import _teacher_payload, _write_teacher
+
+    run_dir = _write_teacher(tmp_path, "teacher", _teacher_payload(False, seed=43))
+    payload = torch.load(run_dir / "teacher_last.pt", weights_only=False)
+    from scripts.d6_prep_inits import _verify_single_real_teacher
+
+    with pytest.raises(SystemExit, match="base seed"):
+        _verify_single_real_teacher(
+            payload, run_dir, expected_model_seed=42, expected_epoch=29
+        )
+
+
+def test_o6_run_metadata_records_retention_teacher_sha():
+    # P0-4 (§42-§44): the run metadata writer must persist the probe manifest
+    # hash and the bound retention teacher identity.
+    import inspect
+
+    from main import _write_run_metadata
+
+    source = inspect.getsource(_write_run_metadata)
+    for field in (
+        "source_train_probe_manifest_sha256",
+        "o6_retention_teacher_checkpoint_sha256",
+        "o6_retention_teacher_initial_model_sha256",
+    ):
+        assert field in source

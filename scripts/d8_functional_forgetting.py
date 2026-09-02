@@ -56,6 +56,29 @@ from d8_retention import (  # noqa: E402
 )
 
 
+def _resolve_b1_artifact_contract(metadata: dict) -> tuple[dict, str]:
+    """Seventh-D8 review P0-1 (§13-§16): two legitimate consumers — the
+    standard D6 B1 reference (d6_artifact_contract) and D7/D8 candidates
+    (d7_artifact_contract).  Both MUST carry mode == b1."""
+
+    d7_contract = metadata.get("d7_artifact_contract")
+    if isinstance(d7_contract, dict) and d7_contract.get("mode") == "b1":
+        return d7_contract, "d7_artifact_contract"
+
+    d6_contract = metadata.get("d6_artifact_contract")
+    if (
+        metadata.get("d6_candidate") == "b1"
+        and isinstance(d6_contract, dict)
+        and d6_contract.get("mode") == "b1"
+    ):
+        return d6_contract, "d6_artifact_contract"
+
+    raise ValueError(
+        "functional forgetting requires a provenance-verified B1 initialization "
+        "contract from either d7_artifact_contract or the B1 d6_artifact_contract"
+    )
+
+
 def verify_run_provenance(run_dir: Path, teacher_dir: str | None = None) -> dict:
     """Bind the evaluator to the candidate's recorded matched teacher.
 
@@ -72,20 +95,10 @@ def verify_run_provenance(run_dir: Path, teacher_dir: str | None = None) -> dict
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     args_payload = json.loads(args_path.read_text(encoding="utf-8"))
 
-    contract = metadata.get("d7_artifact_contract")
-    if not isinstance(contract, dict):
-        raise ValueError(
-            "run_metadata.json lacks a d7_artifact_contract — functional "
-            "forgetting requires a provenance-verified D8 candidate run"
-        )
-    if contract.get("mode") != "b1":
-        raise ValueError(
-            f"functional forgetting requires a B1-initialized candidate, found "
-            f"mode={contract.get('mode')!r}"
-        )
+    contract, contract_source = _resolve_b1_artifact_contract(metadata)
     run_seed = metadata.get("seed")
     if int(contract.get("human_seed", -1)) != int(run_seed):
-        raise ValueError("d7_artifact_contract.human_seed does not match the run seed")
+        raise ValueError("artifact contract human_seed does not match the run seed")
 
     init_state_path = args_payload.get("init_state_path")
     if not init_state_path:
@@ -125,6 +138,7 @@ def verify_run_provenance(run_dir: Path, teacher_dir: str | None = None) -> dict
         "run_dir": run_dir,
         "run_seed": int(run_seed),
         "contract": contract,
+        "contract_source": contract_source,
         "provenance": provenance,
         "teacher_dir": recorded_teacher_dir,
         "expected_teacher_epoch": int(provenance["expected_teacher_epoch"]),
@@ -288,7 +302,10 @@ def main() -> None:
         for batch in loader:
             if getattr(batch, "get", lambda *_: None)("is_empty", False):
                 continue
-            batches.append((task, batch.to(device)))
+            # P1-3 (§58-§60): keep batches on CPU here — evaluate_animal_rmse
+            # moves each batch to the device and back, so the full Animal56
+            # validation set never resides on the GPU at once.
+            batches.append((task, batch))
     if not batches:
         raise RuntimeError("animal56 validation produced no batches")
 
@@ -298,7 +315,11 @@ def main() -> None:
     current_macro, current_per_task = evaluate_animal_rmse(
         hybrid, batches, device, task_scalers, ANIMAL_SOURCE_TASKS
     )
-    stats = functional_forgetting_stats(teacher_per_task, current_per_task)
+    stats = functional_forgetting_stats(
+        teacher_per_task,
+        current_per_task,
+        expected_task_set=set(ANIMAL_SOURCE_TASKS),
+    )
     stats.update(
         {
             "run_dir": str(run_dir),
@@ -306,6 +327,7 @@ def main() -> None:
             "teacher_checkpoint": str(teacher_path),
             # Fifth-D8 review §34: full provenance block.
             "provenance_verified": True,
+            "artifact_contract_source": bundle["contract_source"],
             "teacher_checkpoint_sha256": _sha256_file(teacher_path),
             "teacher_initial_model_sha256": provenance["teacher_initial_model_sha256"],
             "candidate_run_seed": bundle["run_seed"],

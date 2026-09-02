@@ -42,10 +42,16 @@ def select_source_retention_probe(store, animal_tasks, per_task: int = 16) -> di
             (str(store.sample_ids[int(index)]) for index in indices), key=stable_key
         )
         chosen = candidates[:per_task]
-        if chosen:
-            probe[task] = chosen
-    if not probe:
-        raise ValueError("source retention probe selection found no train molecules")
+        if not chosen:
+            raise RuntimeError(
+                f"O6 source retention probe has no train samples for {task!r}"
+            )
+        probe[task] = chosen
+    if set(probe) != set(animal_tasks):
+        missing = sorted(set(animal_tasks) - set(probe))
+        raise RuntimeError(
+            f"O6 source retention probe is missing source tasks: {missing[:5]}"
+        )
     return probe
 
 
@@ -134,28 +140,37 @@ def evaluate_animal_rmse(model, task_batches, device, task_scalers, animal_tasks
         with torch.no_grad():
             for task, batch in task_batches:
                 batch = batch.to(device)
-                representation = model.encoder(batch)
-                raw = model.decoders[task](representation)
-                median = decode_prediction(raw, mode="quantile").median
-                scaler = task_scalers.get(task) or {}
-                median = (
-                    median * float(scaler.get("std", 1.0)) + float(scaler.get("mean", 0.0))
-                )
-                target = batch.y.reshape(-1, 1).float()
-                if target.shape != median.shape:
-                    target = target.reshape(median.shape)
-                error = median - target
-                sum_sq_error[task] += float(error.pow(2).sum().detach().cpu())
-                count[task] += int(error.numel())
+                try:
+                    representation = model.encoder(batch)
+                    raw = model.decoders[task](representation)
+                    median = decode_prediction(raw, mode="quantile").median
+                    scaler = task_scalers.get(task) or {}
+                    median = (
+                        median * float(scaler.get("std", 1.0)) + float(scaler.get("mean", 0.0))
+                    )
+                    target = batch.y.reshape(-1, 1).float()
+                    if target.shape != median.shape:
+                        target = target.reshape(median.shape)
+                    error = median - target
+                    sum_sq_error[task] += float(error.pow(2).sum().detach().cpu())
+                    count[task] += int(error.numel())
+                finally:
+                    # PyG `.to()` is in-place: move the batch back so the full
+                    # validation set never resides on the GPU at once (P1-3).
+                    if getattr(device, "type", None) == "cuda":
+                        batch.cpu()
     finally:
         if was_training:
             model.train()
+    missing_tasks = [task for task in animal_tasks if count[task] <= 0]
+    if missing_tasks:
+        raise RuntimeError(
+            "Animal56 functional evaluation is incomplete; "
+            f"missing {len(missing_tasks)} tasks: {missing_tasks[:5]}"
+        )
     per_task: dict[str, float] = {}
     for task in animal_tasks:
-        if count[task] <= 0:
-            per_task[task] = float("nan")
-        else:
-            per_task[task] = (sum_sq_error[task] / count[task]) ** 0.5
+        per_task[task] = (sum_sq_error[task] / count[task]) ** 0.5
     ordered = [per_task[task] for task in animal_tasks]
     return macro_rmse(ordered), per_task
 
@@ -185,13 +200,29 @@ def functional_forgetting_stats(
     current_task_rmse: dict[str, float],
     *,
     tolerance: float = 1e-6,
+    expected_task_set=None,
 ) -> dict:
-    """Plan §23-§24/§27-§28: macro forgetting (abs/relative), per-endpoint
-    deltas and the source-task forgetting distribution."""
+    """Plan §23-§24/§27-§28 + P1-2 §55: macro forgetting (abs/relative),
+    per-endpoint deltas and the source-task forgetting distribution.  The
+    teacher/current task sets must be IDENTICAL; formal D8 additionally pins
+    them to the full 56-task Animal56 set via ``expected_task_set``."""
 
     import math
 
-    tasks = sorted(set(teacher_task_rmse) & set(current_task_rmse))
+    teacher_tasks = set(teacher_task_rmse)
+    current_tasks = set(current_task_rmse)
+    if teacher_tasks != current_tasks:
+        raise ValueError(
+            "teacher/current animal task sets differ: "
+            f"only-teacher={sorted(teacher_tasks - current_tasks)[:5]} "
+            f"only-current={sorted(current_tasks - teacher_tasks)[:5]}"
+        )
+    tasks = sorted(teacher_tasks)
+    if expected_task_set is not None and tasks != sorted(set(expected_task_set)):
+        raise ValueError(
+            "functional forgetting task set does not match the formal Animal56 "
+            f"task set ({len(tasks)} vs {len(set(expected_task_set))})"
+        )
     if not tasks:
         raise ValueError("functional forgetting: no overlapping tasks")
     deltas = {task: current_task_rmse[task] - teacher_task_rmse[task] for task in tasks}
@@ -253,6 +284,7 @@ DRIFT_TRIGGER_FIELDS = (
     "trigger_threshold",
     "backbone_trainable",
     "triggered",
+    "trigger_fired_this_epoch",
 )
 
 
@@ -317,6 +349,7 @@ class D8RetentionController:
             "trigger_threshold": f"{self.threshold:.4f}",
             "backbone_trainable": int(trainable),
             "triggered": int(self.triggered),
+            "trigger_fired_this_epoch": 0,
         }
         self.rows.append(row)
         if self.output_dir is not None:
@@ -376,6 +409,11 @@ class D8RetentionController:
             self.triggered = True
             self.trigger_epoch = int(epoch)
             frozen = freeze_last_block(model)
+            # P1-4 (§64): keep the firing epoch visible in the CSV — the row's
+            # damage is real and the freeze takes effect from the NEXT epoch.
+            row["triggered"] = 1
+            row["backbone_trainable"] = 0
+            row["trigger_fired_this_epoch"] = 1
             print(
                 f"O6 source-retention trigger: epoch={epoch} damage={damage:.4f} "
                 f"> {self.threshold} — last block frozen from next epoch "

@@ -108,6 +108,41 @@ def check_d8_run_contract(run_dir: Path, candidate: str, seed: int, expected_las
             f"args.backbone_lr_multiplier: found {multiplier!r}, "
             f"expected exactly {scope['multiplier']}"
         )
+    # Seventh-D8 review P0-2 (§26/§67): the final-epoch feature drift is part
+    # of the run contract — a 40-epoch candidate without epoch 39 in its
+    # feature_drift_epochs is a CONTRACT_VIOLATION, not a missing metric.
+    feature_epochs = {
+        int(token)
+        for token in str(args_payload.get("feature_drift_epochs", "")).split(",")
+        if str(token).strip()
+    }
+    if expected_last_epoch not in feature_epochs:
+        violations.append(
+            f"args.feature_drift_epochs lacks final epoch {expected_last_epoch}"
+        )
+    if candidate == "o6":
+        # Seventh-D8 review P0-3 (§32) + P0-4 (§45): O6 protocol locks and
+        # retention teacher identity must be recorded in run metadata.
+        _check(
+            "args.retention_probe_per_task",
+            args_payload.get("retention_probe_per_task"),
+            16,
+        )
+        threshold = args_payload.get("retention_damage_threshold")
+        if not (
+            isinstance(threshold, (int, float))
+            and math.isclose(float(threshold), 0.02, rel_tol=0.0, abs_tol=1e-12)
+        ):
+            violations.append(
+                f"args.retention_damage_threshold: found {threshold!r}, must be exactly 0.02"
+            )
+        for field in (
+            "source_train_probe_manifest_sha256",
+            "o6_retention_teacher_checkpoint_sha256",
+            "o6_retention_teacher_initial_model_sha256",
+        ):
+            if not metadata.get(field):
+                violations.append(f"run_metadata.{field} missing")
     contract = metadata.get("d7_artifact_contract")
     if not isinstance(contract, dict):
         violations.append("run_metadata.d7_artifact_contract missing")
@@ -257,6 +292,31 @@ def _functional_forgetting(run_dir: Path):
     # teacher provenance may participate in mechanism gates.
     if data.get("provenance_verified") is not True:
         return None
+    # Seventh-D8 review P1-1 (§47-§50): bind the JSON to THIS run — a stale or
+    # copied file from another run/seed must never enter a mechanism gate.
+    metadata = _read_json(run_dir / "run_metadata.json")
+    from scripts.d8_functional_forgetting import _resolve_b1_artifact_contract
+
+    try:
+        contract, _ = _resolve_b1_artifact_contract(metadata)
+    except ValueError:
+        return None
+    identity_checks = {
+        "candidate_run_seed": metadata.get("seed"),
+        "split_manifest_hash": metadata.get("manifest_sha256"),
+        "datastore_fingerprint": metadata.get("datastore_fingerprint"),
+        "feature_schema_version": metadata.get("feature_schema_version"),
+        "artifact_sha256": contract.get("artifact_sha256"),
+    }
+    for field, expected in identity_checks.items():
+        if expected is None:
+            continue
+        if data.get(field) != expected:
+            print(
+                f"INVALID_PROVENANCE: {run_dir} functional_forgetting.json "
+                f"{field}={data.get(field)!r} != run {expected!r} — excluded"
+            )
+            return None
     return {
         "relative": data.get("functional_forgetting_relative"),
         "abs": data.get("functional_forgetting_abs"),
