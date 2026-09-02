@@ -249,8 +249,12 @@ class D7DriftTracker:
             else {0, 5, 10, 15, 19}
         )
         self.output_dir = Path(output_dir) if output_dir is not None else None
+        # P0-2 (eighth review §32): only backbone tensors are needed for the
+        # drift definition — keeps the checkpointed state compact.
         init_state = {
-            key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+            key: value.detach().cpu().clone()
+            for key, value in model.state_dict().items()
+            if key.startswith(BACKBONE_PREFIX)
         }
         self.init_state = init_state
         self.probe_ids = select_probe_ids(train_sample_ids(train_loaders), probe_size)
@@ -286,15 +290,66 @@ class D7DriftTracker:
             "feature_drift": feature,
         }
         self.rows.append(row)
-        if self.output_dir is not None:
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            with (self.output_dir / "d7_representation_drift.csv").open(
-                "w", newline="", encoding="utf-8"
-            ) as handle:
-                writer = csv.DictWriter(handle, fieldnames=list(DRIFT_FIELDS))
-                writer.writeheader()
-                writer.writerows(self.rows)
+        self._rewrite()
         return row
+
+    def _rewrite(self):
+        """Rewrite the drift CSV from the current rows (also used on resume)."""
+        if self.output_dir is None:
+            return
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        with (self.output_dir / "d7_representation_drift.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(DRIFT_FIELDS))
+            writer.writeheader()
+            writer.writerows(self.rows)
+
+    def state_dict(self) -> dict:
+        """P0-2 (§31): checkpoint/resume payload — the ORIGINAL pretrained
+        baseline, the probe identity and the logged rows survive interruption,
+        so a resumed run keeps measuring drift against theta_0."""
+
+        return {
+            "anchor_type": self.anchor_type,
+            "feature_drift_epochs": sorted(self.feature_drift_epochs),
+            "init_state": {
+                key: value.detach().cpu().clone()
+                for key, value in self.init_state.items()
+            },
+            "probe_ids": list(self.probe_ids),
+            "reference_representations": {
+                sample_id: tensor.detach().cpu().clone()
+                for sample_id, tensor in self.reference_representations.items()
+            },
+            "rows": list(self.rows),
+        }
+
+    def load_state_dict(self, state) -> None:
+        """P0-2 (§33): restore the pre-interruption baseline/rows.  Probe
+        identity, anchor type and the measurement schedule must match."""
+
+        if state is None:
+            return
+        if state.get("anchor_type") != self.anchor_type:
+            raise ValueError(
+                f"D7 drift anchor_type mismatch: checkpoint has "
+                f"{state.get('anchor_type')!r}, current run {self.anchor_type!r}"
+            )
+        if set(state.get("feature_drift_epochs") or []) != set(self.feature_drift_epochs):
+            raise ValueError("D7 drift feature_drift_epochs changed on resume")
+        if list(state.get("probe_ids") or []) != list(self.probe_ids):
+            raise ValueError("D7 drift probe IDs changed on resume")
+        self.init_state = {
+            key: value.detach().cpu().clone()
+            for key, value in (state.get("init_state") or {}).items()
+        }
+        self.reference_representations = {
+            sample_id: tensor.detach().cpu().clone()
+            for sample_id, tensor in (state.get("reference_representations") or {}).items()
+        }
+        self.rows = list(state.get("rows") or [])
+        self._rewrite()
 
     def log_epoch(self, epoch: int, model) -> dict:
         """Log the POST-epoch state so it aligns with validation epoch t."""

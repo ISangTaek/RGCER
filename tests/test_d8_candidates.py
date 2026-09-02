@@ -198,7 +198,7 @@ class _StubStore:
         self._index_of = lookup
         self.requested_splits = []
 
-    def get_task_indices(self, task, split=None):
+    def get_task_indices(self, task, split=None, max_nodes=None):
         self.requested_splits.append(split)
         assert split == "train", "O6 probe may only read the TRAIN split"
         return [self._index_of[sample_id] for sample_id in self.train_ids_by_task[task]]

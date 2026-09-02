@@ -840,7 +840,7 @@ def d8_a(d8_root: Path, d7_root: Path, seeds: list[int], output_dir: Path, trace
         output_dir / "D8A_SOURCE_RETENTION_TRIGGER.csv",
         ["candidate", "seed", "epoch", "state", "probe_rmse_teacher",
          "probe_rmse_current", "retention_damage_train", "trigger_threshold",
-         "backbone_trainable", "triggered"],
+         "backbone_trainable", "triggered", "trigger_fired_this_epoch"],
         trigger_rows,
     )
     (output_dir / "D8A_SELECTION_TRACE.json").write_text(

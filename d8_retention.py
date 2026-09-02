@@ -28,16 +28,21 @@ def stable_key(sample_id: str) -> str:
     return hashlib.sha256(str(sample_id).encode("utf-8")).hexdigest()
 
 
-def select_source_retention_probe(store, animal_tasks, per_task: int = 16) -> dict[str, list[str]]:
-    """Plan §49-§50: from EACH animal task's TRAIN split take the first
-    `per_task` molecules ordered by stable SHA(sample_id).  Never validation,
-    never label/prediction-dependent."""
+def select_source_retention_probe(
+    store, animal_tasks, per_task: int = 16, *, max_nodes=None
+) -> dict[str, list[str]]:
+    """Plan §49-§50 + eighth-review P1-1 (§48-§52): from EACH animal task's
+    TRAIN split take the first `per_task` molecules ordered by stable
+    SHA(sample_id).  `max_nodes` mirrors the formal loader filter so the probe
+    selection universe == the trainable universe (otherwise a >max_nodes
+    molecule could be selected and then dropped at collection time).  Never
+    validation, never label/prediction-dependent."""
 
     if per_task <= 0:
         raise ValueError(f"per_task must be > 0, found {per_task!r}")
     probe: dict[str, list[str]] = {}
     for task in animal_tasks:
-        indices = store.get_task_indices(task, split="train")
+        indices = store.get_task_indices(task, split="train", max_nodes=max_nodes)
         candidates = sorted(
             (str(store.sample_ids[int(index)]) for index in indices), key=stable_key
         )
@@ -238,12 +243,17 @@ def functional_forgetting_stats(
 
     improved = sum(1 for value in deltas.values() if value < -tolerance)
     worsened = sum(1 for value in deltas.values() if value > tolerance)
+    # Eighth-review P1-2 (§53-§56): a macro delta can cancel +0.01/-0.01
+    # across endpoints — the exact-zero invariant must hold at the ENDPOINT
+    # level (all 56 per-task deltas ~0), not just in the macro.
+    max_abs_task_delta = max(abs(value) for value in deltas.values())
     return {
         "teacher_animal56_macro_rmse": teacher_macro,
         "current_animal56_macro_rmse": current_macro,
         "functional_forgetting_abs": abs_forgetting,
         "functional_forgetting_relative": abs_forgetting / (teacher_macro + 1e-12),
-        "functional_forgetting_exact_zero": bool(abs(abs_forgetting) < 1e-7),
+        "functional_forgetting_exact_zero": bool(max_abs_task_delta < 1e-7),
+        "delta_max_abs": max_abs_task_delta,
         "animal_tasks_improved": improved,
         "animal_tasks_unchanged": n - improved - worsened,
         "animal_tasks_worsened": worsened,

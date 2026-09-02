@@ -613,6 +613,95 @@ def _prediction_records(params, trainer, batch, task_names):
     return rows
 
 
+def _apply_or_validate_init_state(trainer, params):
+    """D7/D8 init overlay with an explicit resume contract (eighth D8 review
+    P0-1, §15-§22).
+
+    Fresh run (no load_path): apply the init artifact to the model and record
+    pre/post overlay hashes.  Resumed run (load_path set): NEVER re-apply the
+    overlay — the checkpoint already carries the trained trajectory; instead
+    verify that the checkpoint's recorded initial_model_sha256 equals the init
+    artifact's init_state_sha256 (§19/§21), proving the checkpoint was created
+    from this exact init artifact.
+    """
+
+    from reproducibility import state_dict_sha256
+
+    init_state_path = Path(params.init_state_path)
+    init_provenance_path = Path(str(params.init_state_path) + ".provenance.json")
+    if getattr(params, "require_init_provenance", False) and not init_provenance_path.is_file():
+        raise FileNotFoundError(
+            "D6 formal candidate is missing its init provenance sidecar: "
+            f"{init_provenance_path}"
+        )
+    init_provenance = None
+    if init_provenance_path.is_file():
+        init_provenance = json.loads(init_provenance_path.read_text(encoding="utf-8"))
+        if int(init_provenance.get("human_seed", -1)) != int(params.seed):
+            raise ValueError(
+                f"Init provenance human_seed {init_provenance.get('human_seed')!r} "
+                f"does not match --seed {params.seed}"
+            )
+        if (
+            init_provenance.get("output_sha256")
+            and init_provenance["output_sha256"] != _sha256_file(params.init_state_path)
+        ):
+            raise ValueError(
+                "Init provenance output_sha256 does not match the init state file"
+            )
+
+    if getattr(params, "load_path", None):
+        # RESUME: the checkpoint already holds the trained trajectory — the
+        # overlay must not clobber it (model/optimizer/epoch/best would fall
+        # out of the same trajectory otherwise, §13-§14).
+        expected_init_hash = (init_provenance or {}).get("init_state_sha256")
+        if not expected_init_hash:
+            raise ValueError(
+                "formal init provenance lacks init_state_sha256 — cannot verify "
+                "the resume checkpoint's initialization identity"
+            )
+        checkpoint_initial_hash = getattr(trainer, "initial_model_sha256", None)
+        if checkpoint_initial_hash != expected_init_hash:
+            raise ValueError(
+                "resume checkpoint was not created from the supplied init "
+                f"artifact (checkpoint initial_model_sha256 {checkpoint_initial_hash!r} "
+                f"!= init_state_sha256 {expected_init_hash!r})"
+            )
+        params.init_overlay_provenance = {
+            "resume": True,
+            "init_overlay_applied": False,
+            "resume_checkpoint": str(params.load_path),
+            "expected_initial_model_sha256": expected_init_hash,
+            "checkpoint_initial_model_sha256": checkpoint_initial_hash,
+            "init_state_path": str(init_state_path),
+            "init_state_sha256": _sha256_file(init_state_path),
+        }
+        print(
+            f"resume run: init overlay NOT re-applied; checkpoint initial model "
+            f"verified against {init_state_path}"
+        )
+        return
+
+    # FRESH run: apply the init artifact before any training step.
+    pre_overlay_model_sha256 = trainer.initial_model_sha256
+    state = torch.load(init_state_path, map_location=trainer.device, weights_only=False)
+    trainer.model.load_state_dict(state, strict=True)
+    post_overlay_model_sha256 = state_dict_sha256(trainer.model)
+    trainer.initial_model_sha256 = post_overlay_model_sha256
+    params.init_overlay_provenance = {
+        "resume": False,
+        "init_overlay_applied": True,
+        "init_state_path": str(init_state_path),
+        "init_state_sha256": _sha256_file(init_state_path),
+        "pre_overlay_model_sha256": pre_overlay_model_sha256,
+        "post_overlay_model_sha256": post_overlay_model_sha256,
+        "init_provenance_path": (
+            str(init_provenance_path) if init_provenance_path.exists() else None
+        ),
+    }
+    print(f"applied init state overlay from {params.init_state_path}")
+
+
 def main(params):
     # P0 reproducibility gate: the seed must be active before ANY nn.Module
     # is constructed (review §5) — otherwise decoder initial weights are not
@@ -795,51 +884,12 @@ def main(params):
         )
     _write_run_metadata(params, task_names, trainer)
     if getattr(params, "init_state_path", None):
-        # D6 CSDT/CLST/sequential-transfer initialisation (plan §64-§65): the
-        # fresh seed-matched model receives a prepared state dict before any
-        # training step; provenance hashes are recorded post-overlay
-        # (review P1-12/§51).
-        from reproducibility import state_dict_sha256
-
-        pre_overlay_model_sha256 = trainer.initial_model_sha256
-        state = torch.load(params.init_state_path, map_location=trainer.device, weights_only=False)
-        trainer.model.load_state_dict(state, strict=True)
-        post_overlay_model_sha256 = state_dict_sha256(trainer.model)
-        trainer.initial_model_sha256 = post_overlay_model_sha256
-        init_provenance_path = Path(str(params.init_state_path) + ".provenance.json")
-        if getattr(params, "require_init_provenance", False) and not init_provenance_path.is_file():
-            raise FileNotFoundError(
-                "D6 formal candidate is missing its init provenance sidecar: "
-                f"{init_provenance_path}"
-            )
-        # Review §29: actually parse the sidecar and verify it matches this
-        # candidate run (seed, artifact identity, data identity).
-        init_provenance = None
-        if init_provenance_path.is_file():
-            init_provenance = json.loads(init_provenance_path.read_text(encoding="utf-8"))
-            if int(init_provenance.get("human_seed", -1)) != int(params.seed):
-                raise ValueError(
-                    f"Init provenance human_seed {init_provenance.get('human_seed')!r} "
-                    f"does not match --seed {params.seed}"
-                )
-            if (
-                init_provenance.get("output_sha256")
-                and init_provenance["output_sha256"] != _sha256_file(params.init_state_path)
-            ):
-                raise ValueError(
-                    "Init provenance output_sha256 does not match the init state file"
-                )
-        params.init_overlay_provenance = {
-            "pre_overlay_model_sha256": pre_overlay_model_sha256,
-            "post_overlay_model_sha256": post_overlay_model_sha256,
-            "init_state_path": str(params.init_state_path),
-            "init_state_sha256": _sha256_file(Path(params.init_state_path)),
-            "init_provenance_path": (
-                str(init_provenance_path) if init_provenance_path.exists() else None
-            ),
-        }
-        print(f"applied init state overlay from {params.init_state_path}")
+        # D7/D8 init overlay with the resume contract (eighth D8 review P0-1):
+        # fresh runs apply the artifact; resumed runs verify the checkpoint's
+        # initial_model_sha256 against the artifact and NEVER re-apply.
+        _apply_or_validate_init_state(trainer, params)
         _write_run_metadata(params, task_names, trainer)
+    print(f"Using device: {trainer.device}; tasks={len(task_names)}; architecture={params.arch}")
     print(f"Using device: {trainer.device}; tasks={len(task_names)}; architecture={params.arch}")
 
     if params.mode in {"train", "test"}:
@@ -898,6 +948,12 @@ def main(params):
                     ),
                     anchor_type=drift_anchor_type,
                 )
+                # D8 P0-2 (§37): restore the pre-interruption baseline/rows —
+                # a resumed run keeps measuring drift against theta_0.
+                pending_drift = getattr(trainer, "pending_d7_drift_state", None)
+                if pending_drift is not None:
+                    trainer.d7_drift_tracker.load_state_dict(pending_drift)
+                    trainer.pending_d7_drift_state = None
             if getattr(params, "d7_candidate", "none") == "o6":
                 # D8 O6/SRTA (plan §49-§57): build the deterministic Animal56
                 # TRAIN retention probe and attach the retention controller.
@@ -912,7 +968,10 @@ def main(params):
                 if store is None:
                     raise RuntimeError("O6 retention probe requires the DataStore")
                 probe = select_source_retention_probe(
-                    store, ANIMAL_SOURCE_TASKS, per_task=params.retention_probe_per_task
+                    store,
+                    ANIMAL_SOURCE_TASKS,
+                    per_task=params.retention_probe_per_task,
+                    max_nodes=params.max_nodes_filter,
                 )
                 manifest = build_probe_manifest(probe)
                 params.source_train_probe_manifest_sha256 = manifest["manifest_sha256"]

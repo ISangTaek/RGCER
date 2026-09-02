@@ -1289,6 +1289,17 @@ class Trainer:
                 getattr(item, "__dict__", {})
                 for item in getattr(prompt_bank, "metadata", [])
             ],
+            # D8 P0-3 (§43): adaptation/training protocol identity — part of
+            # the resume contract for D7/D8 candidate runs.
+            "d6_candidate": str(getattr(self.args, "d6_candidate", "none")),
+            "d7_candidate": str(getattr(self.args, "d7_candidate", "none")),
+            "freeze_backbone_epochs": int(getattr(self.args, "freeze_backbone_epochs", 0)),
+            "backbone_lr_multiplier": float(getattr(self.args, "backbone_lr_multiplier", 1.0)),
+            "trainable_last_blocks": int(getattr(self.args, "trainable_last_blocks", 0)),
+            "retention_probe_per_task": int(getattr(self.args, "retention_probe_per_task", 16)),
+            "retention_damage_threshold": float(getattr(self.args, "retention_damage_threshold", 0.02)),
+            "feature_drift_probe_size": int(getattr(self.args, "feature_drift_probe_size", 128)),
+            "feature_drift_epochs": str(getattr(self.args, "feature_drift_epochs", "0,5,10,15,19")),
         }
 
     def _persist_initial_state(self):
@@ -1309,6 +1320,11 @@ class Trainer:
         snapshot_path = self.save_path / "initial_model.pt"
         if snapshot_path.exists():
             return
+        # NOTE (eighth-review P2 §61): this snapshot is taken at TRAINER
+        # construction — BEFORE main() applies any D7/D8 init overlay.  For
+        # overlay runs it is therefore the pre-overlay scratch init, not the
+        # pretrained init; the pretrained baseline lives in the init artifact
+        # referenced by init_state_path.
         torch.save(
             {
                 "model_state": {
@@ -1449,6 +1465,22 @@ class Trainer:
                 if getattr(self, "d8_retention_controller", None) is not None
                 else None
             ),
+            # D8 P0-2 (eighth review §35): the drift tracker's baseline
+            # (pretrained init + reference representations) must survive
+            # resume — otherwise drift resets to zero at the break point.
+            "d7_drift_state": (
+                self.d7_drift_tracker.state_dict()
+                if getattr(self, "d7_drift_tracker", None) is not None
+                else None
+            ),
+            # D8 P0-2 (eighth review §35): the drift tracker's baseline
+            # (pretrained init + reference representations) must survive
+            # resume — otherwise drift resets to zero at the break point.
+            "d7_drift_state": (
+                self.d7_drift_tracker.state_dict()
+                if getattr(self, "d7_drift_tracker", None) is not None
+                else None
+            ),
         }
         if include_historical_best and self._best_training_state is not None:
             payload["best_training_state"] = copy.deepcopy(self._best_training_state)
@@ -1469,6 +1501,42 @@ class Trainer:
             path,
         )
         return path
+
+    @staticmethod
+    def _validate_resume_adaptation_config(stored_architecture, current_config):
+        """D8 P0-3 (§44-§46): a D7/D8 candidate checkpoint may only be resumed
+        under the SAME adaptation protocol — candidate identity, freeze
+        schedule, backbone LR, trainable scope, retention probe/threshold and
+        the feature-drift measurement schedule.  Legacy checkpoints (no
+        candidate recorded on either side) skip the check."""
+
+        stored_candidate = str(stored_architecture.get("d7_candidate", "none"))
+        current_candidate = str(current_config.get("d7_candidate", "none"))
+        if stored_candidate != "none" or current_candidate != "none":
+            for name in (
+                "d7_candidate",
+                "freeze_backbone_epochs",
+                "backbone_lr_multiplier",
+                "trainable_last_blocks",
+                "retention_probe_per_task",
+                "retention_damage_threshold",
+                "feature_drift_probe_size",
+                "feature_drift_epochs",
+            ):
+                if stored_architecture.get(name) != current_config.get(name):
+                    raise ValueError(
+                        f"Checkpoint D7/D8 adaptation setting {name!r} does not "
+                        f"match current run ({stored_architecture.get(name)!r} != "
+                        f"{current_config.get(name)!r})"
+                    )
+        stored_d6 = str(stored_architecture.get("d6_candidate", "none"))
+        current_d6 = str(current_config.get("d6_candidate", "none"))
+        if "b1" in (stored_d6, current_d6) and stored_d6 != current_d6:
+            raise ValueError(
+                f"Checkpoint d6_candidate {stored_d6!r} does not match current "
+                f"run {current_d6!r} — B1 reference resume requires the same "
+                "candidate identity"
+            )
 
     def load_checkpoint(self, path):
         path = Path(path)
@@ -1498,11 +1566,28 @@ class Trainer:
             )
         if list(checkpoint["task_names"]) != self.task_name:
             raise ValueError("Checkpoint task_names do not match the current experiment")
+        self._validate_resume_adaptation_config(
+            checkpoint.get("architecture_config") or {},
+            self._architecture_config(),
+        )
         # D8 P1-2: the retention controller does not exist yet at this point
         # (it is attached in main() after the init overlay) — park the state
         # so main() can restore it right after creating the controller.
         self.pending_d8_retention_state = checkpoint.get("d8_retention_state")
-        stored_repro = checkpoint.get("reproducibility")
+        self.pending_d7_drift_state = checkpoint.get("d7_drift_state")
+        self.pending_d7_drift_state = checkpoint.get("d7_drift_state")
+        stored_repro = checkpoint.get("reproducibility") or {}
+        # D8 P0-1 (eighth review §20): the checkpoint's recorded initial model
+        # hash is the identity of the trajectory — main() compares it against
+        # the init artifact's init_state_sha256 on resume instead of blindly
+        # re-applying the overlay.
+        stored_initial_hash = stored_repro.get("initial_model_sha256")
+        if formal_v2 and not stored_initial_hash:
+            raise ValueError(
+                "Formal v6 checkpoint lacks reproducibility.initial_model_sha256"
+            )
+        if stored_initial_hash:
+            self.initial_model_sha256 = str(stored_initial_hash)
         if formal_v2 and stored_repro is None:
             raise ValueError("Formal v6 checkpoints must embed a reproducibility block")
         if stored_repro is not None:
