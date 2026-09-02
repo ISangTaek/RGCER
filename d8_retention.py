@@ -76,31 +76,38 @@ def build_probe_manifest(probe: dict[str, list[str]]) -> dict:
 
 
 def collect_probe_items(store, animal_tasks, probe: dict[str, list[str]], *, max_nodes=None):
-    """Collect the exact dataset items for the probe ids (per task), keeping the
-    (task, item) association so each batch is scored with its own decoder."""
+    """Collect the exact graph items for the probe ids (per task) directly from
+    the store, keeping the (task, item) association so each batch is scored
+    with its own decoder.  Uses the store's OWN env cache (same instance as
+    the training loaders) — avoids the LMDB double-open that a fresh
+    ToxAcuteTaskDataset would trigger (sixth-D8 server finding)."""
 
-    dataset_cache: dict[str, object] = {}
+    wanted: dict[str, set[str]] = {task: set(ids) for task, ids in probe.items() if ids}
     pairs: list[tuple[str, object]] = []
+    seen: set[str] = set()
     for task in animal_tasks:
-        ids = probe.get(task)
+        ids = wanted.get(task)
         if not ids:
             continue
-        if task not in dataset_cache:
-            from toxacute_datastore import ToxAcuteTaskDataset
-
-            dataset_cache[task] = ToxAcuteTaskDataset(
-                store, task, split="train", max_nodes=max_nodes
+        indices = store.get_task_indices(task, split="train", max_nodes=max_nodes)
+        for index in indices:
+            sample_id = str(store.sample_ids[int(index)])
+            if sample_id not in ids or sample_id in seen:
+                continue
+            label = store.get_label(int(index), task)
+            if label is None:
+                continue
+            item = store.get_graph_data(
+                int(index), task_name=task, label=float(label)
             )
-        dataset = dataset_cache[task]
-        position_by_id = {}
-        for index in range(len(dataset)):
-            position_by_id.setdefault(dataset.get_sample_id(index), index)
-        for sample_id in ids:
-            if sample_id not in position_by_id:
-                raise RuntimeError(
-                    f"retention probe id {sample_id!r} not found in train split of {task!r}"
-                )
-            pairs.append((task, dataset[position_by_id[sample_id]]))
+            pairs.append((task, item))
+            seen.add(sample_id)
+    missing = sorted(wanted.keys() - seen) if wanted else []
+    if missing:
+        raise RuntimeError(
+            f"O6 retention probe set incomplete: missing {len(missing)} ids; "
+            f"examples={missing[:3]}"
+        )
     return pairs
 
 
