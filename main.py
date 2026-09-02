@@ -996,19 +996,12 @@ def main(params):
                         Path(params.save_path) / "D8_SOURCE_RETENTION_TRAIN_PROBE.json",
                         manifest,
                     )
-                # Multiple _resolve_data_store() calls in main() create
-                # independent ToxAcuteDataStore instances with independent
-                # LMDB env caches — a second lmdb.open() on the same shard
-                # path raises "already open in this process".  Fix: use the
-                # TRAINING loaders' store for probe collection so ALL data
-                # access shares one env cache.
-                training_store = getattr(
-                    getattr(next(iter(loaders.values()), None), "dataset", None),
-                    "store",
-                    store,
-                )
+                # The singleton _resolve_data_store() ensures all callers
+                # share one store instance (one LMDB env cache) — no
+                # double-open is possible.  The same store serves human3
+                # training and animal56 probe collection.
                 probe_pairs = collect_probe_items(
-                    training_store, ANIMAL_SOURCE_TASKS, probe, max_nodes=params.max_nodes_filter
+                    store, ANIMAL_SOURCE_TASKS, probe, max_nodes=params.max_nodes_filter
                 )
                 probe_collator = DataCollator(
                     spatial_pos_max_clip=params.spatial_pos_clip, max_node_filter=None
