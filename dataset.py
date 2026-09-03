@@ -223,6 +223,7 @@ class DataloaderWrapper:
         max_nodes_filter=None,
         label_providers=None,
         loader_seed=None,
+        train_fraction=1.0,
     ):
         if data_store is None and isinstance(preprocessed_data_base_dir, ToxAcuteDataStore):
             data_store = preprocessed_data_base_dir
@@ -259,6 +260,11 @@ class DataloaderWrapper:
         # ``loader_seed`` defaults to split_seed so legacy callers stay
         # reproducible too.
         self.loader_seed = int(loader_seed) if loader_seed is not None else self.split_seed
+        self.train_fraction = float(train_fraction)
+        if not (0.0 < self.train_fraction <= 1.0):
+            raise ValueError(
+                f"train_fraction must be in (0, 1], found {self.train_fraction!r}"
+            )
 
         if self.data_store is None and self.preprocessed_data_base_dir is None:
             raise ValueError("Either data_store or preprocessed_data_base_dir is required")
@@ -398,8 +404,20 @@ class DataloaderWrapper:
                 )
                 for split in ("train", "validation", "calibration", "test")
             }
+            train_dataset = datasets["train"]
+            if self.train_fraction < 1.0:
+                # D8 label scarcity (§8): deterministic nested subsample —
+                # a seeded permutation ensures 25% ⊂ 50% ⊂ 75% ⊂ 100%.
+                import numpy as _np
+
+                _rng = _np.random.RandomState(self.split_seed)
+                _perm = _rng.permutation(len(train_dataset))
+                _n_keep = max(1, int(len(train_dataset) * self.train_fraction))
+                from torch.utils.data import Subset
+
+                train_dataset = Subset(train_dataset, sorted(_perm[:_n_keep].tolist()))
             all_task_loaders[task_name] = {
-                "train": self._v2_loader(datasets["train"], "train", task_name=task_name),
+                "train": self._v2_loader(train_dataset, "train", task_name=task_name),
                 "val": self._v2_loader(datasets["validation"], "validation"),
                 "calibration": self._v2_loader(datasets["calibration"], "calibration"),
                 "test": self._v2_loader(datasets["test"], "test"),

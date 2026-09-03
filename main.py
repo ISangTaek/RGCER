@@ -549,6 +549,7 @@ def _loaders(params, task_names, collator):
         max_nodes_filter=params.max_nodes_filter,
         label_providers=getattr(params, "label_providers", None),
         loader_seed=params.seed,
+        train_fraction=getattr(params, "train_fraction", 1.0),
     )
     all_loaders = wrapper.get_data_loaders()
     result = {name: {} for name in ("train", "val", "calibration", "test")}
@@ -1459,6 +1460,14 @@ def build_parser():
         default=16,
         help="D8 O6 §49: Animal56 TRAIN retention probe molecules per source "
         "task (deterministic SHA(sample_id) order).",
+    )
+    parser.add_argument(
+        "--train_fraction",
+        type=float,
+        default=1.0,
+        help="D8 formal §8: fraction of Human3 train data to use for "
+        "label-scaling experiments (10%%=0.1, 25%%=0.25, ...). Deterministic "
+        "nested subsample via split_seed; val/calibration/test untouched.",
     )
     parser.add_argument(
         "--retention_damage_threshold",
