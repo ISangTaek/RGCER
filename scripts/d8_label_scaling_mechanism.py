@@ -172,7 +172,7 @@ def exploratory_correlations(fraction_summary: list[dict]) -> dict:
     from scipy import stats
 
     def series(field):
-        return [row[field] for row in fraction_summary]
+        return [float(row[field]) for row in fraction_summary]
 
     gains = series("gain_mean")
     result = {}
