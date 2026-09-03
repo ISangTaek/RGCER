@@ -213,16 +213,21 @@ def load_model_from_state(state, template_config: dict, device):
     return model
 
 
-def build_probe_batches(template_config: dict, probe_ids, device):
-    """Exact probe batches (probe order, the loaders' own collator)."""
+def build_probe_loaders(template_config: dict):
+    """Rebuild the human3 loaders (full train) exactly as the runs used."""
     from dataset import DataCollator
-    from d7_diagnostics import collect_probe_batches
     from main import _loaders, task_names_for_params
 
     params = _params_from_config(template_config)
     collator = DataCollator(spatial_pos_max_clip=params.spatial_pos_clip, max_node_filter=None)
-    loaders = _loaders(params, task_names_for_params(params), collator)
-    return collect_probe_batches(loaders["train"], probe_ids)
+    return _loaders(params, task_names_for_params(params), collator)
+
+
+def build_probe_batches(template_config: dict, probe_ids, device):
+    """Exact probe batches (probe order, the loaders' own collator)."""
+    from d7_diagnostics import collect_probe_batches
+
+    return collect_probe_batches(build_probe_loaders(template_config)["train"], probe_ids)
 
 
 def derive_probe_and_reference(init_artifact: Path, template_config: dict, device) -> dict:
