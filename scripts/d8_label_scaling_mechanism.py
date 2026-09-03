@@ -111,16 +111,21 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def ff_provenance_ok(ff_path: Path, run_dir: Path, expected_commit: str) -> bool:
+def ff_provenance_ok(ff_path: Path, run_dir: Path) -> bool:
     """Review P0-4: refuse to merge a functional_forgetting.json that was
-    not produced by the current evaluator on the CURRENT final checkpoint
-    of this run under the same data manifest."""
+    not produced by the CURRENT evaluator code on the CURRENT final
+    checkpoint of this run under the same data manifest.
+
+    The invalidation identity is the evaluator SCRIPT hash (plus version
+    constant), not the repository HEAD — an unrelated commit elsewhere must
+    not silently invalidate every stored evaluation."""
     try:
         data = json.loads(ff_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return False
     required = ("checkpoint_sha256", "git_commit", "evaluator_version",
-                "animal_manifest_hash", "provenance_verified")
+                "evaluator_script_sha256", "animal_manifest_hash",
+                "provenance_verified")
     if any(not data.get(name) for name in required):
         return False
     if data["provenance_verified"] is not True:
@@ -130,11 +135,13 @@ def ff_provenance_ok(ff_path: Path, run_dir: Path, expected_commit: str) -> bool
         return False
     if data["checkpoint_sha256"] != _sha256_file(last_pts[0]):
         return False
-    if expected_commit and data["git_commit"] != expected_commit:
-        return False
     from scripts.d8_functional_forgetting import EVALUATOR_VERSION
 
     if data["evaluator_version"] != EVALUATOR_VERSION:
+        return False
+    if data["evaluator_script_sha256"] != _sha256_file(
+        PROJECT_ROOT / "scripts" / "d8_functional_forgetting.py"
+    ):
         return False
     metadata_path = run_dir / "run_metadata.json"
     if metadata_path.is_file():
@@ -215,9 +222,9 @@ def main() -> None:
 
     # ---- step 1: functional forgetting for every fraction x seed ----------
     # Review P0-4: existing results are only reused when their provenance
-    # (checkpoint sha, git commit, evaluator version, data manifest) matches
-    # THIS run exactly — anything stale is re-evaluated, never merged.
-    expected_commit = git_commit()
+    # (checkpoint sha, evaluator script hash + version, data manifest)
+    # matches THIS run exactly — anything stale is re-evaluated, never
+    # merged.
     for fraction in args.fractions:
         for seed in args.seeds:
             if fraction == 100:
@@ -225,7 +232,7 @@ def main() -> None:
             else:
                 run_dir = scaling_run_dir(Path(args.scaling_root), fraction, seed)
             ff_path = run_dir / "functional_forgetting.json"
-            if ff_path.is_file() and ff_provenance_ok(ff_path, run_dir, expected_commit):
+            if ff_path.is_file() and ff_provenance_ok(ff_path, run_dir):
                 continue
             if ff_path.is_file():
                 print(f"stale functional_forgetting.json (provenance mismatch): f{fraction} s{seed} — re-evaluating")
@@ -238,7 +245,7 @@ def main() -> None:
                     f"STOP: functional forgetting failed for f{fraction} s{seed} "
                     f"(see {log_path})"
                 )
-            if not ff_provenance_ok(ff_path, run_dir, expected_commit):
+            if not ff_provenance_ok(ff_path, run_dir):
                 raise SystemExit(
                     f"STOP: freshly written functional_forgetting.json still fails "
                     f"the provenance check for f{fraction} s{seed} — refusing to merge"
@@ -296,7 +303,15 @@ def main() -> None:
     )
 
     # ---- step 3: Figure 4 master table (performance + drift + forgetting) -
+    def s1_run_dir(fraction: int, seed: int) -> Path:
+        if fraction == 100:
+            return (Path(args.d7_root) / "d7_stage_b" / "s1" / "d7_s1_e40"
+                    / f"seed_{seed}")
+        return (Path(args.scaling_root) / "s1" / f"d8_s1_f{fraction}_e40"
+                / f"seed_{seed}")
+
     performance = {}
+    s1_performance = {}
     for fraction in args.fractions:
         for seed in args.seeds:
             if fraction == 100:
@@ -307,14 +322,13 @@ def main() -> None:
             if b1_metrics is None:
                 raise SystemExit(f"STOP: missing/incomplete metrics in {b1_dir}")
             performance[(fraction, seed)] = b1_metrics
-
-    s1_by_seed = {}
-    for seed in args.seeds:
-        s1_dir = Path(args.d7_root) / "d7_stage_b" / "s1" / "d7_s1_e40" / f"seed_{seed}"
-        s1_metrics = stable_endpoint_rmse(s1_dir)
-        if s1_metrics is None:
-            raise SystemExit(f"STOP: missing S1 formal metrics in {s1_dir}")
-        s1_by_seed[seed] = s1_metrics
+            # Figure 4 pairs B1@fraction against S1 at the SAME fraction
+            # (the label-scaling S1 runs from the formal phase); the 100%
+            # point is the formal S1 run.
+            s1_metrics = stable_endpoint_rmse(s1_run_dir(fraction, seed))
+            if s1_metrics is None:
+                raise SystemExit(f"STOP: missing/incomplete metrics in {s1_run_dir(fraction, seed)}")
+            s1_performance[(fraction, seed)] = s1_metrics
 
     drift_by_key = {}
     drift_path = Path(args.drift_csv)
@@ -326,7 +340,7 @@ def main() -> None:
     for fraction in args.fractions:
         for seed in args.seeds:
             b1_macro = sum(performance[(fraction, seed)].values()) / len(HUMAN_TASKS)
-            s1_macro = sum(s1_by_seed[seed].values()) / len(HUMAN_TASKS)
+            s1_macro = sum(s1_performance[(fraction, seed)].values()) / len(HUMAN_TASKS)
             drift = drift_by_key.get((round(fraction / 100.0, 2), seed), {})
             ff = next(
                 (r for r in ff_rows if r["fraction"] == fraction / 100.0 and r["seed"] == seed),

@@ -363,6 +363,7 @@ def main() -> None:
             "checkpoint_sha256": _sha256_file(run_checkpoint),
             "git_commit": _git_commit(),
             "evaluator_version": EVALUATOR_VERSION,
+            "evaluator_script_sha256": _sha256_file(Path(__file__)),
             "animal_manifest_hash": contract.get("split_manifest_hash"),
         }
     )

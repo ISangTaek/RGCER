@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -225,76 +227,76 @@ def test_overlap_audit_scaffold_overlap_reported_not_exact():
 def _toy_ff_run(tmp_path, ff_payload):
     import hashlib
 
+    import scripts.d8_label_scaling_mechanism as mech
+    from scripts.d8_functional_forgetting import EVALUATOR_VERSION
+
     run_dir = tmp_path / "seed_42"
     run_dir.mkdir()
     checkpoint = run_dir / "model_last.pt"
     torch.save({"model_state": {}}, checkpoint)
     digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    script_sha = hashlib.sha256(
+        (Path(mech.__file__).parent / "d8_functional_forgetting.py").read_bytes()
+    ).hexdigest()
     ff_payload = dict(ff_payload)
     ff_payload.setdefault("checkpoint_sha256", digest)
     ff_payload.setdefault("git_commit", "a" * 40)
-    ff_payload.setdefault("evaluator_version", "d8_functional_forgetting/1.1-provenance")
+    ff_payload.setdefault("evaluator_version", EVALUATOR_VERSION)
+    ff_payload.setdefault("evaluator_script_sha256", script_sha)
     ff_payload.setdefault("animal_manifest_hash", "manifest-abc")
     ff_payload.setdefault("provenance_verified", True)
     (run_dir / "functional_forgetting.json").write_text(json.dumps(ff_payload))
     return run_dir, digest
 
 
-def test_ff_provenance_accepts_fresh_artifact(tmp_path, monkeypatch):
-    import scripts.d8_label_scaling_mechanism as mech
-
-    monkeypatch.setattr(mech, "git_commit", lambda: "a" * 40)
+def test_ff_provenance_accepts_fresh_artifact(tmp_path):
     run_dir, _ = _toy_ff_run(tmp_path, {"some": "stats"})
-    assert ff_provenance_ok(run_dir / "functional_forgetting.json", run_dir,
-                            "a" * 40) is True
+    assert ff_provenance_ok(run_dir / "functional_forgetting.json", run_dir) is True
 
 
-def test_ff_provenance_rejects_stale_commit(tmp_path, monkeypatch):
-    import scripts.d8_label_scaling_mechanism as mech
-
-    monkeypatch.setattr(mech, "git_commit", lambda: "b" * 40)
-    run_dir, _ = _toy_ff_run(tmp_path, {})
-    assert ff_provenance_ok(run_dir / "functional_forgetting.json", run_dir,
-                            "b" * 40) is False
+def test_ff_provenance_ignores_unrelated_head_change(tmp_path):
+    # a different repository HEAD alone must NOT invalidate an evaluation:
+    # the invalidation identity is the evaluator script hash, not the commit
+    run_dir, _ = _toy_ff_run(tmp_path, {})  # stamped with git_commit "a"*40
+    assert ff_provenance_ok(run_dir / "functional_forgetting.json", run_dir) is True
 
 
-def test_ff_provenance_rejects_checkpoint_mismatch(tmp_path, monkeypatch):
-    import scripts.d8_label_scaling_mechanism as mech
-
-    monkeypatch.setattr(mech, "git_commit", lambda: "a" * 40)
+def test_ff_provenance_rejects_checkpoint_mismatch(tmp_path):
     run_dir, digest = _toy_ff_run(tmp_path, {})
     payload = json.loads((run_dir / "functional_forgetting.json").read_text())
     payload["checkpoint_sha256"] = "0" * 64
     (run_dir / "functional_forgetting.json").write_text(json.dumps(payload))
-    assert ff_provenance_ok(run_dir / "functional_forgetting.json", run_dir,
-                            "a" * 40) is False
+    assert ff_provenance_ok(run_dir / "functional_forgetting.json", run_dir) is False
 
 
-def test_ff_provenance_rejects_legacy_format(tmp_path, monkeypatch):
+def test_ff_provenance_rejects_stale_evaluator_script(tmp_path):
+    import hashlib
+    from pathlib import Path as _P
+
+    run_dir, _ = _toy_ff_run(tmp_path, {})
+    payload = json.loads((run_dir / "functional_forgetting.json").read_text())
+    payload["evaluator_script_sha256"] = hashlib.sha256(b"old evaluator").hexdigest()
+    (run_dir / "functional_forgetting.json").write_text(json.dumps(payload))
+    assert ff_provenance_ok(run_dir / "functional_forgetting.json", run_dir) is False
+
+
+def test_ff_provenance_rejects_legacy_format(tmp_path):
     # a pre-P0-4 file (no provenance fields, as produced by the 007 phase)
-    import scripts.d8_label_scaling_mechanism as mech
-
-    monkeypatch.setattr(mech, "git_commit", lambda: "a" * 40)
     run_dir = tmp_path / "seed_42"
     run_dir.mkdir()
     torch.save({"model_state": {}}, run_dir / "model_last.pt")
     (run_dir / "functional_forgetting.json").write_text(
         json.dumps({"functional_forgetting_abs": 0.08})
     )
-    assert ff_provenance_ok(run_dir / "functional_forgetting.json", run_dir,
-                            "a" * 40) is False
+    assert ff_provenance_ok(run_dir / "functional_forgetting.json", run_dir) is False
 
 
-def test_ff_provenance_rejects_manifest_mismatch(tmp_path, monkeypatch):
-    import scripts.d8_label_scaling_mechanism as mech
-
-    monkeypatch.setattr(mech, "git_commit", lambda: "a" * 40)
+def test_ff_provenance_rejects_manifest_mismatch(tmp_path):
     run_dir, _ = _toy_ff_run(tmp_path, {"animal_manifest_hash": "manifest-abc"})
     (run_dir / "run_metadata.json").write_text(
         json.dumps({"split_manifest_hash": "manifest-other"})
     )
-    assert ff_provenance_ok(run_dir / "functional_forgetting.json", run_dir,
-                            "a" * 40) is False
+    assert ff_provenance_ok(run_dir / "functional_forgetting.json", run_dir) is False
 
 
 # ---------------------------------------------------------------------------
