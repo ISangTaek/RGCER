@@ -248,8 +248,9 @@ def main() -> None:
     for method in ("b1", "s1"):
         stage = "d6_stage_b" if method == "b1" else "d7_stage_b"
         mtag = f"d6_{method}_e40" if method == "b1" else f"d7_{method}_e40"
+        ff_root = args.d6_root if method == "b1" else args.d7_root
         for seed in seeds:
-            run_dir = Path(root if method != "s1" else args.d7_root) / stage / method / mtag / f"seed_{seed}"
+            run_dir = Path(ff_root) / stage / method / mtag / f"seed_{seed}"
             ff_path = run_dir / "functional_forgetting.json"
             if not ff_path.is_file():
                 continue
@@ -275,7 +276,12 @@ def main() -> None:
 
     for key, val in statistics.items():
         if isinstance(val, dict) and "mean_improvement" in val:
-            print(f"{key}: mean={val['mean_improvement']:.4f} W/T/L={val['w/t/l']} wilcoxon_p={val.get('wilcoxon_signed_rank', {}).get('p_value_one_sided', 'N/A')}")
+            wilcoxon_p = val.get("wilcoxon_signed_rank", {}).get("p_value_one_sided", "N/A")
+            print(
+                f"{key}: mean={val['mean_improvement']:.4f} "
+                f"W/T/L={val['s1_wins']}/{val['ties']}/{val['b1_wins']} "
+                f"wilcoxon_p={wilcoxon_p}"
+            )
     print(f"formal metrics written to {output_dir}")
 
 
