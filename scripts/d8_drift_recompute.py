@@ -10,15 +10,16 @@ so nothing is re-sampled (§18) and the reference is the true Animal56
 pretrained state (§19).
 
 Task D (§24-§32): B1 label-scaling runs (10/25/50/75%) trained without
-in-run drift logging.  Their final drift is recomputed against the SAME
-per-seed Animal56-pretrained reference and the seed's 100% probe (the
-formal-run probe), keeping values comparable across fractions.  The 100%
-row reuses the formal run's in-run epoch-39 drift row.
+in-run drift logging.  Their final drift — and the 100% row as well — is
+recomputed against the SAME per-seed Animal56-pretrained reference and the
+seed's 100% probe, so every row of the Figure 4 drift table sits on one
+scale.  (The D7-era in-run logs of seeds 42/44/46 are historical
+measurements from older code and are not patched or mixed in.)
 
-Machinery self-check: for a seed whose epoch-39 feature drift WAS logged
-in-run, the recompute must reproduce the logged value (tolerance 1e-3
-relative / 1e-4 absolute for cross-device float noise) — otherwise
-STOP_DRIFT_SELFCHECK.
+Machinery self-check: on B1 seed 43 — a current-code run whose checkpoint
+embeds the original drift state and whose epoch-39 feature drift was
+logged — the recompute must reproduce the logged value (verified to
+~5e-9); otherwise STOP_DRIFT_SELFCHECK.
 
 Outputs (under --output_dir):
     D8_S1_FINAL_DRIFT_PATCH.csv            (§22 fields + provenance)
@@ -322,7 +323,7 @@ def main() -> None:
     parser.add_argument("--output_dir", default="artifacts/results/d8_result_correction/drift")
     parser.add_argument("--gpu_id", default="0")
     parser.add_argument("--seeds", nargs="+", type=int, default=[42, 43, 44, 45, 46])
-    parser.add_argument("--fractions", nargs="+", type=int, default=[10, 25, 50, 75])
+    parser.add_argument("--fractions", nargs="+", type=int, default=[10, 25, 50, 75, 100])
     parser.add_argument("--skip_selfcheck", action="store_true")
     args = parser.parse_args()
 
@@ -351,9 +352,14 @@ def main() -> None:
         raise FileNotFoundError(f"no b1_init artifact for seed {seed}")
 
     # ---- machinery self-check: reproduce a logged epoch-39 value ----------
+    # Anchor: B1 seed 43 — a CURRENT-code run whose checkpoint embeds the
+    # original drift state AND whose epoch-39 feature drift was logged.
+    # (The D7-era runs s42/44/46 logged drift with older code and carry no
+    # embedded state; their logged values are not reproducible bit-exactly
+    # and are treated as historical in-run measurements, never patched.)
     contract_audit: dict = {}
     if not args.skip_selfcheck:
-        check_seed = 42
+        check_seed = 43
         payload, _ = last_checkpoint(formal_dir("b1", check_seed))
         reference = drift_state_or_derived(payload, init_artifact_for(check_seed), device)
         candidate_config = dict(payload.get("configuration") or {})
@@ -474,7 +480,12 @@ def main() -> None:
     else:
         print(f"WARNING: {source_matrix} not found — merge skipped (patch CSV stands alone)")
 
-    # ---- Task D: B1 label-scaling drift (fractions < 100%) ----------------
+    # ---- Task D: B1 label-scaling drift -----------------------------------
+    # ALL fractions (100% included) are recomputed with the same machinery
+    # and reference so every row in the Figure 4 drift table is on one
+    # scale.  (The D7-era in-run logs of s42/44/46 are not reproducible by
+    # the current machinery — see the self-check comment — so using them
+    # for 100% would mix scales within a seed's fraction trend.)
     drift_rows = []
     for seed in args.seeds:
         formal_payload, _ = last_checkpoint(formal_dir("b1", seed))
@@ -484,7 +495,10 @@ def main() -> None:
             formal_config if reference["source"] == "checkpoint_d7_drift_state" else None
         )
         for fraction in args.fractions:
-            run_dir = Path(args.scaling_root) / "b1" / f"d8_b1_f{fraction}_e40" / f"seed_{seed}"
+            if fraction >= 100:
+                run_dir = formal_dir("b1", seed)
+            else:
+                run_dir = Path(args.scaling_root) / "b1" / f"d8_b1_f{fraction}_e40" / f"seed_{seed}"
             payload, _ = last_checkpoint(run_dir)
             contract_audit[f"B1_f{fraction}_s{seed}"] = verify_drift_contract(
                 reference=reference,
@@ -510,19 +524,6 @@ def main() -> None:
             print(
                 f"TASK_D b1 f{fraction} s{seed}: param={result['backbone_param_drift']:.6f} "
                 f"feature={result['feature_drift']:.6f}"
-            )
-        logged = read_drift_csv_row(formal_dir("b1", seed), 39)
-        if logged and logged.get("feature_drift"):
-            drift_rows.append(
-                {
-                    "fraction": 1.0,
-                    "seed": seed,
-                    "backbone_param_drift": logged["backbone_param_drift"],
-                    "early_block_drift": logged["early_block_drift"],
-                    "late_block_drift": logged["late_block_drift"],
-                    "feature_drift": logged["feature_drift"],
-                    "source": "training_log",
-                }
             )
 
     with (output_dir / "D8_LABEL_SCALING_B1_DRIFT.csv").open("w", newline="", encoding="utf-8") as handle:
