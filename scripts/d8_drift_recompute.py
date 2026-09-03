@@ -496,26 +496,34 @@ def main() -> None:
     # for 100% would mix scales within a seed's fraction trend.)
     drift_rows = []
     for seed in args.seeds:
-        formal_payload, _ = last_checkpoint(formal_dir("b1", seed))
-        reference = drift_state_or_derived(formal_payload, init_artifact_for_run(formal_dir("b1", seed)), device)
-        formal_config = dict(formal_payload.get("configuration") or {})
-        formal_reference_config = (
-            formal_config if reference["source"] == "checkpoint_d7_drift_state" else None
-        )
         for fraction in args.fractions:
             if fraction >= 100:
                 run_dir = formal_dir("b1", seed)
             else:
                 run_dir = Path(args.scaling_root) / "b1" / f"d8_b1_f{fraction}_e40" / f"seed_{seed}"
             payload, _ = last_checkpoint(run_dir)
+            # Reference = the run's OWN recorded initialization: drift is
+            # "how far did this run move from the pretrained baseline it
+            # actually started from".  (Seed 42's scaling runs were
+            # initialized from an earlier b1_init artifact revision than
+            # the formal runs; a shared reference would inflate their
+            # drift.  Seed 42's B1/S1 scaling pairs share that same init,
+            # so their paired comparison stays fair.)
+            reference = drift_state_or_derived(
+                payload, init_artifact_for_run(run_dir), device
+            )
+            reference_config = (
+                dict(payload.get("configuration") or {})
+                if reference["source"] == "checkpoint_d7_drift_state" else None
+            )
             contract_audit[f"B1_f{fraction}_s{seed}"] = verify_drift_contract(
                 reference=reference,
                 candidate_payload=payload,
-                init_artifact_path=init_artifact_for_run(formal_dir("b1", seed)),
+                init_artifact_path=init_artifact_for_run(run_dir),
                 expected_probe_manifest=expected_probe_manifest_cached(
                     dict(payload.get("configuration") or {})
                 ),
-                reference_config=formal_reference_config,
+                reference_config=reference_config,
             )
             result = recompute_for_run(run_dir, reference, device)
             drift_rows.append(
