@@ -341,15 +341,23 @@ def main() -> None:
             return Path(args.d7_root) / "d7_stage_b" / "s1" / "d7_s1_e40" / f"seed_{seed}"
         return Path(args.d6_root) / "d6_stage_b" / method / f"d6_{method}_e40" / f"seed_{seed}"
 
-    def init_artifact_for(seed: int) -> Path:
-        for candidate in (
-            Path(args.inits_dir) / "d7" / f"b1_init_seed{seed}.pt",
-            Path(args.inits_dir) / "d8_stage0" / f"b1_init_seed{seed}.pt",
-            Path(args.inits_dir) / "d7_stage_b" / f"b1_init_seed{seed}.pt",
-        ):
-            if candidate.is_file():
-                return candidate
-        raise FileNotFoundError(f"no b1_init artifact for seed {seed}")
+    def init_artifact_for_run(run_dir: Path) -> Path:
+        """Resolve the pretrained-init artifact from the run's OWN args.json
+        (authoritative provenance — seed 42 has TWO same-named artifacts and
+        only args.json knows which one the run actually used)."""
+        args_path = run_dir / "args.json"
+        args_payload = json.loads(args_path.read_text(encoding="utf-8"))
+        recorded = args_payload.get("init_state_path")
+        if not recorded:
+            raise ValueError(f"{args_path} lacks init_state_path")
+        artifact = Path(recorded)
+        if not artifact.is_absolute():
+            artifact = Path.cwd() / artifact
+        if not artifact.is_file():
+            raise FileNotFoundError(
+                f"init artifact recorded by {args_path} not found: {artifact}"
+            )
+        return artifact
 
     # ---- machinery self-check: reproduce a logged epoch-39 value ----------
     # Anchor: B1 seed 43 — a CURRENT-code run whose checkpoint embeds the
@@ -361,12 +369,12 @@ def main() -> None:
     if not args.skip_selfcheck:
         check_seed = 43
         payload, _ = last_checkpoint(formal_dir("b1", check_seed))
-        reference = drift_state_or_derived(payload, init_artifact_for(check_seed), device)
+        reference = drift_state_or_derived(payload, init_artifact_for_run(formal_dir("b1", check_seed)), device)
         candidate_config = dict(payload.get("configuration") or {})
         contract_audit[f"selfcheck_b1_s{check_seed}"] = verify_drift_contract(
             reference=reference,
             candidate_payload=payload,
-            init_artifact_path=init_artifact_for(check_seed),
+            init_artifact_path=init_artifact_for_run(formal_dir("b1", check_seed)),
             expected_probe_manifest=expected_probe_manifest_cached(candidate_config),
             reference_config=(
                 candidate_config
@@ -394,12 +402,12 @@ def main() -> None:
     for seed in args.seeds:
         run_dir = formal_dir("s1", seed)
         payload, ckpt_path = last_checkpoint(run_dir)
-        reference = drift_state_or_derived(payload, init_artifact_for(seed), device)
+        reference = drift_state_or_derived(payload, init_artifact_for_run(run_dir), device)
         candidate_config = dict(payload.get("configuration") or {})
         contract_audit[f"S1_s{seed}"] = verify_drift_contract(
             reference=reference,
             candidate_payload=payload,
-            init_artifact_path=init_artifact_for(seed),
+            init_artifact_path=init_artifact_for_run(run_dir),
             expected_probe_manifest=expected_probe_manifest_cached(candidate_config),
             reference_config=(
                 candidate_config
@@ -420,7 +428,7 @@ def main() -> None:
                 "feature_drift": f"{result['feature_drift']:.8f}",
                 "probe_manifest_sha256": probe_manifest_sha256(reference["probe_ids"]),
                 "reference_source": reference["source"],
-                "reference_checkpoint_sha256": sha256_file(init_artifact_for(seed)),
+                "reference_checkpoint_sha256": sha256_file(init_artifact_for_run(run_dir)),
                 "candidate_checkpoint_sha256": sha256_file(ckpt_path),
                 "note": "already_logged_in_run" if already_logged else "patched_missing_value",
             }
@@ -489,7 +497,7 @@ def main() -> None:
     drift_rows = []
     for seed in args.seeds:
         formal_payload, _ = last_checkpoint(formal_dir("b1", seed))
-        reference = drift_state_or_derived(formal_payload, init_artifact_for(seed), device)
+        reference = drift_state_or_derived(formal_payload, init_artifact_for_run(formal_dir("b1", seed)), device)
         formal_config = dict(formal_payload.get("configuration") or {})
         formal_reference_config = (
             formal_config if reference["source"] == "checkpoint_d7_drift_state" else None
@@ -503,7 +511,7 @@ def main() -> None:
             contract_audit[f"B1_f{fraction}_s{seed}"] = verify_drift_contract(
                 reference=reference,
                 candidate_payload=payload,
-                init_artifact_path=init_artifact_for(seed),
+                init_artifact_path=init_artifact_for_run(formal_dir("b1", seed)),
                 expected_probe_manifest=expected_probe_manifest_cached(
                     dict(payload.get("configuration") or {})
                 ),
