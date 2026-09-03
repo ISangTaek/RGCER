@@ -153,7 +153,9 @@ def main() -> None:
     # ---- selection manifest (stateless across seeds) ----------------------
     from toxacute_datastore import ToxAcuteDataStore
 
-    from scripts.d8_drift_recompute import _params_from_config, last_checkpoint
+    from scripts.d8_drift_recompute import (
+        POOLING_NAME, _params_from_config, last_checkpoint, sha256_file,
+    )
 
     # a scaling run's args supplies the shared data conventions
     args_json = Path(
@@ -236,6 +238,27 @@ def main() -> None:
     human_items, human_tasks_by_id = collect_ids_and_items(human_loaders)
     print(f"pools: animal={len(animal_items)} human_val={len(human_items)}")
 
+    # ---- review P0-1: source/target overlap audit BEFORE any embedding ----
+    from experiment_config import TOXACUTE_RAW_CSV
+    from scripts.d8_embedding_overlap_audit import run_overlap_audit
+    from scripts.d8_label_scaling_subset_audit import load_smiles_by_row
+
+    smiles_by_row = load_smiles_by_row(Path(TOXACUTE_RAW_CSV))
+    smiles_by_id = {
+        sample_id: smiles_by_row.get(sample_id, "")
+        for sample_id in set(probe_ids) | set(human_items)
+    }
+    run_overlap_audit(
+        human_ids=sorted(human_items),
+        animal_ids=probe_ids,
+        smiles_by_id=smiles_by_id,
+        output_path=output_dir / "D8_EMBEDDING_OVERLAP_AUDIT.json",
+    )
+
+    # ---- review P0-2: shared provenance for every embedding row -----------
+    datastore_sha256 = store.fingerprint
+    manifest_sha256 = store.split_manifest_hash
+
     human_ids = sorted(human_items)
     animal_batch = collator([animal_items[sid] for sid in probe_ids])
     human_batch = collator([human_items[sid] for sid in human_ids])
@@ -267,10 +290,21 @@ def main() -> None:
 
     for seed in args.seeds:
         states = {}
-        init_state = torch.load(init_artifact_for(seed), map_location="cpu", weights_only=False)
+        state_source_file = {}
+        init_artifact = init_artifact_for(seed)
+        init_state = torch.load(init_artifact, map_location="cpu", weights_only=False)
         states["animal_pretrained"] = init_state
-        states["s1_final"] = run_payload("s1", seed)[0]["model_state"]
-        states["b1_final"] = run_payload("b1", seed)[0]["model_state"]
+        state_source_file["animal_pretrained"] = init_artifact
+        s1_payload, s1_ckpt = run_payload("s1", seed)
+        b1_payload, b1_ckpt = run_payload("b1", seed)
+        states["s1_final"] = s1_payload["model_state"]
+        state_source_file["s1_final"] = s1_ckpt
+        states["b1_final"] = b1_payload["model_state"]
+        state_source_file["b1_final"] = b1_ckpt
+
+        state_checkpoint_sha256 = {
+            name: sha256_file(path) for name, path in state_source_file.items()
+        }
 
         embeddings = {}
         for state_name, state in states.items():
@@ -330,6 +364,12 @@ def main() -> None:
                             "sample_id": sample_id,
                             "split": "validation",
                             "label": label,
+                            # review P0-2: full encoder provenance per row
+                            "checkpoint_sha256": state_checkpoint_sha256[state_name],
+                            "datastore_sha256": datastore_sha256,
+                            "manifest_sha256": manifest_sha256,
+                            "pooling_name": POOLING_NAME,
+                            "embedding_dim": int(per_group[group][row_index].shape[0]),
                         }
                     )
 
@@ -341,7 +381,9 @@ def main() -> None:
         writer = csv.DictWriter(
             handle,
             fieldnames=["seed", "encoder_state", "species_group", "task",
-                        "sample_id", "split", "label"],
+                        "sample_id", "split", "label",
+                        "checkpoint_sha256", "datastore_sha256",
+                        "manifest_sha256", "pooling_name", "embedding_dim"],
         )
         writer.writeheader()
         writer.writerows(metadata_rows)

@@ -94,7 +94,67 @@ def load_ff_summary(json_path: Path) -> dict:
         "animal_tasks_unchanged": data.get("animal_tasks_unchanged"),
         "delta_max_abs": data.get("delta_max_abs"),
         "provenance_verified": data.get("provenance_verified"),
+        "checkpoint_sha256": data.get("checkpoint_sha256"),
+        "git_commit": data.get("git_commit"),
+        "evaluator_version": data.get("evaluator_version"),
+        "animal_manifest_hash": data.get("animal_manifest_hash"),
     }
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def ff_provenance_ok(ff_path: Path, run_dir: Path, expected_commit: str) -> bool:
+    """Review P0-4: refuse to merge a functional_forgetting.json that was
+    not produced by the current evaluator on the CURRENT final checkpoint
+    of this run under the same data manifest."""
+    try:
+        data = json.loads(ff_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    required = ("checkpoint_sha256", "git_commit", "evaluator_version",
+                "animal_manifest_hash", "provenance_verified")
+    if any(not data.get(name) for name in required):
+        return False
+    if data["provenance_verified"] is not True:
+        return False
+    last_pts = sorted(run_dir.glob("*_last.pt"))
+    if len(last_pts) != 1:
+        return False
+    if data["checkpoint_sha256"] != _sha256_file(last_pts[0]):
+        return False
+    if expected_commit and data["git_commit"] != expected_commit:
+        return False
+    from scripts.d8_functional_forgetting import EVALUATOR_VERSION
+
+    if data["evaluator_version"] != EVALUATOR_VERSION:
+        return False
+    metadata_path = run_dir / "run_metadata.json"
+    if metadata_path.is_file():
+        run_manifest = (json.loads(metadata_path.read_text(encoding="utf-8"))
+                        .get("split_manifest_hash"))
+        if run_manifest and data["animal_manifest_hash"] != run_manifest:
+            return False
+    return True
+
+
+def git_commit() -> str:
+    import subprocess
+
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except Exception:
+        return ""
 
 
 def mean_std_median(values):
@@ -147,10 +207,6 @@ def main() -> None:
     parser.add_argument("--gpu_id", default="0")
     parser.add_argument("--seeds", nargs="+", type=int, default=[42, 43, 44, 45, 46])
     parser.add_argument("--fractions", nargs="+", type=int, default=[10, 25, 50, 75, 100])
-    parser.add_argument(
-        "--skip_existing", action="store_true", default=True,
-        help="skip evaluator runs whose functional_forgetting.json already exists",
-    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -158,6 +214,10 @@ def main() -> None:
     (output_dir / "figure4").mkdir(parents=True, exist_ok=True)
 
     # ---- step 1: functional forgetting for every fraction x seed ----------
+    # Review P0-4: existing results are only reused when their provenance
+    # (checkpoint sha, git commit, evaluator version, data manifest) matches
+    # THIS run exactly — anything stale is re-evaluated, never merged.
+    expected_commit = git_commit()
     for fraction in args.fractions:
         for seed in args.seeds:
             if fraction == 100:
@@ -165,15 +225,23 @@ def main() -> None:
             else:
                 run_dir = scaling_run_dir(Path(args.scaling_root), fraction, seed)
             ff_path = run_dir / "functional_forgetting.json"
-            if args.skip_existing and ff_path.is_file():
+            if ff_path.is_file() and ff_provenance_ok(ff_path, run_dir, expected_commit):
                 continue
-            print(f"evaluating functional forgetting: f{fraction} s{seed} ...")
+            if ff_path.is_file():
+                print(f"stale functional_forgetting.json (provenance mismatch): f{fraction} s{seed} — re-evaluating")
+            else:
+                print(f"evaluating functional forgetting: f{fraction} s{seed} ...")
             log_path = output_dir / "forgetting" / f"ff_f{fraction}_s{seed}.log"
             ok = run_functional_forgetting(run_dir, args.gpu_id, log_path)
             if not ok:
                 raise SystemExit(
                     f"STOP: functional forgetting failed for f{fraction} s{seed} "
                     f"(see {log_path})"
+                )
+            if not ff_provenance_ok(ff_path, run_dir, expected_commit):
+                raise SystemExit(
+                    f"STOP: freshly written functional_forgetting.json still fails "
+                    f"the provenance check for f{fraction} s{seed} — refusing to merge"
                 )
 
     # ---- step 2: aggregate evaluator JSONs --------------------------------
@@ -217,7 +285,8 @@ def main() -> None:
         ["fraction", "seed", "teacher_animal56_macro_rmse", "current_animal56_macro_rmse",
          "functional_forgetting_abs", "functional_forgetting_relative",
          "animal_tasks_worsened", "animal_tasks_improved", "animal_tasks_unchanged",
-         "delta_max_abs", "provenance_verified"],
+         "delta_max_abs", "provenance_verified",
+         "checkpoint_sha256", "git_commit", "evaluator_version", "animal_manifest_hash"],
         ff_rows,
     )
     _write(

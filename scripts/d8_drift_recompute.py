@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -46,6 +47,106 @@ CONFIG_KEYS = (
     "spatial_pos_clip", "max_nodes_filter", "prediction_mode",
     "head_hidden_dim", "head_dropout",
 )
+# Result-correction review P0-3: model-defining keys that must agree between
+# the candidate checkpoint and the reference source before any drift
+# recompute may run.
+MODEL_CONFIG_KEYS = (
+    "hidden_dim", "mid_dim", "a_layers", "a_heads", "edge_bias_mode",
+    "head_hidden_dim", "head_dropout", "prediction_mode",
+)
+POOLING_NAME = "graphormer_backbone_pooled"
+
+_EXPECTED_PROBE_CACHE: dict[str, str] = {}
+
+
+def expected_probe_manifest_cached(template_config: dict) -> str:
+    """Deterministic §47 probe identity for a data configuration, cached —
+    the probe rule (first 128 sorted full-train ids) is a pure function of
+    (data_store_dir, split_seed, splitting, val/test sizes)."""
+    key = json.dumps(
+        {name: template_config.get(name) for name in (
+            "data_store_dir", "split_seed", "splitting", "vs",
+            "calibration_size", "ts",
+        )},
+        sort_keys=True, default=str,
+    )
+    if key not in _EXPECTED_PROBE_CACHE:
+        from d7_diagnostics import select_probe_ids, train_sample_ids
+
+        loaders = build_probe_loaders(template_config)
+        ids = select_probe_ids(train_sample_ids(loaders["train"]), 128)
+        _EXPECTED_PROBE_CACHE[key] = probe_manifest_sha256(ids)
+    return _EXPECTED_PROBE_CACHE[key]
+
+
+def verify_drift_contract(
+    *,
+    reference: dict,
+    candidate_payload: dict,
+    init_artifact_path: Path,
+    expected_probe_manifest: str,
+    reference_config: dict | None = None,
+) -> dict:
+    """P0-3 preflight: refuse to recompute drift when probe identity,
+    pretrained-reference authenticity or model configuration disagree —
+    otherwise a wrong-but-plausible drift number could slip through.
+
+    Checks
+      1. probe_manifest_match      reference probe ids == the deterministic
+                                   §47 probe for the data configuration
+      2. reference_matches_artifact checkpoint-embedded pretrained baseline
+                                   tensors == the provenance-verified
+                                   b1_init artifact (key-exact, bit-exact)
+      3. model_config_match        candidate configuration == the reference
+                                   source's configuration (when the
+                                   reference came from a checkpoint)
+      4. backbone_key_set_match    candidate backbone parameter names ==
+                                   reference init_state names
+
+    Raises SystemExit("STOP_DRIFT_CONTRACT") on any failure.
+    """
+    import torch
+
+    candidate_config = dict(candidate_payload.get("configuration") or {})
+    checks: dict = {}
+    actual_manifest = probe_manifest_sha256(reference["probe_ids"])
+    checks["probe_manifest_match"] = actual_manifest == expected_probe_manifest
+    checks["probe_manifest_sha256"] = actual_manifest
+    checks["expected_probe_manifest_sha256"] = expected_probe_manifest
+
+    artifact_state = torch.load(init_artifact_path, map_location="cpu", weights_only=False)
+    reference_state = reference["init_state"]
+    artifact_backbone = {
+        key: value for key, value in artifact_state.items() if key in reference_state
+    }
+    keys_match = set(artifact_backbone) == set(reference_state) and bool(reference_state)
+    tensors_match = keys_match and all(
+        torch.equal(
+            torch.as_tensor(reference_state[key]).cpu(),
+            torch.as_tensor(artifact_backbone[key]).cpu(),
+        )
+        for key in reference_state
+    )
+    checks["reference_matches_artifact"] = bool(tensors_match)
+
+    if reference_config:
+        checks["model_config_match"] = all(
+            candidate_config.get(name) == reference_config.get(name)
+            for name in MODEL_CONFIG_KEYS
+        )
+    else:
+        checks["model_config_match"] = True  # derived from the artifact itself
+
+    candidate_keys = {
+        key for key in candidate_payload["model_state"]
+        if key.startswith("encoder.backbone.")
+    }
+    checks["backbone_key_set_match"] = candidate_keys == set(reference_state)
+
+    failures = [name for name, ok in checks.items() if ok is False]
+    if failures:
+        raise SystemExit(f"STOP_DRIFT_CONTRACT: failed checks={failures}")
+    return checks
 
 
 def sha256_file(path: Path) -> str:
@@ -245,10 +346,22 @@ def main() -> None:
         raise FileNotFoundError(f"no b1_init artifact for seed {seed}")
 
     # ---- machinery self-check: reproduce a logged epoch-39 value ----------
+    contract_audit: dict = {}
     if not args.skip_selfcheck:
         check_seed = 42
         payload, _ = last_checkpoint(formal_dir("b1", check_seed))
         reference = drift_state_or_derived(payload, init_artifact_for(check_seed), device)
+        candidate_config = dict(payload.get("configuration") or {})
+        contract_audit[f"selfcheck_b1_s{check_seed}"] = verify_drift_contract(
+            reference=reference,
+            candidate_payload=payload,
+            init_artifact_path=init_artifact_for(check_seed),
+            expected_probe_manifest=expected_probe_manifest_cached(candidate_config),
+            reference_config=(
+                candidate_config
+                if reference["source"] == "checkpoint_d7_drift_state" else None
+            ),
+        )
         recomputed = recompute_for_run(formal_dir("b1", check_seed), reference, device)
         logged = read_drift_csv_row(formal_dir("b1", check_seed), 39)
         if logged is None or not logged.get("feature_drift"):
@@ -271,6 +384,17 @@ def main() -> None:
         run_dir = formal_dir("s1", seed)
         payload, ckpt_path = last_checkpoint(run_dir)
         reference = drift_state_or_derived(payload, init_artifact_for(seed), device)
+        candidate_config = dict(payload.get("configuration") or {})
+        contract_audit[f"S1_s{seed}"] = verify_drift_contract(
+            reference=reference,
+            candidate_payload=payload,
+            init_artifact_path=init_artifact_for(seed),
+            expected_probe_manifest=expected_probe_manifest_cached(candidate_config),
+            reference_config=(
+                candidate_config
+                if reference["source"] == "checkpoint_d7_drift_state" else None
+            ),
+        )
         result = recompute_for_run(run_dir, reference, device)
         logged = read_drift_csv_row(run_dir, result["epoch"])
         already_logged = bool(logged and logged.get("feature_drift") not in (None, ""))
@@ -350,8 +474,22 @@ def main() -> None:
     for seed in args.seeds:
         formal_payload, _ = last_checkpoint(formal_dir("b1", seed))
         reference = drift_state_or_derived(formal_payload, init_artifact_for(seed), device)
+        formal_config = dict(formal_payload.get("configuration") or {})
+        formal_reference_config = (
+            formal_config if reference["source"] == "checkpoint_d7_drift_state" else None
+        )
         for fraction in args.fractions:
             run_dir = Path(args.scaling_root) / "b1" / f"d8_b1_f{fraction}_e40" / f"seed_{seed}"
+            payload, _ = last_checkpoint(run_dir)
+            contract_audit[f"B1_f{fraction}_s{seed}"] = verify_drift_contract(
+                reference=reference,
+                candidate_payload=payload,
+                init_artifact_path=init_artifact_for(seed),
+                expected_probe_manifest=expected_probe_manifest_cached(
+                    dict(payload.get("configuration") or {})
+                ),
+                reference_config=formal_reference_config,
+            )
             result = recompute_for_run(run_dir, reference, device)
             drift_rows.append(
                 {
@@ -387,6 +525,12 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(drift_rows)
     print(f"wrote {output_dir / 'D8_LABEL_SCALING_B1_DRIFT.csv'} ({len(drift_rows)} rows)")
+
+    contract_path = output_dir / "D8_DRIFT_CONTRACT_AUDIT.json"
+    contract_path.write_text(
+        json.dumps(contract_audit, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    print(f"wrote {contract_path} ({len(contract_audit)} contracts verified)")
 
 
 if __name__ == "__main__":

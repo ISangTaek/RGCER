@@ -55,6 +55,25 @@ from d8_retention import (  # noqa: E402
     functional_forgetting_stats,
 )
 
+# Result-correction review P0-4: bump whenever the evaluator or its
+# dependencies change; downstream merges refuse files with a different
+# version (see d8_label_scaling_mechanism.ff_provenance_ok).
+EVALUATOR_VERSION = "d8_functional_forgetting/1.1-provenance"
+
+
+def _git_commit() -> str:
+    import subprocess
+
+    try:
+        return (
+            subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=PROJECT_ROOT, capture_output=True, text=True, check=True,
+            ).stdout.strip()
+        )
+    except Exception:
+        return ""
+
 
 def _resolve_b1_artifact_contract(metadata: dict) -> tuple[dict, str]:
     """Seventh-D8 review P0-1 (§13-§16): two legitimate consumers — the
@@ -338,6 +357,13 @@ def main() -> None:
             "n_animal_tasks": len(ANIMAL_SOURCE_TASKS),
             "per_task_rmse_teacher": teacher_per_task,
             "per_task_rmse_current": current_per_task,
+            # Result-correction review P0-4: artifact provenance so stale
+            # results from a different commit / checkpoint / evaluator can
+            # never be silently merged downstream.
+            "checkpoint_sha256": _sha256_file(run_checkpoint),
+            "git_commit": _git_commit(),
+            "evaluator_version": EVALUATOR_VERSION,
+            "animal_manifest_hash": contract.get("split_manifest_hash"),
         }
     )
 
