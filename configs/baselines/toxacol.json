@@ -1,0 +1,9 @@
+{
+  "method": "toxacol",
+  "upstream": {"commit": "704edcb951ab397e31561bc130154d01e0103b3c"},
+  "architecture": {"fingerprint": "Avalon1024", "endpoint_features": 26, "layers": [768, 512, 384, 64], "output_size": 59},
+  "task_graph": {"minimum_shared_labels": 15, "positive_pcc_threshold": 0.75, "constant_pair_policy": "no_edge"},
+  "formal": {"epochs": 120, "batch_size": 32, "epoch_size": 100, "momentum": 0.9, "nesterov": true, "weight_decay": 0.0005, "lr_lut": [[20, 0.001], [40, 0.0006], [50, 0.00012], [60, 0.000024], [70, 0.000012], [80, 0.000001], [100, 0.0000001], [120, 0.00000001]]},
+  "smoke": {"epochs": 2, "batch_size": 8, "epoch_size": null, "dropout": 0.1, "lr_multiplier": 1.0, "momentum": 0.9, "nesterov": true, "weight_decay": 0.0005, "lr_lut": [[20, 0.001], [40, 0.0006], [50, 0.00012], [60, 0.000024], [70, 0.000012], [80, 0.000001], [100, 0.0000001], [120, 0.00000001]]},
+  "selection": "validation_human3_macro_rmse"
+}

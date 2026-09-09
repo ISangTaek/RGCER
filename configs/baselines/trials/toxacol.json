@@ -1,0 +1,60 @@
+{
+  "method": "toxacol",
+  "sampler": "numpy.random.RandomState(42)",
+  "seed": 42,
+  "trial_count": 10,
+  "trials": [
+    {
+      "dropout": 0.1,
+      "lr_multiplier": 1.0,
+      "trial_id": 0
+    },
+    {
+      "dropout": 0.2,
+      "lr_multiplier": 1.5084699674171043,
+      "trial_id": 1
+    },
+    {
+      "dropout": 0.2,
+      "lr_multiplier": 1.379349337405852,
+      "trial_id": 2
+    },
+    {
+      "dropout": 0.05,
+      "lr_multiplier": 1.1436933745991174,
+      "trial_id": 3
+    },
+    {
+      "dropout": 0.1,
+      "lr_multiplier": 0.6207090305742936,
+      "trial_id": 4
+    },
+    {
+      "dropout": 0.2,
+      "lr_multiplier": 0.9450730704245415,
+      "trial_id": 5
+    },
+    {
+      "dropout": 0.05,
+      "lr_multiplier": 1.1504753106625047,
+      "trial_id": 6
+    },
+    {
+      "dropout": 0.2,
+      "lr_multiplier": 0.5144736127521127,
+      "trial_id": 7
+    },
+    {
+      "dropout": 0.1,
+      "lr_multiplier": 1.3603685370573089,
+      "trial_id": 8
+    },
+    {
+      "dropout": 0.1,
+      "lr_multiplier": 0.6711365444277668,
+      "trial_id": 9
+    }
+  ],
+  "trials_sha256": "2de0131720b75de7762f388dfdc94951766c38941df87ed77b020e369e2a4d70",
+  "without_replacement": false
+}

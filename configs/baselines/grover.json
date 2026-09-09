@@ -1,0 +1,8 @@
+{
+  "method": "grover",
+  "upstream": {"commit": "40b6d97098e4508687912f3c05eca369fc2c6213", "checkpoint": "GROVER_base", "checkpoint_sha256": "47e095880d71baf29ea6f6253473cd56d5406213fa82959c6e14ea469e06b1de"},
+  "architecture": {"hidden_size": 800, "depth": 6, "num_attn_head": 4, "num_mt_block": 1, "ffn_num_layers": 2, "ffn_hidden_size": 300, "features_dim": 0, "output_size": 3},
+  "formal": {"epochs": 50, "batch_size": 64, "warmup_epochs": 2, "fine_tune_coff": 1.0},
+  "smoke": {"epochs": 2, "batch_size": 8, "warmup_epochs": 1, "init_lr": 0.0001, "max_lr": 0.001, "final_lr": 0.0001, "dropout": 0.1, "weight_decay": 0.0, "fine_tune_coff": 1.0},
+  "selection": "validation_human3_macro_rmse"
+}

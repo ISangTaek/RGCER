@@ -1,0 +1,7 @@
+{
+  "method": "afp",
+  "architecture": {"hidden_channels": 128, "num_layers": 3, "num_timesteps": 2, "output_size": 3},
+  "formal": {"epochs": 50, "batch_size": 64, "patience": 5},
+  "smoke": {"epochs": 2, "batch_size": 8, "patience": null, "lr": 0.001, "dropout": 0.1, "weight_decay": 0.0},
+  "selection": "validation_human3_macro_rmse"
+}

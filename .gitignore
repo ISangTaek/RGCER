@@ -26,6 +26,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
+/.venv-baselines/
 .idea/
 .vscode/
 
@@ -34,9 +35,15 @@ __pycache__/
 .qwen/
 _check*.py
 
+# Local ChatGPT history/context export (reference only, do not commit)
+/CODEX_RGCER_HISTORY_CONTEXT_FULL.md
+
 # Cython intermediates and compiler output
 algos/algos.c
 /build/
 
 # Data audit outputs (EXPRIMENTS/E0_*) are scratch audit artifacts
 /EXPRIMENTS/
+
+# Local experiment plans, immutable review packages and scientific reviews
+/Plans&Results/

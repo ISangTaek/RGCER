@@ -1,0 +1,8 @@
+{
+  "method": "dmpnn",
+  "upstream": {"name": "chemprop", "version": "1.6.1", "commit": "f3d1bff19a6e1b03d28e9cfabdf4c80dd8c67382"},
+  "architecture": {"hidden_size": 300, "depth": 3, "ffn_num_layers": 2, "ffn_hidden_size": 300, "output_size": 3},
+  "formal": {"epochs": 50, "batch_size": 50, "warmup_epochs": 2, "weight_decay": 0.0},
+  "smoke": {"epochs": 2, "batch_size": 8, "warmup_epochs": 1, "init_lr": 0.00001, "max_lr": 0.001, "final_lr": 0.00001, "dropout": 0.1, "weight_decay": 0.0},
+  "selection": "validation_human3_macro_rmse"
+}

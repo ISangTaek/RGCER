@@ -1,0 +1,130 @@
+{
+  "method": "afp",
+  "sampler": "numpy.random.RandomState(42)",
+  "seed": 42,
+  "trial_count": 20,
+  "trials": [
+    {
+      "dropout": 0.0,
+      "lr": 5.61151641533451e-05,
+      "trial_id": 0,
+      "weight_decay": 1e-05
+    },
+    {
+      "dropout": 0.0,
+      "lr": 0.00029106359131330674,
+      "trial_id": 1,
+      "weight_decay": 0.0
+    },
+    {
+      "dropout": 0.2,
+      "lr": 2.0513382630874486e-05,
+      "trial_id": 2,
+      "weight_decay": 1e-05
+    },
+    {
+      "dropout": 0.0,
+      "lr": 1.3066739238053285e-05,
+      "trial_id": 3,
+      "weight_decay": 0.0001
+    },
+    {
+      "dropout": 0.2,
+      "lr": 1.930783753654711e-05,
+      "trial_id": 4,
+      "weight_decay": 1e-06
+    },
+    {
+      "dropout": 0.1,
+      "lr": 1.2966511753760402e-05,
+      "trial_id": 5,
+      "weight_decay": 1e-06
+    },
+    {
+      "dropout": 0.0,
+      "lr": 1.0035927878780901e-05,
+      "trial_id": 6,
+      "weight_decay": 0.0
+    },
+    {
+      "dropout": 0.1,
+      "lr": 4.059611610484304e-05,
+      "trial_id": 7,
+      "weight_decay": 0.0
+    },
+    {
+      "dropout": 0.0,
+      "lr": 7.309539835912905e-05,
+      "trial_id": 8,
+      "weight_decay": 1e-05
+    },
+    {
+      "dropout": 0.1,
+      "lr": 0.00016738085788752132,
+      "trial_id": 9,
+      "weight_decay": 0.0001
+    },
+    {
+      "dropout": 0.2,
+      "lr": 3.8396292998041664e-05,
+      "trial_id": 10,
+      "weight_decay": 1e-06
+    },
+    {
+      "dropout": 0.1,
+      "lr": 1.5177941306507477e-05,
+      "trial_id": 11,
+      "weight_decay": 1e-05
+    },
+    {
+      "dropout": 0.0,
+      "lr": 5.820013372709849e-05,
+      "trial_id": 12,
+      "weight_decay": 1e-05
+    },
+    {
+      "dropout": 0.2,
+      "lr": 0.0005246634533625283,
+      "trial_id": 13,
+      "weight_decay": 0.0
+    },
+    {
+      "dropout": 0.1,
+      "lr": 7.961566078062934e-05,
+      "trial_id": 14,
+      "weight_decay": 0.0001
+    },
+    {
+      "dropout": 0.1,
+      "lr": 0.0007663082680255851,
+      "trial_id": 15,
+      "weight_decay": 1e-06
+    },
+    {
+      "dropout": 0.1,
+      "lr": 5.899741796710488e-05,
+      "trial_id": 16,
+      "weight_decay": 0.0
+    },
+    {
+      "dropout": 0.2,
+      "lr": 2.895927274708836e-05,
+      "trial_id": 17,
+      "weight_decay": 0.0001
+    },
+    {
+      "dropout": 0.0,
+      "lr": 1.754189348745081e-05,
+      "trial_id": 18,
+      "weight_decay": 0.0001
+    },
+    {
+      "dropout": 0.1,
+      "lr": 1.1715937392307055e-05,
+      "trial_id": 19,
+      "weight_decay": 0.0
+    }
+  ],
+  "trials_sha256": "310365a96b3568726a1ab7fecb02525af843a9d076856102904e9ce7bd8114ba",
+  "without_replacement": false
+}

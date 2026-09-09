@@ -1,0 +1,90 @@
+{
+  "method": "grover",
+  "sampler": "numpy.random.RandomState(42)",
+  "seed": 42,
+  "trial_count": 10,
+  "trials": [
+    {
+      "dropout": 0.0,
+      "final_lr": 5.61151641533451e-06,
+      "init_lr": 5.61151641533451e-06,
+      "max_lr": 5.61151641533451e-05,
+      "trial_id": 0,
+      "weight_decay": 0.0001
+    },
+    {
+      "dropout": 0.0,
+      "final_lr": 2.9106359131330674e-05,
+      "init_lr": 2.9106359131330674e-05,
+      "max_lr": 0.00029106359131330674,
+      "trial_id": 1,
+      "weight_decay": 0.0
+    },
+    {
+      "dropout": 0.0,
+      "final_lr": 2.0513382630874487e-06,
+      "init_lr": 2.0513382630874487e-06,
+      "max_lr": 2.0513382630874486e-05,
+      "trial_id": 2,
+      "weight_decay": 0.0001
+    },
+    {
+      "dropout": 0.1,
+      "final_lr": 1.3066739238053285e-06,
+      "init_lr": 1.3066739238053285e-06,
+      "max_lr": 1.3066739238053285e-05,
+      "trial_id": 3,
+      "weight_decay": 0.0
+    },
+    {
+      "dropout": 0.1,
+      "final_lr": 1.5930522616241e-05,
+      "init_lr": 1.5930522616241e-05,
+      "max_lr": 0.00015930522616241,
+      "trial_id": 4,
+      "weight_decay": 0.0001
+    },
+    {
+      "dropout": 0.1,
+      "final_lr": 1.0994335574766196e-06,
+      "init_lr": 1.0994335574766196e-06,
+      "max_lr": 1.0994335574766197e-05,
+      "trial_id": 5,
+      "weight_decay": 1e-05
+    },
+    {
+      "dropout": 0.1,
+      "final_lr": 2.658754398327272e-06,
+      "init_lr": 2.658754398327272e-06,
+      "max_lr": 2.6587543983272722e-05,
+      "trial_id": 6,
+      "weight_decay": 0.0
+    },
+    {
+      "dropout": 0.1,
+      "final_lr": 1.7177621112338382e-05,
+      "init_lr": 1.7177621112338382e-05,
+      "max_lr": 0.00017177621112338383,
+      "trial_id": 7,
+      "weight_decay": 1e-05
+    },
+    {
+      "dropout": 0.0,
+      "final_lr": 1.033076804324041e-06,
+      "init_lr": 1.033076804324041e-06,
+      "max_lr": 1.0330768043240409e-05,
+      "trial_id": 8,
+      "weight_decay": 0.0
+    },
+    {
+      "dropout": 0.0,
+      "final_lr": 1.1208547084229366e-05,
+      "init_lr": 1.1208547084229366e-05,
+      "max_lr": 0.00011208547084229366,
+      "trial_id": 9,
+      "weight_decay": 1e-05
+    }
+  ],
+  "trials_sha256": "9f5b398ce3addd7053a2438c8f8866df8cfabf56cc6894bd57a32b5fcec270cd",
+  "without_replacement": false
+}

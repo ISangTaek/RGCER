@@ -1,0 +1,133 @@
+"""TOXACol correlation network, transcribed from the locked upstream commit."""
+
+from __future__ import annotations
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from architecture.toxacute_tasks import parse_toxacute_task_name
+
+from ..constants import TOXACUTE_TASKS, TOXACOL_COMMIT
+from ..utils import canonical_sha256
+
+SPECIES = (
+    "mouse", "mammal (species unspecified)", "guinea pig", "rat", "rabbit", "dog", "cat",
+    "bird - wild", "quail", "duck", "chicken", "man", "women", "human", "frog",
+)
+ROUTES = ("intraperitoneal", "intravenous", "oral", "unreported", "skin", "subcutaneous", "intramuscular", "parenteral")
+MEASUREMENTS = ("LD50", "LDLo", "TDLo")
+
+
+def endpoint_feature_matrix(task_names=TOXACUTE_TASKS) -> tuple[np.ndarray, dict]:
+    rows = []
+    for task in task_names:
+        metadata = parse_toxacute_task_name(task)
+        subject = task.rsplit("_", 2)[0]
+        subject = "bird - wild" if subject == "bird-wild" else subject
+        vector = np.zeros(len(SPECIES) + len(ROUTES) + len(MEASUREMENTS), dtype=np.float32)
+        vector[SPECIES.index(subject)] = 1.0
+        vector[len(SPECIES) + ROUTES.index(metadata.route)] = 1.0
+        vector[len(SPECIES) + len(ROUTES) + MEASUREMENTS.index(metadata.measurement)] = 1.0
+        rows.append(vector)
+    matrix = np.stack(rows)
+    schema = {"species": list(SPECIES), "routes": list(ROUTES), "measurements": list(MEASUREMENTS)}
+    schema["schema_hash"] = canonical_sha256(schema)
+    return matrix, schema
+
+
+def task_adjacency(train_labels: np.ndarray, *, min_shared: int = 15, pcc_threshold: float = 0.75) -> tuple[np.ndarray, dict]:
+    labels = np.asarray(train_labels, dtype=np.float64)
+    width = labels.shape[1]
+    adjacency = np.zeros((width, width), dtype=np.float32)
+    constant_pairs = 0
+    for left in range(width):
+        for right in range(left + 1, width):
+            mask = np.isfinite(labels[:, left]) & np.isfinite(labels[:, right])
+            shared = int(mask.sum())
+            if shared < min_shared:
+                continue
+            x, y = labels[mask, left], labels[mask, right]
+            if np.std(x) <= 0 or np.std(y) <= 0:
+                constant_pairs += 1
+                continue
+            pcc = float(np.corrcoef(x, y)[0, 1])
+            if np.isfinite(pcc) and pcc >= pcc_threshold:
+                adjacency[left, right] = adjacency[right, left] = 1.0
+    with_identity = adjacency + np.eye(width, dtype=np.float32)
+    degrees = np.sum(with_identity, axis=1)
+    normalized = with_identity * (degrees ** -0.5)[:, None] * (degrees ** -0.5)[None, :]
+    audit = {
+        "min_shared": min_shared,
+        "pcc_threshold": pcc_threshold,
+        "undirected_edges": int(np.sum(adjacency) // 2),
+        "constant_or_undefined_pairs": constant_pairs,
+        "normalization": "D^-1/2(A+I)D^-1/2",
+    }
+    return normalized.astype(np.float32), audit
+
+
+class FCL(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, dropout: float):
+        super().__init__()
+        self.linear = nn.Linear(input_dim, output_dim)
+        self.batch_norm = nn.BatchNorm1d(output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return F.relu(self.dropout(self.batch_norm(self.linear(x))))
+
+
+class GCNLayer(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(0.1 * (torch.rand(input_dim, output_dim) - 0.5))
+
+    def forward(self, x, adjacency):
+        return adjacency @ (x @ self.weight)
+
+
+class CorrelationLayer(nn.Module):
+    def __init__(self, num_tasks: int, feature_dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(0.1 * (torch.rand(num_tasks, feature_dim) - 0.5))
+
+    def forward(self, molecule, task_features):
+        bridge = molecule @ F.leaky_relu(task_features.t(), negative_slope=0.1)
+        return bridge @ self.weight + molecule
+
+
+class ToxACoLNet(nn.Module):
+    source_commit = TOXACOL_COMMIT
+
+    def __init__(self, adjacency: np.ndarray, endpoint_features: np.ndarray, *, dropout: float = 0.1):
+        super().__init__()
+        dimensions = (1024, 768, 512, 384, 64)
+        task_dimensions = (26, 768, 512, 384, 64)
+        self.register_buffer("adjacency", torch.as_tensor(adjacency, dtype=torch.float32))
+        self.register_buffer("endpoint_features", torch.as_tensor(endpoint_features, dtype=torch.float32))
+        self.dnn = nn.ModuleList(FCL(dimensions[i], dimensions[i + 1], dropout) for i in range(4))
+        self.gcn = nn.ModuleList(GCNLayer(task_dimensions[i], task_dimensions[i + 1]) for i in range(4))
+        self.correlation = nn.ModuleList(CorrelationLayer(59, dimensions[i + 1]) for i in range(4))
+        self.tail_weight = nn.Parameter(0.1 * torch.rand(64, 59))
+
+    def forward(self, fingerprints):
+        molecule = fingerprints
+        tasks = self.endpoint_features
+        for layer_index, (dnn, gcn, correlation) in enumerate(zip(self.dnn, self.gcn, self.correlation)):
+            molecule = dnn(molecule)
+            tasks = gcn(tasks, self.adjacency)
+            molecule = correlation(molecule, tasks)
+            if layer_index < len(self.gcn) - 1:
+                tasks = F.leaky_relu(tasks, negative_slope=0.1)
+        return molecule @ tasks.t() + molecule @ self.tail_weight
+
+
+def toxacol_learning_rate(epoch: int, bounds: list[int], values: list[float]) -> float:
+    if len(values) != len(bounds) + 1:
+        raise ValueError("LUT requires one more learning-rate value than bounds")
+    for index, bound in enumerate(bounds):
+        if epoch < bound:  # zero-based epoch; first strict upper bound wins
+            return float(values[index])
+    return float(values[-1])
