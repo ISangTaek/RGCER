@@ -1,4 +1,4 @@
-"""Frozen DataStore views for formal train/validation and local Human3 smoke."""
+"""Frozen DataStore views for training, validation, and authorized inference."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from .constants import (
     SPLIT_MANIFEST_HASH,
     TOXACUTE_TASKS,
 )
+from .inference_authorization import TestInferenceGrant
 from .utils import canonical_sha256
 
 
@@ -95,6 +96,16 @@ class BaselinePartition:
 
 
 SmokePartition = BaselinePartition
+
+
+@dataclass(frozen=True)
+class InferenceSampleExpectation:
+    """Independently derived sample/label expectation for output verification."""
+
+    split: str
+    sample_ids: tuple[str, ...]
+    raw_row_indices: np.ndarray
+    labels_human3: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -183,6 +194,9 @@ def _open_validated(datastore: str | Path):
         store.close()
         raise ValueError("split manifest contains duplicate sample_id values")
     global_by_id = {str(sample_id): index for index, sample_id in enumerate(store.sample_ids)}
+    if len(global_by_id) != len(store.sample_ids):
+        store.close()
+        raise ValueError("DataStore index contains duplicate sample_id values")
     if set(global_by_id) != set(manifest_by_id):
         store.close()
         raise ValueError("DataStore and split manifest sample identities differ")
@@ -349,12 +363,92 @@ def load_formal_train_validation(datastore: str | Path, method: str) -> Baseline
         store.close()
 
 
-def load_authorized_validation(datastore: str | Path, method: str, *, split: str = "validation") -> BaselinePartition:
+def _require_inference_split_permission(
+    split: str,
+    method: str,
+    test_grant: TestInferenceGrant | None,
+) -> None:
+    if split == "calibration":
+        raise PermissionError("Calibration prediction remains locked in Stage 3C2A")
+    if split == "test":
+        if test_grant is None:
+            raise PermissionError("Test prediction requires a fully validated authorization grant")
+        test_grant.require(split=split, method=method)
+        return
     if split != "validation":
-        raise PermissionError("Only validation prediction is authorized; calibration and test remain locked")
+        raise ValueError(f"Unknown inference split: {split!r}")
+
+
+def load_authorized_inference_split(
+    datastore: str | Path,
+    method: str,
+    *,
+    split: str = "validation",
+    test_grant: TestInferenceGrant | None = None,
+) -> BaselinePartition:
+    if method not in {"rf", "afp", "dmpnn", "grover", "toxacol"}:
+        raise ValueError(f"Unknown baseline method: {method}")
+    _require_inference_split_permission(split, method, test_grant)
     store, manifest_by_id, _ = _open_validated(datastore)
+    graph_store_owner = _LazyGraphStoreOwner(store.root)
     try:
         ids = _ordered_eligible(store, manifest_by_id, split, HUMAN3_TASKS)
-        return _materialize(store, manifest_by_id, ids, split, lazy_graphs=True)
+        return _materialize(
+            store,
+            manifest_by_id,
+            ids,
+            split,
+            lazy_graphs=True,
+            graph_store_owner=graph_store_owner,
+        )
+    except Exception:
+        graph_store_owner.close()
+        raise
     finally:
         store.close()
+
+
+def derive_authorized_sample_expectation(
+    datastore: str | Path,
+    method: str,
+    *,
+    split: str = "validation",
+    test_grant: TestInferenceGrant | None = None,
+) -> InferenceSampleExpectation:
+    """Derive expected inference samples without reusing the output loader filter."""
+
+    if method not in {"rf", "afp", "dmpnn", "grover", "toxacol"}:
+        raise ValueError(f"Unknown baseline method: {method}")
+    _require_inference_split_permission(split, method, test_grant)
+    store, manifest_by_id, global_by_id = _open_validated(datastore)
+    try:
+        human_columns = [store.task_index(task) for task in HUMAN3_TASKS]
+        selected: list[tuple[int, str, np.ndarray]] = []
+        for sample_id, manifest_record in manifest_by_id.items():
+            global_index = global_by_id[sample_id]
+            manifest_split = str(manifest_record["split"])
+            datastore_split = CODE_TO_SPLIT[int(store.split_codes[global_index])]
+            if datastore_split != manifest_split:
+                raise ValueError(f"Cross-source sample/split mismatch for {sample_id}")
+            if manifest_split != split:
+                continue
+            labels = np.asarray(store.labels[global_index, human_columns], dtype=np.float32).copy()
+            if np.isfinite(labels).any():
+                selected.append((int(manifest_record["row_index"]), sample_id, labels))
+        selected.sort(key=lambda row: (row[0], row[1]))
+        return InferenceSampleExpectation(
+            split=split,
+            sample_ids=tuple(row[1] for row in selected),
+            raw_row_indices=np.asarray([row[0] for row in selected], dtype=np.int64),
+            labels_human3=np.asarray([row[2] for row in selected], dtype=np.float32).reshape(-1, len(HUMAN3_TASKS)),
+        )
+    finally:
+        store.close()
+
+
+def load_authorized_validation(datastore: str | Path, method: str, *, split: str = "validation") -> BaselinePartition:
+    """Backward-compatible validation-only entry point."""
+
+    if split != "validation":
+        raise PermissionError("Only validation prediction is authorized; calibration and test remain locked")
+    return load_authorized_inference_split(datastore, method, split=split)
