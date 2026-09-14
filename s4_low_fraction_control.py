@@ -260,10 +260,19 @@ def strict_json_loads(text: str) -> Any:
 
 
 def read_json(path: str | Path) -> Any:
+    return read_json_document(path)[0]
+
+
+def read_json_document(path: str | Path) -> tuple[Any, bytes, str]:
+    """Read one immutable byte version and return parsed JSON plus its SHA."""
+
+    json_path = Path(path)
+    data = json_path.read_bytes()
     try:
-        return strict_json_loads(Path(path).read_text(encoding="utf-8-sig"))
+        document = strict_json_loads(data.decode("utf-8-sig"))
     except UnicodeDecodeError as exc:
         raise S4BControlError(f"JSON is not UTF-8: {path}") from exc
+    return document, data, sha256_bytes(data)
 
 
 def identity_sha256(value: Any) -> str:
@@ -1841,13 +1850,24 @@ def load_authorization(
     path: str | Path | None,
     **validation: Any,
 ) -> tuple[dict[str, Any], str]:
+    authorization, _, digest = load_authorization_document(path, **validation)
+    return authorization, digest
+
+
+def load_authorization_document(
+    path: str | Path | None,
+    **validation: Any,
+) -> tuple[dict[str, Any], bytes, str]:
+    """Validate and hash the exact authorization bytes read from one version."""
+
     if path is None:
         raise S4BControlError("formal server inference requires a separate Codex authorization")
     authorization_path = Path(path)
     if not authorization_path.is_file():
         raise S4BControlError("Codex authorization file is missing")
-    authorization = read_json(authorization_path)
-    return validate_authorization(authorization, **validation), sha256_file(authorization_path)
+    authorization, source_bytes, digest = read_json_document(authorization_path)
+    validated = validate_authorization(authorization, **validation)
+    return validated, source_bytes, digest
 
 
 def verify_wsl_receipt(
@@ -2364,11 +2384,13 @@ __all__ = [
     "decode_synthetic_human3_batch",
     "identity_sha256",
     "load_authorization",
+    "load_authorization_document",
     "load_s4b_policy",
     "metric_values",
     "parse_jsonl",
     "prepare_low_fraction_checkpoint",
     "read_json",
+    "read_json_document",
     "sha256_bytes",
     "sha256_file",
     "strict_json_loads",

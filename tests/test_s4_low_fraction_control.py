@@ -18,6 +18,7 @@ import sys
 import zipfile
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -300,6 +301,139 @@ def valid_wsl_receipt(policy):
         "real_data_accessed": False,
         "training_called": False,
     }
+
+
+def formatted_json_bytes(value, style):
+    if style == "trailing_lf":
+        return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if style == "no_trailing_lf":
+        return json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
+    if style == "crlf":
+        text = json.dumps(value, ensure_ascii=False, indent=2).replace("\n", "\r\n")
+        return (text + "\r\n").encode("utf-8")
+    if style == "reordered_compact":
+        reordered = dict(reversed(list(value.items())))
+        return json.dumps(
+            reordered,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    raise AssertionError(f"unknown JSON byte style: {style}")
+
+
+def install_server_preflight_fakes(monkeypatch, tmp_path, policy, aliases):
+    from toxacute_datastore import SPLIT_CODES
+
+    validation_samples = synthetic_samples()
+    test_samples = list(aliases.frozen_samples)
+    all_samples = [*validation_samples, *test_samples]
+    labels = torch.full((len(all_samples), 59), float("nan"), dtype=torch.float64)
+    for row_number, sample in enumerate(all_samples):
+        for task_offset, label in enumerate(sample["labels"]):
+            if label is not None:
+                labels[row_number, 35 + task_offset] = float(label)
+
+    store_root = tmp_path / "synthetic_datastore"
+    store_root.mkdir()
+    (store_root / "datastore.json").write_bytes(b"synthetic datastore identity")
+
+    class SyntheticStore:
+        metadata = full_datastore_metadata()
+        task_names = metadata["task_names"]
+        sample_ids = [sample["sample_id"] for sample in all_samples]
+        row_indices = [sample["row_index"] for sample in all_samples]
+        split_codes = [
+            *([SPLIT_CODES["validation"]] * len(validation_samples)),
+            *([SPLIT_CODES["test"]] * len(test_samples)),
+        ]
+        num_nodes = [1] * len(all_samples)
+        root = store_root
+
+        def task_index(self, task):
+            return self.task_names.index(task)
+
+        def close(self):
+            return None
+
+    store = SyntheticStore()
+    store.labels = labels
+
+    def repository_check(repository, implementation_commit):
+        assert Path(repository).resolve() == ROOT.resolve()
+        assert implementation_commit == IMPLEMENTATION_COMMIT
+
+    def params_and_store(*args, **kwargs):
+        del args, kwargs
+        return (
+            object(),
+            SimpleNamespace(
+                max_nodes_filter=policy.assets[0].expected_data_config[
+                    "max_nodes_filter"
+                ]
+            ),
+            store,
+        )
+
+    def prepare_checkpoint(*args, policy, run_id, **kwargs):
+        del args, kwargs
+        asset = policy.asset(run_id)
+        return SimpleNamespace(
+            checkpoint_sha256=asset.checkpoint_sha256,
+            checkpoint_size_bytes=asset.checkpoint_size_bytes,
+            strict_identity={"migration_applied": False, "model_tensor_count": 170},
+        )
+
+    monkeypatch.setattr(runner, "_validate_repository", repository_check)
+    monkeypatch.setattr(runner, "verify_037_aliases", lambda path: aliases)
+    monkeypatch.setattr(runner, "_params_and_store", params_and_store)
+    monkeypatch.setattr(runner, "prepare_low_fraction_checkpoint", prepare_checkpoint)
+    return store_root
+
+
+def make_server_preflight_inputs(
+    tmp_path,
+    monkeypatch,
+    policy,
+    aliases,
+    *,
+    authorization_style="trailing_lf",
+    wsl_style="crlf",
+):
+    datastore_dir = install_server_preflight_fakes(
+        monkeypatch, tmp_path, policy, aliases
+    )
+    authorization = fixture_authorization(policy, fixture_only=False)
+    authorization_bytes = formatted_json_bytes(authorization, authorization_style)
+    authorization_path = tmp_path / "authorization.json"
+    authorization_path.write_bytes(authorization_bytes)
+
+    code = runner._code_identity(ROOT, POLICY_PATH)  # noqa: SLF001
+    wsl = valid_wsl_receipt(policy)
+    wsl.update(
+        {
+            "runner_sha256": code["runner_sha256"],
+            "control_sha256": code["control_sha256"],
+            "trainer_sha256": code["trainer_sha256"],
+        }
+    )
+    wsl_bytes = formatted_json_bytes(wsl, wsl_style)
+    wsl_path = tmp_path / "wsl_receipt.json"
+    wsl_path.write_bytes(wsl_bytes)
+
+    output = tmp_path / "server_preflight"
+    arguments = Namespace(
+        side="server",
+        repository=ROOT,
+        policy=POLICY_PATH,
+        implementation_commit=IMPLEMENTATION_COMMIT,
+        output_run_id=OUTPUT_RUN_ID,
+        authorization=authorization_path,
+        wsl_receipt=wsl_path,
+        core_zip=tmp_path / "mocked_037.zip",
+        datastore_dir=datastore_dir,
+        output=output,
+    )
+    return arguments, authorization_bytes, wsl_bytes
 
 
 @pytest.mark.skipif(not LOCAL_FIXTURES, reason="local accepted attachments are opt-in")
@@ -714,6 +848,206 @@ def test_missing_or_mismatched_authorization_is_rejected(policy, tmp_path):
             output_run_id=OUTPUT_RUN_ID,
             allow_fixture=True,
         )
+
+
+@pytest.mark.parametrize(
+    "style",
+    ["trailing_lf", "no_trailing_lf", "crlf", "reordered_compact"],
+)
+def test_authorization_document_reads_one_exact_byte_version(policy, tmp_path, style):
+    authorization = fixture_authorization(policy, fixture_only=False)
+    source_bytes = formatted_json_bytes(authorization, style)
+    path = tmp_path / f"authorization_{style}.json"
+    path.write_bytes(source_bytes)
+
+    loaded, loaded_bytes, digest = control.load_authorization_document(
+        path,
+        policy=policy,
+        implementation_commit=IMPLEMENTATION_COMMIT,
+        split="validation",
+        output_run_id=OUTPUT_RUN_ID,
+        allow_fixture=False,
+    )
+    compatible_loaded, compatible_digest = control.load_authorization(
+        path,
+        policy=policy,
+        implementation_commit=IMPLEMENTATION_COMMIT,
+        split="validation",
+        output_run_id=OUTPUT_RUN_ID,
+        allow_fixture=False,
+    )
+    assert loaded == authorization == compatible_loaded
+    assert loaded_bytes == source_bytes
+    assert digest == compatible_digest == hashlib.sha256(source_bytes).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("case", "match"),
+    [
+        ("empty", "authorization"),
+        ("commit", "implementation_commit"),
+        ("run_id", "output_run_id"),
+        ("assets", "authorized_run_ids"),
+        ("scope", "does not permit split=validation"),
+    ],
+)
+def test_authorization_document_counterexamples_fail_closed(
+    policy, tmp_path, case, match
+):
+    authorization = fixture_authorization(policy, fixture_only=False)
+    if case == "empty":
+        authorization = {}
+    elif case == "commit":
+        authorization["implementation_commit"] = "b" * 40
+    elif case == "run_id":
+        authorization["output_run_id"] = "wrong-run"
+    elif case == "assets":
+        authorization["authorized_run_ids"] = authorization["authorized_run_ids"][:-1]
+    else:
+        authorization["allowed_splits"] = ["test"]
+    path = tmp_path / f"bad_{case}.json"
+    path.write_bytes(formatted_json_bytes(authorization, "trailing_lf"))
+    with pytest.raises(control.S4BControlError, match=match):
+        control.load_authorization_document(
+            path,
+            policy=policy,
+            implementation_commit=IMPLEMENTATION_COMMIT,
+            split="validation",
+            output_run_id=OUTPUT_RUN_ID,
+            allow_fixture=False,
+        )
+
+
+@pytest.mark.skipif(not LOCAL_FIXTURES, reason="local accepted attachments are opt-in")
+@pytest.mark.parametrize(
+    "style",
+    ["trailing_lf", "no_trailing_lf", "crlf", "reordered_compact"],
+)
+def test_production_preflight_preserves_authorization_snapshot_bytes_and_run_replays(
+    policy, aliases, tmp_path, monkeypatch, style
+):
+    arguments, authorization_bytes, wsl_bytes = make_server_preflight_inputs(
+        tmp_path,
+        monkeypatch,
+        policy,
+        aliases,
+        authorization_style=style,
+    )
+    assert runner.preflight(arguments) == 0
+    authorization_snapshot = arguments.output / "authorization_snapshot.json"
+    wsl_snapshot = arguments.output / "wsl_receipt_snapshot.json"
+    assert authorization_snapshot.read_bytes() == authorization_bytes
+    assert wsl_snapshot.read_bytes() == wsl_bytes
+    authorization_sha = hashlib.sha256(authorization_bytes).hexdigest()
+    receipt = runner._verify_server_preflight(  # noqa: SLF001
+        arguments.output,
+        implementation_commit=IMPLEMENTATION_COMMIT,
+        policy_path=POLICY_PATH,
+        authorization_sha256=authorization_sha,
+        output_run_id=OUTPUT_RUN_ID,
+        expected_data_store_dir=str(arguments.datastore_dir.resolve()),
+        check_live_reference_paths=False,
+    )
+    assert receipt["status"] == "PASS"
+    assert receipt["authorization_sha256"] == authorization_sha
+    assert receipt["wsl_receipt_sha256"] == hashlib.sha256(wsl_bytes).hexdigest()
+
+    if style == "trailing_lf":
+        dispatches = []
+
+        def dispatch_sentinel(namespace, *, asset, gpu_index, output):
+            del namespace, gpu_index, output
+            dispatches.append(asset.run_id)
+            raise RuntimeError("EXPECTED_VALIDATION_DISPATCH_SENTINEL")
+
+        def accept_mocked_live_references(references, policy, *, check_live_paths):
+            assert len(references) == len(policy.assets) == 40
+            assert check_live_paths is True
+
+        monkeypatch.setattr(runner, "_run_worker_process", dispatch_sentinel)
+        monkeypatch.setattr(
+            runner, "_verify_reference_sources", accept_mocked_live_references
+        )
+        run_arguments = Namespace(
+            repository=ROOT,
+            policy=POLICY_PATH,
+            implementation_commit=IMPLEMENTATION_COMMIT,
+            authorization=arguments.authorization,
+            output_run_id=OUTPUT_RUN_ID,
+            preflight=arguments.output,
+            datastore_dir=arguments.datastore_dir,
+            split="validation",
+            gpus=["0"],
+            output=tmp_path / "validation_dispatch",
+            validation_dir=None,
+            validation_gate=None,
+        )
+        with pytest.raises(control.S4BControlError, match="log coverage"):
+            runner.run_batch(run_arguments)
+        assert dispatches == [policy.assets[0].run_id]
+        assert control.read_json(run_arguments.output / "errors.json")[0][
+            "error"
+        ].endswith("EXPECTED_VALIDATION_DISPATCH_SENTINEL")
+
+
+@pytest.mark.skipif(not LOCAL_FIXTURES, reason="local accepted attachments are opt-in")
+def test_run_rejects_tampered_preflight_authorization_snapshot_before_dispatch(
+    policy, aliases, tmp_path, monkeypatch
+):
+    arguments, authorization_bytes, _ = make_server_preflight_inputs(
+        tmp_path, monkeypatch, policy, aliases
+    )
+    assert runner.preflight(arguments) == 0
+    snapshot = arguments.output / "authorization_snapshot.json"
+    snapshot.write_bytes(snapshot.read_bytes() + b" ")
+    touched = []
+    monkeypatch.setattr(
+        runner,
+        "_run_worker_process",
+        lambda *args, **kwargs: touched.append("dispatch"),
+    )
+    with pytest.raises(control.S4BControlError, match="authorization snapshot"):
+        runner.run_batch(
+            Namespace(
+                repository=ROOT,
+                policy=POLICY_PATH,
+                implementation_commit=IMPLEMENTATION_COMMIT,
+                authorization=arguments.authorization,
+                output_run_id=OUTPUT_RUN_ID,
+                preflight=arguments.output,
+                datastore_dir=arguments.datastore_dir,
+                split="validation",
+                gpus=["0"],
+                output=tmp_path / "must_not_dispatch",
+                validation_dir=None,
+                validation_gate=None,
+            )
+        )
+    assert control.sha256_file(arguments.authorization) == hashlib.sha256(
+        authorization_bytes
+    ).hexdigest()
+    assert touched == []
+
+
+@pytest.mark.skipif(not LOCAL_FIXTURES, reason="local accepted attachments are opt-in")
+@pytest.mark.parametrize("changed_input", ["authorization", "wsl_receipt"])
+def test_preflight_rejects_input_replaced_after_validation_without_pass_receipt(
+    policy, aliases, tmp_path, monkeypatch, changed_input
+):
+    arguments, _, _ = make_server_preflight_inputs(
+        tmp_path, monkeypatch, policy, aliases
+    )
+    original_build = runner._build_reference_sources  # noqa: SLF001
+
+    def replace_after_validation(current_policy):
+        path = getattr(arguments, changed_input)
+        path.write_bytes(path.read_bytes() + b" ")
+        return original_build(current_policy)
+
+    monkeypatch.setattr(runner, "_build_reference_sources", replace_after_validation)
+    with pytest.raises(control.S4BControlError, match="input changed after validation"):
+        runner.preflight(arguments)
+    assert not (arguments.output / "preflight_receipt.json").exists()
 
 
 def test_wsl_receipt_mismatch_is_rejected(policy):

@@ -56,13 +56,16 @@ from s4_low_fraction_control import (  # noqa: E402
     compare_validation_reference,
     identity_sha256,
     load_authorization,
+    load_authorization_document,
     load_s4b_policy,
     parse_jsonl,
     prepare_low_fraction_checkpoint,
     read_json,
+    read_json_document,
     sha256_bytes,
     sha256_file,
     strict_json_loads,
+    validate_authorization,
     validate_datastore_metadata,
     validate_datastore_task_selection,
     validate_frozen_test_table,
@@ -96,6 +99,36 @@ def write_jsonl(path: str | Path, rows: Sequence[Mapping[str, Any]]) -> None:
     with path.open("x", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+
+
+def _write_exact_json_snapshot(
+    path: str | Path,
+    source_bytes: bytes,
+    expected_sha256: str,
+    *,
+    label: str,
+) -> Any:
+    """Create a byte-exact snapshot and independently parse/hash the result."""
+
+    if sha256_bytes(source_bytes) != expected_sha256:
+        raise S4BControlError(f"{label} source bytes changed before snapshot")
+    snapshot_path = Path(path)
+    with snapshot_path.open("xb") as handle:
+        handle.write(source_bytes)
+    document, written_bytes, written_sha256 = read_json_document(snapshot_path)
+    if written_bytes != source_bytes or written_sha256 != expected_sha256:
+        raise S4BControlError(f"{label} snapshot bytes differ after write")
+    return document
+
+
+def _require_source_bytes_unchanged(
+    path: str | Path,
+    source_bytes: bytes,
+    *,
+    label: str,
+) -> None:
+    if Path(path).read_bytes() != source_bytes:
+        raise S4BControlError(f"{label} input changed after validation")
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -581,17 +614,19 @@ def preflight(arguments: argparse.Namespace) -> int:
     if arguments.authorization is None or arguments.wsl_receipt is None:
         raise S4BControlError("server preflight requires authorization and WSL receipt")
     output_run_id = arguments.output_run_id
-    authorization, authorization_sha = load_authorization(
-        arguments.authorization,
+    authorization_path = arguments.authorization.resolve()
+    authorization, authorization_bytes, authorization_sha = load_authorization_document(
+        authorization_path,
         policy=policy,
         implementation_commit=arguments.implementation_commit,
         split="validation",
         output_run_id=output_run_id,
         allow_fixture=False,
     )
-    wsl = read_json(arguments.wsl_receipt)
-    verify_wsl_receipt(
-        wsl,
+    wsl_path = arguments.wsl_receipt.resolve()
+    wsl_document, wsl_bytes, wsl_sha = read_json_document(wsl_path)
+    wsl = verify_wsl_receipt(
+        wsl_document,
         implementation_commit=arguments.implementation_commit,
         policy_sha256=policy.sha256,
         runner_sha256=code["runner_sha256"],
@@ -700,8 +735,39 @@ def preflight(arguments: argparse.Namespace) -> int:
     write_json(output / "asset_identity.json", asset_identity)
     reference_sources = _build_reference_sources(policy)
     write_json(output / "reference_sources.json", reference_sources)
-    write_json(output / "authorization_snapshot.json", authorization)
-    write_json(output / "wsl_receipt_snapshot.json", wsl)
+    authorization_snapshot = _write_exact_json_snapshot(
+        output / "authorization_snapshot.json",
+        authorization_bytes,
+        authorization_sha,
+        label="authorization",
+    )
+    snapshot_authorization = validate_authorization(
+        authorization_snapshot,
+        policy=policy,
+        implementation_commit=arguments.implementation_commit,
+        split="validation",
+        output_run_id=output_run_id,
+        allow_fixture=False,
+    )
+    if snapshot_authorization != authorization:
+        raise S4BControlError("authorization snapshot content differs")
+    wsl_snapshot = _write_exact_json_snapshot(
+        output / "wsl_receipt_snapshot.json",
+        wsl_bytes,
+        wsl_sha,
+        label="WSL receipt",
+    )
+    snapshot_wsl = verify_wsl_receipt(
+        wsl_snapshot,
+        implementation_commit=arguments.implementation_commit,
+        policy_sha256=policy.sha256,
+        runner_sha256=code["runner_sha256"],
+        control_sha256=code["control_sha256"],
+        trainer_sha256=code["trainer_sha256"],
+        output_run_id=output_run_id,
+    )
+    if snapshot_wsl != wsl:
+        raise S4BControlError("WSL receipt snapshot content differs")
     receipt = {
         "schema_version": 1,
         "receipt_kind": "S4B_SERVER_PREFLIGHT",
@@ -714,7 +780,7 @@ def preflight(arguments: argparse.Namespace) -> int:
         "authorization_sha256": authorization_sha,
         "output_run_id": arguments.output_run_id,
         "expected_data_store_dir": str(arguments.datastore_dir.resolve()),
-        "wsl_receipt_sha256": sha256_file(arguments.wsl_receipt),
+        "wsl_receipt_sha256": wsl_sha,
         "runner_sha256": code["runner_sha256"],
         "control_sha256": code["control_sha256"],
         "trainer_sha256": code["trainer_sha256"],
@@ -736,6 +802,16 @@ def preflight(arguments: argparse.Namespace) -> int:
         "calibration_called": False,
         "completed": time.time(),
     }
+    _require_source_bytes_unchanged(
+        authorization_path,
+        authorization_bytes,
+        label="authorization",
+    )
+    _require_source_bytes_unchanged(
+        wsl_path,
+        wsl_bytes,
+        label="WSL receipt",
+    )
     write_json(_receipt_file(output), receipt)
     print(json.dumps(receipt, ensure_ascii=False, allow_nan=False))
     return 0
