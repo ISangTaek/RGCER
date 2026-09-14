@@ -81,6 +81,7 @@ class Trainer:
         args,
         save_path=None,
         load_path=None,
+        inference_compatibility=None,
         **kwargs,
     ):
         self.args = args
@@ -89,6 +90,7 @@ class Trainer:
         self.task_num = len(self.task_name)
         self.save_path = Path(save_path) if save_path else None
         self.load_path = load_path
+        self.inference_compatibility = inference_compatibility
         self.kwargs = kwargs
         self.seed = int(getattr(args, "seed", 42))
         self.selection_scope = str(getattr(args, "selection_scope", "human3"))
@@ -1180,6 +1182,10 @@ class Trainer:
         ]
 
     def _fit_conformal(self, calibration_dataloaders_dict, routing_enabled_override=None):
+        if getattr(self, "inference_compatibility", None) is not None:
+            raise RuntimeError(
+                "Inference compatibility checkpoints cannot be used for calibration"
+            )
         if self._prediction_mode() != "quantile" or not getattr(self.args, "fit_conformal", True):
             return
         _, records, _ = self._collect_predictions(
@@ -1566,8 +1572,19 @@ class Trainer:
             )
         if list(checkpoint["task_names"]) != self.task_name:
             raise ValueError("Checkpoint task_names do not match the current experiment")
+        stored_architecture = checkpoint.get("architecture_config")
+        if getattr(self, "inference_compatibility", None) is not None:
+            from checkpoint_inference_compatibility import InferenceCompatibilityView
+
+            if not isinstance(self.inference_compatibility, InferenceCompatibilityView):
+                raise TypeError(
+                    "inference_compatibility must be an InferenceCompatibilityView"
+                )
+            stored_architecture = self.inference_compatibility.architecture_for_trainer(
+                path, checkpoint, self.args
+            )
         self._validate_resume_adaptation_config(
-            checkpoint.get("architecture_config") or {},
+            stored_architecture or {},
             self._architecture_config(),
         )
         # D8 P1-2: the retention controller does not exist yet at this point
@@ -1613,7 +1630,6 @@ class Trainer:
         for name in ("lower", "upper"):
             if float(stored_quantiles.get(name)) != float(current_quantiles[name]):
                 raise ValueError(f"Checkpoint quantile setting {name!r} does not match current configuration")
-        stored_architecture = checkpoint["architecture_config"]
         if not isinstance(stored_architecture, dict):
             raise ValueError("Checkpoint architecture_config is invalid")
         current_config = self._architecture_config()
@@ -1761,6 +1777,10 @@ class Trainer:
         epochs=1,
         params_main=None,
     ):
+        if getattr(self, "inference_compatibility", None) is not None:
+            raise RuntimeError(
+                "Inference compatibility checkpoints cannot be used for training or resume"
+            )
         self.final_test_result = None
         if not any(loader is not None and len(loader) > 0 for loader in train_dataloaders_dict.values()):
             raise ValueError("All training dataloaders are empty")
