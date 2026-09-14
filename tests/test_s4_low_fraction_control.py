@@ -31,6 +31,9 @@ from scripts import run_s4_low_fraction_export as runner
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_ATTACHMENT = ROOT / "Plans&Results/Plans/s4b_low_fraction_policy.json"
 POLICY_PATH = ROOT / "configs/s4b_low_fraction_policy.json"
+DATASTORE_METADATA_FIXTURE = (
+    ROOT / "tests/fixtures/s4c_datastore_metadata_toxacute_v2_7b7bd62a6457.json"
+)
 S4A_FIXTURE = ROOT / "Plans&Results/Results/038_review_20260914/canonical.zip"
 S3C3_FIXTURE = (
     ROOT / "Plans&Results/Results/037_2026-09-14_S3C3R2核心恢复与test闭环.zip"
@@ -77,6 +80,23 @@ def first_metadata(policy):
             archive.read(asset.provenance["metadata_member"]).decode("utf-8-sig")
         )
     return asset, metadata
+
+
+def full_datastore_metadata():
+    return copy.deepcopy(control.read_json(DATASTORE_METADATA_FIXTURE))
+
+
+def datastore_source_identity(policy):
+    identity = control.validate_datastore_metadata(
+        full_datastore_metadata(), policy.assets[0]
+    )
+    identity.update(
+        {
+            "root": "synthetic-datastore",
+            "datastore_json_sha256": "4" * 64,
+        }
+    )
+    return identity
 
 
 def synthetic_samples():
@@ -458,29 +478,156 @@ def test_checkpoint_file_size_then_sha_validation(tmp_path):
         )
 
 
-def test_datastore_metadata_binds_full_frozen_identity_and_rejects_bool(policy):
+def test_datastore_metadata_binds_full_catalogue_to_human3_selection(policy):
     asset = policy.assets[0]
-    frozen = asset.expected_data_config
-    metadata = {
-        "format_version": frozen["datastore_format_version"],
-        "build_id": frozen["datastore_build_id"],
-        "datastore_fingerprint": frozen["datastore_fingerprint"],
-        "raw_csv_sha256": frozen["raw_csv_sha256"],
-        "feature_schema_version": frozen["feature_schema_version"],
-        "max_path_distance": frozen["max_path_distance"],
-        "splitting": frozen["splitting"],
-        "split_seed": frozen["split_seed"],
-        "split_ratios": copy.deepcopy(frozen["split_ratios"]),
-        "split_manifest_hash": frozen["split_manifest_hash"],
-        "task_names": list(frozen["task_names"]),
-        "build_complete": True,
-    }
-    assert control.validate_datastore_metadata(metadata, asset)[
+    metadata = full_datastore_metadata()
+    result = control.validate_datastore_metadata(metadata, asset)
+    assert result["datastore_fingerprint"] == asset.expected_data_config[
         "datastore_fingerprint"
-    ] == frozen["datastore_fingerprint"]
-    metadata["format_version"] = True
-    with pytest.raises(control.S4BControlError, match="format_version"):
-        control.validate_datastore_metadata(metadata, asset)
+    ]
+    assert len(result["datastore_task_names"]) == 59
+    assert result["requested_task_names"] == list(control.HUMAN3_TASKS)
+    assert result["selected_task_indices"] == [35, 36, 37]
+    assert result["num_tasks"] == 59
+    assert result["labels_shape"] == [79721, 59]
+    assert control.sha256_file(POLICY_PATH) == control.S4B_POLICY_SHA256
+
+
+@pytest.mark.parametrize(
+    ("case", "match"),
+    [
+        ("missing_human3", "missing requested Human3"),
+        ("duplicate_task", "duplicates"),
+        ("non_string_task", "non-empty strings"),
+        ("wrong_num_tasks", "num_tasks"),
+        ("wrong_label_columns", "labels_shape columns"),
+        ("reordered_full_catalogue", "ordered task catalogue"),
+        ("wrong_build", "build_id"),
+        ("wrong_fingerprint", "datastore_fingerprint"),
+        ("wrong_split", "splitting"),
+        ("collapsed_to_human3", "ordered task catalogue"),
+        ("bool_format_version", "format_version"),
+    ],
+)
+def test_datastore_metadata_catalogue_negative_cases_fail_closed(policy, case, match):
+    metadata = full_datastore_metadata()
+    if case == "missing_human3":
+        metadata["task_names"].remove(control.HUMAN3_TASKS[1])
+    elif case == "duplicate_task":
+        metadata["task_names"][1] = metadata["task_names"][0]
+    elif case == "non_string_task":
+        metadata["task_names"][0] = 7
+    elif case == "wrong_num_tasks":
+        metadata["num_tasks"] = 58
+    elif case == "wrong_label_columns":
+        metadata["labels_shape"][1] = 58
+    elif case == "reordered_full_catalogue":
+        metadata["task_names"][0], metadata["task_names"][1] = (
+            metadata["task_names"][1],
+            metadata["task_names"][0],
+        )
+    elif case == "wrong_build":
+        metadata["build_id"] = "wrong-build"
+    elif case == "wrong_fingerprint":
+        metadata["datastore_fingerprint"] = "0" * 64
+    elif case == "wrong_split":
+        metadata["splitting"] = "random"
+    elif case == "collapsed_to_human3":
+        metadata["task_names"] = list(control.HUMAN3_TASKS)
+        metadata["num_tasks"] = 3
+        metadata["labels_shape"][1] = 3
+    elif case == "bool_format_version":
+        metadata["format_version"] = True
+    else:  # pragma: no cover - parametrization is closed above
+        raise AssertionError(case)
+    with pytest.raises(control.S4BControlError, match=match):
+        control.validate_datastore_metadata(metadata, policy.assets[0])
+
+
+def test_datastore_task_selection_rejects_recorded_wrong_indices():
+    tasks = full_datastore_metadata()["task_names"]
+    with pytest.raises(control.S4BControlError, match="name-resolved"):
+        control.validate_datastore_task_selection(
+            tasks, list(control.HUMAN3_TASKS), [0, 1, 2]
+        )
+
+
+def test_offline_preflight_replay_rejects_self_consistent_wrong_task_mapping(policy):
+    source = datastore_source_identity(policy)
+    source["selected_task_indices"] = [0, 1, 2]
+    with pytest.raises(control.S4BControlError, match="task selection"):
+        runner._validate_recorded_datastore_source(source, policy)  # noqa: SLF001
+
+
+def test_sample_table_uses_human3_columns_from_full_catalogue(policy):
+    from toxacute_datastore import SPLIT_CODES
+
+    metadata = full_datastore_metadata()
+    identity = control.validate_datastore_metadata(metadata, policy.assets[0])
+
+    class SyntheticFullStore:
+        task_names = list(metadata["task_names"])
+        sample_ids = ["sample-12", "sample-10", "sentinel-only"]
+        row_indices = [12, 10, 11]
+        split_codes = [SPLIT_CODES["validation"]] * 3
+        num_nodes = [8, 9, 10]
+        labels = torch.full((3, 59), float("nan"), dtype=torch.float64)
+
+        def task_index(self, task_name):
+            return self.task_names.index(task_name)
+
+    store = SyntheticFullStore()
+    store.labels[:, 0:3] = torch.tensor(
+        [[9001.0, 9002.0, 9003.0]] * 3, dtype=torch.float64
+    )
+    store.labels[0, 35:38] = torch.tensor(
+        [1.5, float("nan"), 3.5], dtype=torch.float64
+    )
+    store.labels[1, 35:38] = torch.tensor(
+        [4.5, 5.5, float("nan")], dtype=torch.float64
+    )
+
+    samples, graph_indices = runner._sample_table_from_store(  # noqa: SLF001
+        store,
+        "validation",
+        max_nodes_filter=512,
+        selected_task_indices=identity["selected_task_indices"],
+    )
+    assert graph_indices == [1, 0]
+    assert samples == [
+        {
+            "sample_id": "sample-10",
+            "row_index": 10,
+            "labels": [4.5, 5.5, None],
+        },
+        {
+            "sample_id": "sample-12",
+            "row_index": 12,
+            "labels": [1.5, None, 3.5],
+        },
+    ]
+    assert all(
+        value is None or value < 9000
+        for sample in samples
+        for value in sample["labels"]
+    )
+
+
+def test_checkpoint_task_scope_remains_strict_human3(policy):
+    asset = policy.assets[0]
+    payload = synthetic_payload(asset)
+    assert control._validate_payload_identity(  # noqa: SLF001
+        payload, asset, torch_module=torch
+    )["task_scalers"] == asset.expected_scalers
+
+    full_catalogue = full_datastore_metadata()["task_names"]
+    payload["task_names"] = list(full_catalogue)
+    payload["architecture_config"]["task_names"] = list(full_catalogue)
+    payload["data_config"]["task_names"] = list(full_catalogue)
+    with pytest.raises(control.S4BControlError, match="task_names"):
+        control._validate_payload_identity(  # noqa: SLF001
+            payload, asset, torch_module=torch
+        )
 
 
 @pytest.mark.parametrize("operation", ["train", "resume", "calibration", "single_inference"])
@@ -1176,10 +1323,7 @@ def build_full_validation_contract(root, policy, frozen_test_samples):
     wsl.update(code)
     runner.write_json(preflight / "wsl_receipt_snapshot.json", wsl)
     sample_sources = {
-        "datastore": {
-            "datastore_fingerprint": policy.assets[0].expected_data_config["datastore_fingerprint"],
-            "datastore_json_sha256": "4" * 64,
-        },
+        "datastore": datastore_source_identity(policy),
         "validation": {
             "sample_identity_sha256": control.identity_sha256(validation_samples),
         },

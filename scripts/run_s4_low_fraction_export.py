@@ -64,6 +64,7 @@ from s4_low_fraction_control import (  # noqa: E402
     sha256_file,
     strict_json_loads,
     validate_datastore_metadata,
+    validate_datastore_task_selection,
     validate_frozen_test_table,
     validate_legacy_alias_rows,
     validate_prediction_rows,
@@ -204,8 +205,24 @@ def _synthetic_selftest(policy_path: Path) -> dict[str, Any]:
     }
 
 
-def _sample_table_from_store(store: Any, split: str, *, max_nodes_filter: int) -> tuple[list[dict[str, Any]], list[int]]:
+def _sample_table_from_store(
+    store: Any,
+    split: str,
+    *,
+    max_nodes_filter: int,
+    selected_task_indices: Sequence[int] | None = None,
+) -> tuple[list[dict[str, Any]], list[int]]:
     from toxacute_datastore import SPLIT_CODES
+
+    datastore_task_names = list(store.task_names)
+    if selected_task_indices is None:
+        selected_task_indices = [store.task_index(task) for task in HUMAN3_TASKS]
+    selection = validate_datastore_task_selection(
+        datastore_task_names,
+        list(HUMAN3_TASKS),
+        list(selected_task_indices),
+    )
+    selected_task_indices = selection["selected_task_indices"]
 
     samples = []
     indices = []
@@ -213,7 +230,8 @@ def _sample_table_from_store(store: Any, split: str, *, max_nodes_filter: int) -
         if int(store.split_codes[index]) != SPLIT_CODES[split]:
             continue
         labels = [
-            float(store.labels[index, store.task_index(task)]) for task in HUMAN3_TASKS
+            float(store.labels[index, task_index])
+            for task_index in selected_task_indices
         ]
         if not any(math.isfinite(value) for value in labels):
             continue
@@ -342,6 +360,47 @@ def _verify_reference_sources(
     return result
 
 
+def _validate_recorded_datastore_source(
+    datastore_source: Any, policy: Any
+) -> dict[str, Any]:
+    """Replay full-catalogue identity and Human3 column selection offline."""
+
+    if not isinstance(datastore_source, Mapping):
+        raise S4BControlError("server preflight DataStore source is not an object")
+    recorded_metadata = {
+        "format": datastore_source.get("format"),
+        "format_version": datastore_source.get("datastore_format_version"),
+        "graph_record_version": datastore_source.get("graph_record_version"),
+        "build_id": datastore_source.get("datastore_build_id"),
+        "datastore_fingerprint": datastore_source.get("datastore_fingerprint"),
+        "raw_csv_sha256": datastore_source.get("raw_csv_sha256"),
+        "feature_schema_version": datastore_source.get("feature_schema_version"),
+        "max_path_distance": datastore_source.get("max_path_distance"),
+        "splitting": datastore_source.get("splitting"),
+        "split_seed": datastore_source.get("split_seed"),
+        "split_ratios": datastore_source.get("split_ratios"),
+        "split_manifest_hash": datastore_source.get("split_manifest_hash"),
+        "num_samples": datastore_source.get("num_samples"),
+        "num_tasks": datastore_source.get("num_tasks"),
+        "labels_shape": datastore_source.get("labels_shape"),
+        "task_names": datastore_source.get("datastore_task_names"),
+        "build_complete": datastore_source.get("build_complete"),
+    }
+    replayed_datastore = validate_datastore_metadata(
+        recorded_metadata, policy.assets[0]
+    )
+    for name in (
+        "datastore_task_names",
+        "requested_task_names",
+        "selected_task_indices",
+    ):
+        if datastore_source.get(name) != replayed_datastore[name]:
+            raise S4BControlError(
+                f"server preflight DataStore task selection differs: {name}"
+            )
+    return replayed_datastore
+
+
 def _verify_server_preflight(
     preflight_dir: Path,
     *,
@@ -405,6 +464,7 @@ def _verify_server_preflight(
     if not isinstance(sample_sources, Mapping):
         raise S4BControlError("server preflight sample source record is not an object")
     datastore_source = sample_sources.get("datastore", {})
+    _validate_recorded_datastore_source(datastore_source, policy)
     if (
         datastore_source.get("datastore_fingerprint")
         != policy.assets[0].expected_data_config["datastore_fingerprint"]
@@ -573,10 +633,16 @@ def preflight(arguments: argparse.Namespace) -> int:
             }
         )
         validation_samples, _ = _sample_table_from_store(
-            store, "validation", max_nodes_filter=params.max_nodes_filter
+            store,
+            "validation",
+            max_nodes_filter=params.max_nodes_filter,
+            selected_task_indices=datastore_identity["selected_task_indices"],
         )
         actual_test, _ = _sample_table_from_store(
-            store, "test", max_nodes_filter=params.max_nodes_filter
+            store,
+            "test",
+            max_nodes_filter=params.max_nodes_filter,
+            selected_task_indices=datastore_identity["selected_task_indices"],
         )
     finally:
         store.close()
@@ -886,10 +952,12 @@ def worker(arguments: argparse.Namespace) -> int:
         gpu_id="0",
     )
     try:
+        datastore_identity = validate_datastore_metadata(store.metadata, asset)
         actual_samples, graph_indices = _sample_table_from_store(
             store,
             arguments.split,
             max_nodes_filter=params.max_nodes_filter,
+            selected_task_indices=datastore_identity["selected_task_indices"],
         )
         independent_samples = read_json(
             preflight_dir / f"{arguments.split}_samples.json"

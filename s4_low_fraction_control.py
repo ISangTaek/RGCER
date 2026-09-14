@@ -1151,12 +1151,111 @@ def validate_frozen_test_table(samples: Any) -> list[dict[str, Any]]:
     return result
 
 
+def validate_datastore_task_selection(
+    datastore_task_names: Any,
+    requested_task_names: Any,
+    selected_task_indices: Any | None = None,
+) -> dict[str, Any]:
+    """Keep the full DataStore catalogue separate from the Human3 request."""
+
+    if type(datastore_task_names) is not list or not datastore_task_names:
+        raise S4BControlError(
+            "datastore.metadata.task_names must be a non-empty list"
+        )
+    if any(type(task) is not str or not task for task in datastore_task_names):
+        raise S4BControlError(
+            "datastore.metadata.task_names entries must be non-empty strings"
+        )
+    if len(set(datastore_task_names)) != len(datastore_task_names):
+        raise S4BControlError("datastore.metadata.task_names contains duplicates")
+
+    if type(requested_task_names) is not list or not _strict_equal(
+        requested_task_names, list(HUMAN3_TASKS)
+    ):
+        raise S4BControlError(
+            "requested_task_names differs from the frozen Human3 order/type"
+        )
+    missing = [task for task in requested_task_names if task not in datastore_task_names]
+    if missing:
+        raise S4BControlError(
+            f"DataStore is missing requested Human3 task_names: {missing}"
+        )
+    resolved_indices = [datastore_task_names.index(task) for task in requested_task_names]
+
+    if selected_task_indices is not None:
+        if type(selected_task_indices) is not list or any(
+            type(index) is not int for index in selected_task_indices
+        ):
+            raise S4BControlError("selected_task_indices must be true integers")
+        if selected_task_indices != resolved_indices:
+            raise S4BControlError(
+                "selected_task_indices differs from the name-resolved Human3 columns"
+            )
+
+    return {
+        "datastore_task_names": list(datastore_task_names),
+        "requested_task_names": list(requested_task_names),
+        "selected_task_indices": resolved_indices,
+    }
+
+
 def validate_datastore_metadata(
     metadata: Any, asset: LowFractionAsset
 ) -> dict[str, Any]:
     """Bind a live DataStore V2 metadata block to the frozen data identity."""
 
     metadata = _mapping(metadata, "datastore.metadata")
+    requested_task_names = list(asset.expected_data_config["task_names"])
+    selection = validate_datastore_task_selection(
+        metadata.get("task_names"), requested_task_names
+    )
+
+    num_tasks = _true_int(
+        metadata.get("num_tasks"), "datastore.metadata.num_tasks", minimum=1
+    )
+    if num_tasks != len(selection["datastore_task_names"]):
+        raise S4BControlError(
+            "datastore.metadata.num_tasks does not match the full task catalogue"
+        )
+    labels_shape = metadata.get("labels_shape")
+    if type(labels_shape) is not list or len(labels_shape) != 2:
+        raise S4BControlError("datastore.metadata.labels_shape must be a two-item list")
+    num_samples = _true_int(
+        metadata.get("num_samples"), "datastore.metadata.num_samples", minimum=1
+    )
+    labels_rows = _true_int(
+        labels_shape[0], "datastore.metadata.labels_shape[0]", minimum=1
+    )
+    labels_columns = _true_int(
+        labels_shape[1], "datastore.metadata.labels_shape[1]", minimum=1
+    )
+    if labels_rows != num_samples:
+        raise S4BControlError(
+            "datastore.metadata.labels_shape rows do not match num_samples"
+        )
+    if labels_columns != num_tasks:
+        raise S4BControlError(
+            "datastore.metadata.labels_shape columns do not match num_tasks"
+        )
+
+    try:
+        from toxacute_datastore import (
+            DATASTORE_FORMAT,
+            GRAPH_RECORD_VERSION,
+            compute_datastore_fingerprint,
+        )
+    except ImportError as exc:
+        raise S4BControlError(
+            "DataStore native fingerprint implementation is unavailable"
+        ) from exc
+
+    _require_exact(metadata, "format", DATASTORE_FORMAT, "datastore.metadata")
+    _require_exact(
+        metadata,
+        "graph_record_version",
+        GRAPH_RECORD_VERSION,
+        "datastore.metadata",
+    )
     key_map = {
         "format_version": "datastore_format_version",
         "build_id": "datastore_build_id",
@@ -1168,7 +1267,6 @@ def validate_datastore_metadata(
         "split_seed": "split_seed",
         "split_ratios": "split_ratios",
         "split_manifest_hash": "split_manifest_hash",
-        "task_names": "task_names",
     }
     for metadata_name, policy_name in key_map.items():
         _require_exact(
@@ -1178,8 +1276,22 @@ def validate_datastore_metadata(
             "datastore.metadata",
         )
     _require_exact(metadata, "build_complete", True, "datastore.metadata")
+    computed_fingerprint = compute_datastore_fingerprint(
+        raw_csv_sha256=metadata["raw_csv_sha256"],
+        feature_schema_version=metadata["feature_schema_version"],
+        graph_record_version=metadata["graph_record_version"],
+        max_path_distance=metadata["max_path_distance"],
+        task_names=selection["datastore_task_names"],
+        split_manifest_hash=metadata["split_manifest_hash"],
+    )
+    if computed_fingerprint != metadata["datastore_fingerprint"]:
+        raise S4BControlError(
+            "datastore full ordered task catalogue does not reproduce the frozen fingerprint"
+        )
     return {
+        "format": metadata["format"],
         "datastore_format_version": metadata["format_version"],
+        "graph_record_version": metadata["graph_record_version"],
         "datastore_build_id": metadata["build_id"],
         "datastore_fingerprint": metadata["datastore_fingerprint"],
         "raw_csv_sha256": metadata["raw_csv_sha256"],
@@ -1189,7 +1301,10 @@ def validate_datastore_metadata(
         "split_seed": metadata["split_seed"],
         "split_ratios": metadata["split_ratios"],
         "split_manifest_hash": metadata["split_manifest_hash"],
-        "task_names": metadata["task_names"],
+        "num_samples": num_samples,
+        "num_tasks": num_tasks,
+        "labels_shape": list(labels_shape),
+        **selection,
         "build_complete": True,
     }
 
@@ -2261,6 +2376,7 @@ __all__ = [
     "validate_authorization",
     "validate_frozen_test_table",
     "validate_datastore_metadata",
+    "validate_datastore_task_selection",
     "validate_legacy_alias_rows",
     "validate_prediction_rows",
     "validate_request",
