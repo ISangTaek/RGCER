@@ -710,7 +710,12 @@ class EvidenceWriter:
         source = source.resolve()
         destination = self.root / PurePosixPath(relative_destination)
         destination_key = destination.relative_to(self.root).as_posix()
-        require(destination_key not in self._destinations, f"duplicate evidence destination: {destination_key}")
+        if destination_key in self._destinations:
+            previous = next(r for r in self.records if r.get("evidence_path") == "evidence/" + destination_key)
+            require(previous.get("source_path") == str(source), f"evidence source identity changed: {destination_key}")
+            require(sha256_file(source) == previous["sha256"] == sha256_file(destination),
+                    f"evidence bytes changed: {destination_key}")
+            return dict(previous, reused=True)
         record: dict[str, Any] = {
             "category": category,
             "source_path": str(source),
@@ -1342,17 +1347,23 @@ def project_scope_evidence(
     }
 
 
-def require_complete_scope(scope: Mapping[str, Any], label: str) -> None:
+def require_complete_scope(scope: Mapping[str, Any], label: str, *, source_teacher: bool = False) -> None:
     if scope.get("conflict_fields"):
         raise RunCollectionError(
             "TRAINING_SCOPE_CONFLICT",
             f"{label} training scope conflicts: {scope['conflict_fields']}",
             status="CONFLICT",
         )
-    if scope.get("missing_fields"):
+    missing = list(scope.get("missing_fields", []))
+    # Historical source runs predate label-scaling metadata. Absence is a
+    # scientific unknown, never an inferred 100% training fraction.
+    fraction = scope.get("fields", {}).get("train_fraction", {})
+    if source_teacher and fraction.get("status") == "UNKNOWN" and not fraction.get("sources"):
+        missing = [field for field in missing if field != "train_fraction"]
+    if missing:
         raise RunCollectionError(
             "TRAINING_SCOPE_INCOMPLETE",
-            f"{label} training scope fields are not persisted: {scope['missing_fields']}",
+            f"{label} training scope fields are not persisted: {missing}",
         )
 
 
@@ -2116,6 +2127,8 @@ def collect_source_assets(
                     "BEST_EPOCH_MISMATCH",
                     f"best checkpoint epoch {observed_epoch!r} != lock {spec.best_epoch}",
                 )
+            link["best"] = {"path": str(checkpoint), "sha256": spec.checkpoint_sha256,
+                            "size_bytes": spec.checkpoint_size_bytes, "epoch": observed_epoch, "load": best_load}
             args_document, args_evidence = read_json_evidence(
                 run_dir / "args.json",
                 evidence,
@@ -2226,6 +2239,8 @@ def collect_source_assets(
                 mismatch_status="CONFLICT",
             )
             init_path_verification["summary_reused"] = cached_init is not None
+            link.update(init_asset_id=init_asset_id, init_path_verification=init_path_verification,
+                        sidecar_evidence=sidecar_evidence)
             if init_asset_id not in source_asset_records:
                 init_payload, init_load = load_verified_torch(
                     init_path,
@@ -2262,6 +2277,7 @@ def collect_source_assets(
                 mismatch_status="CONFLICT",
             )
             teacher_path_verification["summary_reused"] = cached_teacher is not None
+            link["teacher_path_verification"] = teacher_path_verification
             if teacher_asset_id not in source_asset_records:
                 teacher_payload, teacher_load = load_verified_torch(
                     teacher_path,
@@ -2326,7 +2342,6 @@ def collect_source_assets(
                 teacher_scope = project_scope_evidence(
                     [("teacher_checkpoint", teacher_payload), *teacher_documents]
                 )
-                require_complete_scope(teacher_scope, "teacher")
                 source_asset_records[teacher_asset_id] = teacher_record
                 source_states[teacher_asset_id] = teacher_state
                 source_training[teacher_asset_id] = {
@@ -2341,6 +2356,8 @@ def collect_source_assets(
                     ),
                 }
 
+            link["teacher_asset_id"] = teacher_asset_id
+            require_complete_scope(source_training[teacher_asset_id]["scope"], "teacher", source_teacher=True)
             cached_teacher = source_asset_records[teacher_asset_id]
             if cached_teacher.get("epoch") != expected_teacher_epoch:
                 raise RunCollectionError(
@@ -2397,7 +2414,6 @@ def collect_source_assets(
                     ("run_metadata", metadata),
                 ]
             )
-            require_complete_scope(target_scope, "target run")
             target_training.append(
                 {
                     "run_id": spec.run_id,
@@ -2408,6 +2424,7 @@ def collect_source_assets(
                     "sample_or_subset_evidence": training_references,
                 }
             )
+            require_complete_scope(target_scope, "target run")
             link.update(
                 status="COLLECTED",
                 run_dir=str(run_dir),
@@ -2485,9 +2502,17 @@ def collect_source_assets(
         "deduplication": "asset kind plus exact SHA-256; all fifty run links are retained",
         "acceptance_status": "PENDING_REVIEW",
     }
+    scientific_unknowns = [
+        {"asset_id": asset_id, "field": "train_fraction", "value": None,
+         "reason": "not_persisted_in_historical_source",
+         "affected_run_ids": [r["run_id"] for r in links if r.get("teacher_asset_id") == asset_id]}
+        for asset_id, entry in sorted(source_training.items())
+        if entry["scope"]["fields"]["train_fraction"]["status"] == "UNKNOWN"
+    ]
     training_document = {
         "schema_version": SCHEMA_VERSION,
         "sources": sorted(source_training.values(), key=lambda row: row["asset_id"]),
+        "scientific_unknowns": scientific_unknowns,
         "targets": sorted(target_training, key=lambda row: row["run_id"]),
         "labels_exported": False,
         "missing_runtime_sample_lists_are_not_inferred": True,
@@ -2557,6 +2582,7 @@ def collect_source_assets(
         "training_called": False,
         "gpu_used": False,
         "issue_count": len(issues),
+        "scientific_unknowns": scientific_unknowns,
     }
     write_json(output / "collection_manifest.json", manifest)
     _write_checksum_manifest(output)

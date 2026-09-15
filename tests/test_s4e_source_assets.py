@@ -455,6 +455,69 @@ def identity_spec(method: str, *, seed: int = 42, fraction: int = 10):
     )
 
 
+@pytest.mark.parametrize("missing", ["train_fraction", "dataset"])
+def test_shared_historical_teacher_missing_scope_preserves_facts(tmp_path, monkeypatch, missing):
+    original = teacher_payload
+    def historical(*a, **kw):
+        payload = original(*a, **kw)
+        payload["configuration"].pop(missing)
+        return payload
+    monkeypatch.setattr(sys.modules[__name__], "teacher_payload", historical)
+    fixture = build_synthetic_repository(tmp_path)
+    output = tmp_path / "historical-output"
+    code = collector.collect_source_assets(fixture["repo"], fixture["low"], fixture["core"], output)
+    read = lambda n: json.loads((output / n).read_text(encoding="utf-8"))
+    links = read("run_source_links.json")
+    assets = read("source_assets.json")
+    assert len(links["runs"]) == 50
+    assert len([x for x in assets["assets"] if x["kind"] == "teacher"]) == 6
+    assert all("teacher_asset_id" in x and "best" in x and "init_path_verification" in x for x in links["runs"])
+    if missing == "train_fraction":
+        assert code == 0 and not links["issues"]
+        unknowns = read("collection_manifest.json")["scientific_unknowns"]
+        assert len(unknowns) == 6
+        assert sum(len(x["affected_run_ids"]) for x in unknowns) == 50
+        assert all(x["value"] is None for x in unknowns)
+        assert all(x["scope"]["fields"]["train_fraction"]["status"] == "UNKNOWN"
+                   for x in read("training_scope_evidence.json")["sources"])
+    else:
+        assert code == 2
+        assert {x["code"] for x in links["issues"]} == {"TRAINING_SCOPE_INCOMPLETE"}
+        assert all("dataset" in x["reason"] for x in links["issues"])
+    collector.verify_checksum_manifest(output)
+
+
+def test_source_fraction_unknown_exception_does_not_allow_invalid_or_target():
+    payload = teacher_payload(42, 29)
+    payload["configuration"].pop("train_fraction")
+    scope = collector.project_scope_evidence([("checkpoint", payload)])
+    collector.require_complete_scope(scope, "teacher", source_teacher=True)
+    with pytest.raises(collector.RunCollectionError):
+        collector.require_complete_scope(scope, "target")
+    payload["configuration"]["train_fraction"] = "unknown"
+    with pytest.raises(collector.RunCollectionError):
+        collector.require_complete_scope(collector.project_scope_evidence([("checkpoint", payload)]), "teacher", source_teacher=True)
+    payload["configuration"]["train_fraction"] = 1.0
+    with pytest.raises(collector.RunCollectionError):
+        collector.require_complete_scope(collector.project_scope_evidence([("checkpoint", payload), ("args", {"train_fraction": 0.5})]), "teacher", source_teacher=True)
+
+
+def test_evidence_copy_reuse_requires_same_source_and_bytes(tmp_path):
+    src = tmp_path / "source.json"
+    write_json(src, {"a": 1})
+    writer = collector.EvidenceWriter(tmp_path / "evidence")
+    first = writer.copy(src, "teacher/args.json", parsed={"a": 1}, category="teacher")
+    second = writer.copy(src, "teacher/args.json", parsed={"a": 1}, category="teacher")
+    assert first["sha256"] == second["sha256"] and second["reused"]
+    other = tmp_path / "other.json"
+    write_json(other, {"a": 1})
+    with pytest.raises(collector.S4ECollectionError, match="identity changed"):
+        writer.copy(other, "teacher/args.json", parsed={"a": 1}, category="teacher")
+    write_json(src, {"a": 2})
+    with pytest.raises(collector.S4ECollectionError, match="bytes changed"):
+        writer.copy(src, "teacher/args.json", parsed={"a": 2}, category="teacher")
+
+
 def test_exact_matrix_excludes_b0_and_rejects_incomplete_or_illegal(tmp_path):
     fixture = build_synthetic_repository(tmp_path)
     specs = collector.build_run_specs(fixture["low_document"], fixture["core_document"])
