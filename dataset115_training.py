@@ -85,8 +85,10 @@ def _write_json(path, value):
 
 
 class RouteBTrainer:
+    ROUTE = 'B'
+
     def __init__(self, args, source, source_identity, train, validation, *, method, seed, config, device):
-        require(train.route == validation.route == 'B' and train.role == validation.role == 'target', 'Route B target required')
+        require(train.route == validation.route == self.ROUTE and train.role == validation.role == 'target', 'Route '+self.ROUTE+' target required')
         require(train.split == 'train' and validation.split == 'validation', 'train/validation only')
         require(train.input_identity == validation.input_identity, 'input identity')
         for attr in ('sample_ids', 'canonical', 'groups'):
@@ -115,7 +117,7 @@ class RouteBTrainer:
                          for split, v in [('train', train), ('validation', validation)]}
         require(all(len(d) for ds in self.datasets.values() for d in ds.values()), 'empty task')
         self.cache = {}
-        self.identity = dict(schema='dataset115_route_b_epoch_v1', method=method, seed=seed,
+        self.identity = dict(schema='dataset115_route_'+self.ROUTE.lower()+'_epoch_v1', method=method, seed=seed,
             config=asdict(config), architecture=vars(args), source_identity=source_identity,
             input_identity=train.input_identity, train_ids=semantic_digest(list(train.sample_ids)),
             validation_ids=semantic_digest(list(validation.sample_ids)), scaler=self.scaler.to_dict(),
