@@ -44,13 +44,13 @@ def load_selected(path,row):
     require(all(torch.isfinite(v).all() for v in p['best_model_state'].values()),'finite best tensors')
     return p['best_model_state']
 
-def expected_population(view):
-    require(view.route=='B' and view.role=='target' and view.tasks==PRIMARY and view.split in ('validation','test'),'prediction scope')
+def expected_population(view, *, route='B'):
+    require(route in ('A','B') and view.route==route and view.role=='target' and view.tasks==PRIMARY and view.split in ('validation','test'),'prediction scope')
     return {(t,view.sample_ids[i]):dict(label=float(view.labels[i,j]),canonical=view.canonical[i],group=view.groups[i])
             for j,t in enumerate(PRIMARY) for i in range(len(view.sample_ids)) if np.isfinite(view.labels[i,j])}
 
-def metrics(rows,view):
-    expected=expected_population(view);keys=[(r['task'],r['sample_id']) for r in rows]
+def metrics(rows,view, *, route='B'):
+    expected=expected_population(view,route=route);keys=[(r['task'],r['sample_id']) for r in rows]
     require(len(keys)==len(set(keys)) and set(keys)==set(expected),'prediction population differs')
     for r in rows:
         require(r['split']==view.split and all(r[k]==v for k,v in expected[(r['task'],r['sample_id'])].items()),'prediction identity differs')
@@ -113,11 +113,13 @@ def write_json(path,value):
     raw=json.dumps(value,indent=2,ensure_ascii=False,allow_nan=False)+'\n'
     with Path(path).open('x',encoding='utf8') as f:f.write(raw)
 
-def export_all(lock,table,output,*,device,checkpoint_resolver=None,predictor=predict):
+def export_all(lock,table,output,*,device,checkpoint_resolver=None,predictor=predict,
+               route='B',task_id='S5C_ROUTEB_15_FORMAL_TEST_20260915',lock_sha=LOCK_SHA):
     output=Path(output);require(not output.exists(),'output exists')
     require(len(lock['runs'])==15 and {(r['method'],r['seed']) for r in lock['runs']}==MATRIX,'matrix')
-    train=table.view('B','target','train');validation=table.view('B','target','validation')
-    test=table.view('B','target','test');sc=TrainOnlyScaler.fit(train).to_dict()
+    require(route in ('A','B'),'export route')
+    train=table.view(route,'target','train');validation=table.view(route,'target','validation')
+    test=table.view(route,'target','test');sc=TrainOnlyScaler.fit(train).to_dict()
     require(all(r['identity']['input_identity']==table.identity for r in lock['runs']),'data identity')
     for r in lock['runs']:require(r['identity']['scaler']==sc,'scaler identity')
     output.mkdir(parents=True,exist_ok=False);cache={};states={};regressions=[]
@@ -127,21 +129,21 @@ def export_all(lock,table,output,*,device,checkpoint_resolver=None,predictor=pre
         key=f"{r['method']}_seed{r['seed']}"
         path=r['checkpoint_path'] if checkpoint_resolver is None else checkpoint_resolver(r)
         state=load_selected(path,r);states[key]=state
-        rows=predictor(state,r,validation,device,cache);metrics(rows,validation)
+        rows=predictor(state,r,validation,device,cache);metrics(rows,validation,route=route)
         check=compare_validation(rows,r['validation_rows']);check.update(method=r['method'],seed=r['seed'])
         write_json(output/(key+'_validation.json'),rows);regressions.append(check)
     write_json(output/'validation_regression.json',regressions)
     result=[]
     for r in lock['runs']:
         key=f"{r['method']}_seed{r['seed']}"
-        rows=predictor(states[key],r,test,device,cache);m=metrics(rows,test)
+        rows=predictor(states[key],r,test,device,cache);m=metrics(rows,test,route=route)
         target=output/(key+'_test.json');write_json(target,rows)
         # Parse the actual saved artifact and recalculate, not a PASS field.
-        need=metrics(strict_json(target.read_bytes()),test);require(need==m,'saved metric differs')
+        need=metrics(strict_json(target.read_bytes()),test,route=route);require(need==m,'saved metric differs')
         result.append(dict(method=r['method'],seed=r['seed'],best_epoch=r['best_epoch'],
             checkpoint_sha256=r['checkpoint_sha256'],best_model_digest=r['best_model_digest'],
             prediction_file=target.name,prediction_sha256=hashlib.sha256(target.read_bytes()).hexdigest(),metrics=m))
-    summary=dict(task_id='S5C_ROUTEB_15_FORMAL_TEST_20260915',selection_lock_sha256=LOCK_SHA,
+    summary=dict(task_id=task_id,selection_lock_sha256=lock_sha,
         input_identity=table.identity,runs=result,validation_regressions=regressions,
         training_performed=False,calibration_predictions_accessed=False,acceptance_status='PENDING_REVIEW')
     write_json(output/'test_summary.json',summary)
