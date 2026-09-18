@@ -84,7 +84,7 @@ def collect_probe_items(store, animal_tasks, probe: dict[str, list[str]], *, max
 
     wanted: dict[str, set[str]] = {task: set(ids) for task, ids in probe.items() if ids}
     pairs: list[tuple[str, object]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     for task in animal_tasks:
         ids = wanted.get(task)
         if not ids:
@@ -92,7 +92,7 @@ def collect_probe_items(store, animal_tasks, probe: dict[str, list[str]], *, max
         indices = store.get_task_indices(task, split="train", max_nodes=max_nodes)
         for index in indices:
             sample_id = str(store.sample_ids[int(index)])
-            if sample_id not in ids or sample_id in seen:
+            if sample_id not in ids or (task, sample_id) in seen:
                 continue
             label = store.get_label(int(index), task)
             if label is None:
@@ -101,10 +101,8 @@ def collect_probe_items(store, animal_tasks, probe: dict[str, list[str]], *, max
                 int(index), task_name=task, label=float(label)
             )
             pairs.append((task, item))
-            seen.add(sample_id)
-    all_wanted = set()
-    for ids in wanted.values():
-        all_wanted |= ids
+            seen.add((task, sample_id))
+    all_wanted = {(task, sample_id) for task, ids in wanted.items() for sample_id in ids}
     missing = sorted(all_wanted - seen)
     if missing:
         raise RuntimeError(
@@ -199,6 +197,19 @@ def build_hybrid_model(base_animal_model, current_backbone_state: dict):
 
     hybrid = copy.deepcopy(base_animal_model)
     state = hybrid.state_dict()
+    expected = {key for key in state if key.startswith(BACKBONE_PREFIX)}
+    supplied = {key for key in current_backbone_state if key.startswith(BACKBONE_PREFIX)}
+    if not expected or supplied != expected:
+        raise RuntimeError(
+            f"hybrid model: incomplete or unexpected backbone keys; "
+            f"missing={sorted(expected - supplied)}, extra={sorted(supplied - expected)}"
+        )
+    for key in expected:
+        value = current_backbone_state[key]
+        if not isinstance(value, torch.Tensor) or value.shape != state[key].shape:
+            raise RuntimeError(f"hybrid model: backbone shape/type mismatch for {key}")
+        if not torch.isfinite(value).all():
+            raise RuntimeError(f"hybrid model: nonfinite backbone tensor {key}")
     overwritten = []
     for key, value in state.items():
         if key.startswith(BACKBONE_PREFIX) and key in current_backbone_state:

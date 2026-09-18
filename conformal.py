@@ -102,12 +102,24 @@ class ConformalCalibrator:
 
     @staticmethod
     def conformity_scores(lower, upper, target):
-        lower = torch.as_tensor(lower)
-        upper = torch.as_tensor(upper)
-        target = torch.as_tensor(target)
+        def vector(value):
+            tensor = torch.as_tensor(value)
+            if tensor.ndim == 2 and tensor.shape[1] == 1:
+                tensor = tensor[:, 0]
+            if tensor.ndim != 1:
+                raise ValueError("calibration inputs must have shape [B] or [B,1]")
+            if not torch.isfinite(tensor).all():
+                raise ValueError("calibration inputs must be finite")
+            return tensor
+        lower, upper, target = map(vector, (lower, upper, target))
+        if lower.shape != upper.shape or lower.shape != target.shape:
+            raise ValueError("calibration inputs must have equal sample counts")
         # CQR uses the signed conformity score.  Negative scores are valid:
         # they allow an over-wide base interval to contract after calibration.
-        return torch.maximum(lower - target, target - upper)
+        scores = torch.maximum(lower - target, target - upper)
+        if not torch.isfinite(scores).all():
+            raise ValueError("calibration scores must be finite")
+        return scores
 
     def fit_task(self, task, lower, upper, target):
         scores = self.conformity_scores(lower, upper, target).reshape(-1)

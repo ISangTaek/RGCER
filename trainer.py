@@ -875,10 +875,12 @@ class Trainer:
                 human3_values.append(primary)
             if task in selection_tasks and np.isfinite(primary):
                 selection_values.append(weighted)
+        selection_complete = bool(selection_tasks) and len(selection_values) == len(selection_tasks)
         return {
             "tasks": task_scores,
             "score": float(np.mean(primary_values)) if primary_values else -float("inf"),
-            "selection_score": float(np.mean(selection_values)) if selection_values else -float("inf"),
+            "selection_score": float(np.mean(selection_values)) if selection_complete else -float("inf"),
+            "selection_reason": None if selection_complete else "missing_or_nonfinite_required_task",
             "selection_scope": effective_scope,
             "selection_tasks": list(selection_tasks),
             "human3_macro_rmse": float(np.mean(human3_values)) if human3_values else np.nan,

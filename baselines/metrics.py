@@ -6,6 +6,8 @@ import numpy as np
 
 
 def _task_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+    if np.any(np.isfinite(y_true) & ~np.isfinite(y_pred)):
+        raise ValueError("nonfinite prediction at an observed label")
     mask = np.isfinite(y_true) & np.isfinite(y_pred)
     count = int(mask.sum())
     if count == 0:
