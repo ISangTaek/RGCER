@@ -20,19 +20,29 @@ ROUTES = ("intraperitoneal", "intravenous", "oral", "unreported", "skin", "subcu
 MEASUREMENTS = ("LD50", "LDLo", "TDLo")
 
 
-def endpoint_feature_matrix(task_names=TOXACUTE_TASKS) -> tuple[np.ndarray, dict]:
+def endpoint_feature_matrix(task_names=TOXACUTE_TASKS, *, extend_vocabulary=False) -> tuple[np.ndarray, dict]:
+    if not task_names or len(set(task_names)) != len(task_names):
+        raise ValueError("task names must be nonempty and unique")
+    parts = [task.rsplit("_", 2) for task in task_names]
+    if any(len(p) != 3 or not all(p) for p in parts):
+        raise ValueError("expected species_route_measurement")
+    parts = [("bird - wild" if p[0] == "bird-wild" else p[0], p[1], p[2]) for p in parts]
+    vocab = [list(SPECIES), list(ROUTES), list(MEASUREMENTS)]
+    if extend_vocabulary:
+        for i in range(3):
+            vocab[i].extend(sorted({p[i] for p in parts} - set(vocab[i])))
     rows = []
-    for task in task_names:
-        metadata = parse_toxacute_task_name(task)
-        subject = task.rsplit("_", 2)[0]
-        subject = "bird - wild" if subject == "bird-wild" else subject
-        vector = np.zeros(len(SPECIES) + len(ROUTES) + len(MEASUREMENTS), dtype=np.float32)
-        vector[SPECIES.index(subject)] = 1.0
-        vector[len(SPECIES) + ROUTES.index(metadata.route)] = 1.0
-        vector[len(SPECIES) + len(ROUTES) + MEASUREMENTS.index(metadata.measurement)] = 1.0
+    for task, part in zip(task_names, parts):
+        if not extend_vocabulary:
+            parse_toxacute_task_name(task)  # retain legacy task validation
+        vector = np.zeros(sum(map(len, vocab)), dtype=np.float32)
+        offset = 0
+        for category, value in zip(vocab, part):
+            vector[offset + category.index(value)] = 1.0
+            offset += len(category)
         rows.append(vector)
     matrix = np.stack(rows)
-    schema = {"species": list(SPECIES), "routes": list(ROUTES), "measurements": list(MEASUREMENTS)}
+    schema = dict(zip(("species", "routes", "measurements"), vocab))
     schema["schema_hash"] = canonical_sha256(schema)
     return matrix, schema
 
@@ -103,14 +113,23 @@ class ToxACoLNet(nn.Module):
 
     def __init__(self, adjacency: np.ndarray, endpoint_features: np.ndarray, *, dropout: float = 0.1):
         super().__init__()
+        adjacency = np.asarray(adjacency)
+        endpoint_features = np.asarray(endpoint_features)
+        if (endpoint_features.ndim != 2 or min(endpoint_features.shape) < 1
+                or adjacency.shape != (len(endpoint_features), len(endpoint_features))
+                or not np.isfinite(adjacency).all() or not np.isfinite(endpoint_features).all()
+                or not np.allclose(adjacency, adjacency.T, rtol=0, atol=1e-7)
+                or np.any(adjacency < 0) or np.any(np.diag(adjacency) <= 0)):
+            raise ValueError("invalid task adjacency/endpoint features")
+        num_tasks, feature_width = endpoint_features.shape
         dimensions = (1024, 768, 512, 384, 64)
-        task_dimensions = (26, 768, 512, 384, 64)
+        task_dimensions = (feature_width, 768, 512, 384, 64)
         self.register_buffer("adjacency", torch.as_tensor(adjacency, dtype=torch.float32))
         self.register_buffer("endpoint_features", torch.as_tensor(endpoint_features, dtype=torch.float32))
         self.dnn = nn.ModuleList(FCL(dimensions[i], dimensions[i + 1], dropout) for i in range(4))
         self.gcn = nn.ModuleList(GCNLayer(task_dimensions[i], task_dimensions[i + 1]) for i in range(4))
-        self.correlation = nn.ModuleList(CorrelationLayer(59, dimensions[i + 1]) for i in range(4))
-        self.tail_weight = nn.Parameter(0.1 * torch.rand(64, 59))
+        self.correlation = nn.ModuleList(CorrelationLayer(num_tasks, dimensions[i + 1]) for i in range(4))
+        self.tail_weight = nn.Parameter(0.1 * torch.rand(64, num_tasks))
 
     def forward(self, fingerprints):
         molecule = fingerprints
