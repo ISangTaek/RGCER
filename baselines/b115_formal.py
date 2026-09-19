@@ -163,5 +163,24 @@ def screen_selection(root,campaign):
 
 def verify_selection(root,campaign):
     current=screen_selection(root,campaign)
-    if read_json(Path(root)/'selection.json')!=current: raise ValueError('selection changed or stale')
+    saved=read_json(Path(root)/'selection.json')
+    if ({k:v for k,v in saved.items() if k!='screen'} !=
+            {k:v for k,v in current.items() if k!='screen'}
+            or len(saved['screen'])!=len(current['screen'])
+            or not all(same_verified_job(a,b) for a,b in zip(saved['screen'],current['screen']))):
+        raise ValueError('selection changed or stale')
     return current
+
+
+def same_verified_job(saved,current):
+    """Compare identities/results exactly, not the diagnostic CPU replay residual.
+
+    Callers must obtain current from verify_job, which checks the actual arrays
+    with the frozen allclose tolerance. A small residual is not itself a PASS.
+    """
+    for value in (saved,current):
+        residual=value.get('replay_max_abs')
+        if type(residual) not in (int,float) or not math.isfinite(residual) or residual<0:
+            return False
+    return ({k:v for k,v in saved.items() if k!='replay_max_abs'} ==
+            {k:v for k,v in current.items() if k!='replay_max_abs'})

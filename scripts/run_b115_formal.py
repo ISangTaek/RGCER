@@ -15,7 +15,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import torch
 from baselines.b115_formal import (TASK_ID,MULTIPLIERS,sha,code_identity,check_checkout,
-    read_campaign,job_id,load_route,verify_job,screen_selection,verify_selection)
+    read_campaign,job_id,load_route,verify_job,screen_selection,verify_selection,same_verified_job)
 from baselines.b115_training import train_engine,configuration,save_json
 from baselines.features import avalon_matrix
 
@@ -129,7 +129,7 @@ def main():
         loaded_by_route={r:load_route(campaign,r) for r in ('A','B')}
         for row in final['runs']:
             phase='screen' if row['seed']==42 else 'replicate'
-            if verify_job(root,campaign,phase,row['route'],row['seed'],row['trial'],loaded_by_route[row['route']])!=row:
+            if not same_verified_job(row,verify_job(root,campaign,phase,row['route'],row['seed'],row['trial'],loaded_by_route[row['route']])):
                 raise ValueError('content changed after final verification')
             folder=root/row['job_id'];train=folder/'training'
             if sha(train/'run.json')!=row['run_sha256']:raise ValueError('run changed after finalize')

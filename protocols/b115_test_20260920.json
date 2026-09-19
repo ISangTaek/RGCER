@@ -1,0 +1,184 @@
+{
+  "task_id": "V5_B115_TEST_20260920",
+  "training_commit": "195c6334ed1a8887692c9929ce611980689d9621",
+  "source_archive_sha256": "5c5a8e413d78e6cc23a28e5a47cf2ce67cb2d4ebe12dbeea0aef32ba5b7c0dee",
+  "campaign_sha256": "c7f407bf0176b6d7a30b9932142756daf6bb4f194745293c7cdfaadeb5aa02ea",
+  "selected": {
+    "A": 2,
+    "B": 0
+  },
+  "jobs": [
+    {
+      "job_id": "screen_A_t2_s42",
+      "route": "A",
+      "seed": 42,
+      "trial": 2,
+      "best_epoch": 36,
+      "validation_macro_rmse": 1.0165635546635605,
+      "files": {
+        "training/resolved.json": "7b841c78bc93b82a2cb84239101926526a48fe29058ffcff1abfa898729ebcc4",
+        "training/run.json": "b776b976a607a3591ea7a73bacfc7436bc66adf94dec90676647b5978d3831c2",
+        "training/epoch_036.pt": "ec66b6c682e5a25024034a4a96bf29b7010e29f942e06fdce8f6f38c65c4838e",
+        "training/validation_036.npy": "28567d62c28b99d9efddfd51e3f1e90e856935d7b7d91a403b6af018d3572e13",
+        "validation_truth.npz": "b353bbe5200107ebebce814ce0b1e88bba3f03a5adaaec7a6151855199c33929"
+      }
+    },
+    {
+      "job_id": "screen_B_t0_s42",
+      "route": "B",
+      "seed": 42,
+      "trial": 0,
+      "best_epoch": 68,
+      "validation_macro_rmse": 1.016042482150872,
+      "files": {
+        "training/resolved.json": "afde957df1dc2241b5d106f67e091d8d6902b2f9e297e22dd5c54118c6248f43",
+        "training/run.json": "82498924e576b578c5c8ef9e2d0f0eb16e3b0f025865c34c1258408f384a7126",
+        "training/epoch_068.pt": "428a57019eae2520294863de4a8b700c2f7ce4debeab41d915d678eb9a099a1a",
+        "training/validation_068.npy": "b4858f0571efbdfdb62178fd08e86ba9645ff8897607130c02d011f7db0e57a6",
+        "validation_truth.npz": "af584d668a91ed2b0f8e695bc56698817dd0583068db62c2a091af389d81d387"
+      }
+    },
+    {
+      "job_id": "replicate_A_s43",
+      "route": "A",
+      "seed": 43,
+      "trial": 2,
+      "best_epoch": 35,
+      "validation_macro_rmse": 1.0170349674189603,
+      "files": {
+        "training/resolved.json": "1bff0a767171b899b598c0a207f0c63c375af07f271e745247087e4ea8e945a9",
+        "training/run.json": "dada9d756b76b48991ba6a74b62cbcdbec9d59412510d30473a333f2bc061948",
+        "training/epoch_035.pt": "cc4c16a30c79777c091294f4255c9d23c8c28b6eefa081cf4f9256b254d07fa7",
+        "training/validation_035.npy": "b00a70b23ea1a8da11afd786ff60a8f70eef15c2279dfdd23c87032749a23e9f",
+        "validation_truth.npz": "b353bbe5200107ebebce814ce0b1e88bba3f03a5adaaec7a6151855199c33929"
+      }
+    },
+    {
+      "job_id": "replicate_A_s44",
+      "route": "A",
+      "seed": 44,
+      "trial": 2,
+      "best_epoch": 11,
+      "validation_macro_rmse": 1.081332009107838,
+      "files": {
+        "training/resolved.json": "1d8ed8d9a9df154d6ff11a89b4c14bfc198acde5b7e9c0eb159b796b53b12891",
+        "training/run.json": "e3e9b7e256eef05b6b2ca6ab3e4379e5db6c8551a90a2edda90d8472614b996a",
+        "training/epoch_011.pt": "e676319be6837179af0e865876f66b91f23b769c93b8ea27b2d18f6716b4401e",
+        "training/validation_011.npy": "233c410932a843db6e37dec1a012c64b6f46d7277bdac3c93b17d4fb3ca2018e",
+        "validation_truth.npz": "b353bbe5200107ebebce814ce0b1e88bba3f03a5adaaec7a6151855199c33929"
+      }
+    },
+    {
+      "job_id": "replicate_A_s45",
+      "route": "A",
+      "seed": 45,
+      "trial": 2,
+      "best_epoch": 33,
+      "validation_macro_rmse": 1.0452052687259212,
+      "files": {
+        "training/resolved.json": "fc086ddd991a81074206a7547ca004cc0ca4711a9db5ed6343a96b95abca2255",
+        "training/run.json": "edb0832499cf4afa5f83ba91ee25f727e68fbbbd9715dc529a145ea61b2fc86d",
+        "training/epoch_033.pt": "c721b4928dd50f8e28dc3d9af9e4cb80745f341c82aa22a71ca5608330a4709c",
+        "training/validation_033.npy": "6c436d4e8dc639802d694c43857ce87275e54768ea97d40506b6c5e15ddea21c",
+        "validation_truth.npz": "b353bbe5200107ebebce814ce0b1e88bba3f03a5adaaec7a6151855199c33929"
+      }
+    },
+    {
+      "job_id": "replicate_A_s46",
+      "route": "A",
+      "seed": 46,
+      "trial": 2,
+      "best_epoch": 9,
+      "validation_macro_rmse": 1.0402969532411008,
+      "files": {
+        "training/resolved.json": "a0c6b0b0307f3098649b925f57ac086a2f578c8a29c93e9e17744739ca02f895",
+        "training/run.json": "420cdb3f944e613e127eaf40d1b96ebe7bfcb558831d1d6ae4a3d31e2bce38f6",
+        "training/epoch_009.pt": "2878a9026684dfe38857094de9719e360879e578c17062957bd6be2d47c81327",
+        "training/validation_009.npy": "97ef78c4f2902c9cb2c573472e36cff7892d681eb2964bca8440cc3d6212f599",
+        "validation_truth.npz": "b353bbe5200107ebebce814ce0b1e88bba3f03a5adaaec7a6151855199c33929"
+      }
+    },
+    {
+      "job_id": "replicate_B_s43",
+      "route": "B",
+      "seed": 43,
+      "trial": 0,
+      "best_epoch": 46,
+      "validation_macro_rmse": 1.1094797681228212,
+      "files": {
+        "training/resolved.json": "908c59353c7e313f2f30c88fec21a3d085a06468b3a0fb12af4000eb7946ff74",
+        "training/run.json": "c0c9fd0d30e221c3e2eaa875580f3fa7f5779936519b2cc79f32057a90011147",
+        "training/epoch_046.pt": "69b62ada9bb461e560b0db90d4aa14c176c1c42f1a736ef2cb147193a569328d",
+        "training/validation_046.npy": "ac4608f0e0271b16237d3e4110eb10b3f39f1d98054b8abb04a512bb92f7fda7",
+        "validation_truth.npz": "af584d668a91ed2b0f8e695bc56698817dd0583068db62c2a091af389d81d387"
+      }
+    },
+    {
+      "job_id": "replicate_B_s44",
+      "route": "B",
+      "seed": 44,
+      "trial": 0,
+      "best_epoch": 46,
+      "validation_macro_rmse": 1.112625682316382,
+      "files": {
+        "training/resolved.json": "f2b00258451683374bd56a50eff07781707a57a703e172a7e36cff12bcf88f6d",
+        "training/run.json": "9a764795c34cc1b3266c4c083f2c9de2aa4fa7ada4b2410045844df8f03a99ea",
+        "training/epoch_046.pt": "d235da1c825deee80822999cc8c05deae87320c648d7e2869d098c2882b275d0",
+        "training/validation_046.npy": "4f92dea03fd4a546de0375a5dc77907633d413bd0e4c623f587b5f0936709373",
+        "validation_truth.npz": "af584d668a91ed2b0f8e695bc56698817dd0583068db62c2a091af389d81d387"
+      }
+    },
+    {
+      "job_id": "replicate_B_s45",
+      "route": "B",
+      "seed": 45,
+      "trial": 0,
+      "best_epoch": 65,
+      "validation_macro_rmse": 1.1221497779880953,
+      "files": {
+        "training/resolved.json": "b677f5b92d3df8c0bf146ea32ab1f8225fe14442639f07f6cf7d78dbf48ab7d8",
+        "training/run.json": "9859322088eae421aea7185ff4e1b485e97cfa15cb107cb588007976d1df935d",
+        "training/epoch_065.pt": "9f363ca023655c2ac8212a092b1d64f90fa233f4a35a2222435613766491eca2",
+        "training/validation_065.npy": "c2a0379dacafabefd34212821bbf7dda03a34f5eeece7a9ebcba8a1dd9a1d7bc",
+        "validation_truth.npz": "af584d668a91ed2b0f8e695bc56698817dd0583068db62c2a091af389d81d387"
+      }
+    },
+    {
+      "job_id": "replicate_B_s46",
+      "route": "B",
+      "seed": 46,
+      "trial": 0,
+      "best_epoch": 17,
+      "validation_macro_rmse": 1.155543894408816,
+      "files": {
+        "training/resolved.json": "40da85931277a2396f1a8517eb076f5b52ee1ebaba4469652c6e32cf7127dc2c",
+        "training/run.json": "3aeb7f789d48d6b39eebb4793ebcc6262cde8a6508b39a38e22bc0a1d77a31f6",
+        "training/epoch_017.pt": "ca3b8bd44c6f4710eb5d99b9198cc86f159bab5e9f5586d5ffbc823914b3f59f",
+        "training/validation_017.npy": "62d43bcac36480ba06d364a0c98a8f3b8e629852c5b3cdf075164c185b327737",
+        "validation_truth.npz": "af584d668a91ed2b0f8e695bc56698817dd0583068db62c2a091af389d81d387"
+      }
+    }
+  ],
+  "inputs": {
+    "csv_path": "2119b3641edc8fc7577f7efbaa4c283aad47bef418f06e50bd26ad64e6a18716",
+    "split_path": "9caffcebed884840ad1817da5413cb1704a306c26ebdcf0f41235faf3cb0dd32",
+    "tox_manifest": "825c9f4ffc13aeefcaa204bd2fba854c76d6e66db36e821b72a746248b23ae14"
+  },
+  "implementation": {
+    "baselines/b115_training.py": "624054a5fffe63ab71ebb2e0f0711b3f363aeee4cea548ba9ceff3ad39721129",
+    "baselines/b115_data.py": "0866987584e06f8692e1d6ae1ab2231c3c7dd1f14e66fe2d8705f9511b436cb7",
+    "baselines/models/toxacol.py": "2b69d8f532ebc4edd146ae786f7930e50dc04172315f59a966d8c6e65eb6f26c",
+    "baselines/scaling.py": "e1330eeb6a04f75e4051eb3f0e3c68e6f47281740d2a3007d60205fe9fe77107",
+    "baselines/metrics.py": "b073a9e30f45dfaccc6370d0342cb1a693bf7827a40594cc9e5c96ca57ae3518",
+    "baselines/features.py": "6fada5c53e0ca2df500d9bbfa2f543844f4c97be10804bc50efebca1c3c3b315",
+    "dataset115_adapter.py": "3237546a0121d417fa51310b02c68ece42809278b37a92166e7adc5e7abf1baf",
+    "dataset115_contract.py": "50cea61891d35fb17d06f7ef1cdc9cd0d3e465f1d7bb1fc98b97454cba1aff40",
+    "scripts/smoke_b115.py": "3d85ba2b70908e8a15c5557bc4b6c500830fccb97463d6e330545d3d3c7a8ac2",
+    "scripts/verify_b115_smoke.py": "3cf51a8b97f7501c8d16b4c639ab29da9ced4cb522f711bdd21e5496dc942b23"
+  },
+  "mode": "single_validation_best",
+  "max_jobs": 10,
+  "retrain": false,
+  "calibration": false,
+  "ensemble": false
+}

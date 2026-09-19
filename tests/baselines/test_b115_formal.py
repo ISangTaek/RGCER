@@ -9,6 +9,28 @@ from baselines.b115_training import configuration,LUT,validation_metrics
 from baselines.models.toxacol import toxacol_learning_rate
 
 
+def test_replay_diagnostic_not_selection_identity(tmp_path,monkeypatch):
+    import copy
+    import baselines.b115_formal as m
+    saved={'task_id':'fixed','selected':{'A':2,'B':0},'screen':[
+        {'macro_rmse':1.0,'best_checkpoint_sha256':'a'*64,'replay_max_abs':1e-6}]}
+    current=copy.deepcopy(saved);current['screen'][0]['replay_max_abs']=1.8e-6
+    (tmp_path/'selection.json').write_text(json.dumps(saved))
+    monkeypatch.setattr(m,'screen_selection',lambda *args:current)
+    assert m.verify_selection(tmp_path,{})==current
+    current['screen'][0]['macro_rmse']+=1e-12
+    with pytest.raises(ValueError):m.verify_selection(tmp_path,{})
+
+
+@pytest.mark.parametrize('field,value',[('best_checkpoint_sha256','changed'),('assets',[]),
+    ('replay_max_abs',None),('replay_max_abs',True),('replay_max_abs',-1.),
+    ('replay_max_abs',float('nan')),('replay_max_abs',float('inf'))])
+def test_stable_result_or_invalid_diagnostic_rejected(field,value):
+    from baselines.b115_formal import same_verified_job
+    old=dict(best_checkpoint_sha256='a'*64,replay_max_abs=1e-6)
+    assert not same_verified_job(old,{**old,field:value})
+
+
 def test_matrix_and_tie():
     assert choose({0:1.,1:1.,2:2.})==0
     assert choose({0:2.,1:1.,2:3.})==1
