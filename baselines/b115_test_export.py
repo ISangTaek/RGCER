@@ -86,6 +86,9 @@ def metrics(truth,prediction):
     if truth.shape!=prediction.shape or not np.isfinite(prediction).all():
         raise ValueError('wrong shape/nonfinite prediction')
     result=regression_metrics(truth,prediction,PRIMARY)
+    # The shared API carries a legacy Human3 validation label, not test scope.
+    result.pop('selection_metric')
+    result['primary_metric']='human5_macro_rmse'
     if result['macro_rmse'] is None:raise ValueError('undefined primary macro')
     direct=[float(np.sqrt(np.mean((prediction[np.isfinite(truth[:,j]),j]-truth[np.isfinite(truth[:,j]),j])**2))) for j in range(5)]
     np.testing.assert_allclose(result['macro_rmse'],np.mean(direct),rtol=1e-12,atol=1e-12)

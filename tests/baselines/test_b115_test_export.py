@@ -81,6 +81,8 @@ def test_full_synthetic_export_verify_package(flow):
     result=m.run('test','unused',flow,{})
     (flow/'execution.json').write_text('{}')
     assert len(result['runs'])==10
+    assert result['runs'][0]['metrics']['primary_metric']=='human5_macro_rmse'
+    assert 'selection_metric' not in result['runs'][0]['metrics']
     assert m.run('verify','unused',flow,{})==result
     archive=m.package(flow)
     assert m.sha(archive)==open(archive+'.sha256').read().split()[0]
