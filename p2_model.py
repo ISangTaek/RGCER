@@ -83,7 +83,7 @@ class P2Optimization:
         self.check()
         return dict(method=self.method,epoch=self.epoch,optimizer=deepcopy(self.optimizer.state_dict()))
 
-    def restore(self,snapshot):
+    def restore(self,snapshot,*,allow_partial_epoch=False):
         """Optimizer-only restore; caller must restore and verify model/RNG too."""
         require(self.epoch is None and not self.optimizer.state,'restore only into fresh controller')
         require(set(snapshot)=={'method','epoch','optimizer'} and snapshot['method']==self.method,'restore identity')
@@ -93,7 +93,9 @@ class P2Optimization:
         ids=[i for g in self.groups for i in g['params']]
         parameters=[p for _,p in self.backbone+self.heads]
         require(set(state['state']).issubset(ids),'unknown optimizer parameter')
-        require(set(self.groups[1]['params']).issubset(state['state']),'missing completed-epoch head Adam state')
+        require(type(allow_partial_epoch) is bool,'partial-epoch flag')
+        if not allow_partial_epoch:
+            require(set(self.groups[1]['params']).issubset(state['state']),'missing completed-epoch head Adam state')
         for pid,item in state['state'].items():
             require(type(pid) is int and set(item)=={'step','exp_avg','exp_avg_sq'},'Adam state schema')
             p=parameters[ids.index(pid)]
