@@ -3,11 +3,13 @@ from types import SimpleNamespace
 import hashlib
 import json
 import torch
+import pytest
 from tests.test_p2_engine import View, Model
 from tests.test_p2_execution import release
 
 
-def test_smoke_orchestration_cpu_double(tmp_path,monkeypatch):
+@pytest.mark.parametrize('stage',['SMOKE','FORMAL'])
+def test_smoke_orchestration_cpu_double(tmp_path,monkeypatch,stage):
     import scripts.run_p2_smoke as runner
     import p2_data,p2_engine,p2_model
     class Data:
@@ -36,7 +38,11 @@ def test_smoke_orchestration_cpu_double(tmp_path,monkeypatch):
     monkeypatch.setattr(p2_model,'build_model',build)
     monkeypatch.setattr(p2_engine,'P2Engine',cpu_engine)
     monkeypatch.setattr(runner,'sys',SimpleNamespace(platform='linux',version='synthetic'))
-    monkeypatch.setattr(runner,'load_release',lambda *args:release())
+    r=release()
+    if stage=='FORMAL':
+        from p2_contract import run_matrix
+        r.update(stage='FORMAL',updates_max=23200,runs=run_matrix())
+    monkeypatch.setattr(runner,'load_release',lambda *args:r)
     monkeypatch.setattr(runner,'load_contract',lambda *args:(None,None))
     def git(repo,*args):
         if args==('rev-parse','HEAD'):return 'a'*40
@@ -48,33 +54,37 @@ def test_smoke_orchestration_cpu_double(tmp_path,monkeypatch):
                        ('is_current_stream_capturing',False),('max_memory_allocated',0),('empty_cache',None),('reset_peak_memory_stats',None)]:
         monkeypatch.setattr(torch.cuda,name,lambda *args,v=value:v)
     args=['run_p2_smoke']
+    if stage=='FORMAL':args.extend(['--panel','mouse','--route','oral'])
     for key,value in dict(authorization='x',authorization_sha='b'*64,approval='x',protocol='x',members='x',datastore='x',output=str(tmp_path/'output')).items():
         args.extend(['--'+key.replace('_','-'),value])
     import sys
     monkeypatch.setattr(sys,'argv',args)
     deterministic=torch.are_deterministic_algorithms_enabled()
-    try:runner.main()
+    try:runner.main(stage)
     finally:torch.use_deterministic_algorithms(deterministic)
     root=tmp_path/'output'
     summary=json.loads((root/'summary.json').read_text())
-    assert summary['updates']==112 and len(summary['runs'])==7
-    assert summary['runs'][-1]['resume']['updates']==30
-    assert len(list(root.glob('*/epoch_*.json')))==18
+    assert summary['updates']==(112 if stage=='SMOKE' else 5800)
+    assert len(summary['runs'])==(7 if stage=='SMOKE' else 20)
+    if stage=='SMOKE':assert summary['runs'][-1]['resume']['updates']==30
+    else:assert all(x['resume'] is None and x['epochs']==40 for x in summary['runs'])
+    assert len(list(root.glob('*/epoch_*.json')))==(18 if stage=='SMOKE' else 800)
     checksums=json.loads((root/'checksums.json').read_text())
     assert all(hashlib.sha256((root/p).read_bytes()).hexdigest()==sha for p,sha in checksums.items())
     import scripts.verify_p2_smoke as verifier
     monkeypatch.setattr(verifier,'build_model',build)
     monkeypatch.setattr(verifier,'P2Engine',cpu_engine)
-    assert verifier.verify(root,release(),'b'*64,Data())['content_status']=='PASS'
+    partition={} if stage=='SMOKE' else dict(panel='mouse',route='oral')
+    assert verifier.verify(root,r,'b'*64,Data(),**partition)['content_status']=='PASS'
     # Re-hashing a scientifically wrong export must not make it valid.
-    name='P2SMOKE_FROZEN/epoch_00.json'
+    name=('P2SMOKE_FROZEN' if stage=='SMOKE' else 'P2_mouse_oral_s42_FROZEN')+'/epoch_00.json'
     path=root/name;value=json.loads(path.read_text());value['validation_rows'][0]['label']+=1
     path.write_text(json.dumps(value),encoding='utf8')
     checksums[name]=hashlib.sha256(path.read_bytes()).hexdigest()
     (root/'checksums.json').write_text(json.dumps(checksums),encoding='utf8')
     import pytest
     from p2_contract import P2Error
-    with pytest.raises(P2Error):verifier.verify(root,release(),'b'*64,Data())
+    with pytest.raises(P2Error):verifier.verify(root,r,'b'*64,Data(),**partition)
     def failing_engine(*args,**kwargs):
         e=cpu_engine(*args,**kwargs)
         def fail():raise RuntimeError('synthetic step failure')
@@ -82,6 +92,6 @@ def test_smoke_orchestration_cpu_double(tmp_path,monkeypatch):
         return e
     monkeypatch.setattr(p2_engine,'P2Engine',failing_engine)
     args[-1]=str(tmp_path/'failed_output')
-    with pytest.raises(RuntimeError,match='synthetic step failure'):runner.main()
+    with pytest.raises(RuntimeError,match='synthetic step failure'):runner.main(stage)
     failure=json.loads((tmp_path/'failed_output'/'failure.json').read_text())
     assert failure['attempted_updates']==1 and failure['completed_runs']==0

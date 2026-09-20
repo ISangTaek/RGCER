@@ -1,10 +1,10 @@
-"""P2 smoke release identity and one independent validation audit."""
+"""P2 bounded release identity and one independent validation audit."""
 from pathlib import Path
 import hashlib
 import math
 import os
 import re
-from p2_contract import require, bound_json, PROTOCOL_SHA, MEMBERS_SHA, PANELS, ROUTES, METHODS
+from p2_contract import require, bound_json, PROTOCOL_SHA, MEMBERS_SHA, PANELS, ROUTES, METHODS, run_matrix
 from p2_data import digest
 
 APPROVAL_SHA='3c8143e31eb66cba3d4ed25003bdd2fa72b276429f552b312042bdddad409bdb'
@@ -21,19 +21,29 @@ def smoke_matrix():
     return rows
 
 
-def load_release(path,sha,approval):
+def load_release(path,sha,approval,stage='SMOKE'):
     a=bound_json(approval,APPROVAL_SHA)
     require(a['budget_status']=='APPROVED','budget not approved')
     r=bound_json(path,sha)
     require(set(r)=={'schema','stage','commit','protocol_sha256','members_sha256','approval_sha256',
                     'updates_max','runs','test_authorized','calibration_authorized','retry_authorized'},'release schema')
-    require(r['schema']=='p2_release_v1' and r['stage']=='SMOKE','only smoke release supported')
+    require(stage in ('SMOKE','FORMAL') and r['schema']=='p2_release_v1' and r['stage']==stage,'release stage')
     require(isinstance(r['commit'],str) and re.fullmatch('[0-9a-f]{40}',r['commit']),'release commit')
     require(r['protocol_sha256']==PROTOCOL_SHA and r['members_sha256']==MEMBERS_SHA and r['approval_sha256']==APPROVAL_SHA,'release inputs')
-    require(type(r['updates_max']) is int and r['updates_max']==112,'smoke budget')
-    require(digest(r['runs'])==digest(smoke_matrix()),'smoke matrix')
+    require(type(r['updates_max']) is int and r['updates_max']==(112 if stage=='SMOKE' else 23200),'release budget')
+    require(digest(r['runs'])==digest(smoke_matrix() if stage=='SMOKE' else run_matrix()),'release matrix')
     require(all(r[k] is False for k in ('test_authorized','calibration_authorized','retry_authorized')),'forbidden permissions')
     return r
+
+
+def selected_runs(release,panel=None,route=None):
+    if release['stage']=='SMOKE':
+        require(panel is None and route is None,'smoke cannot partition')
+        return release['runs']
+    require(panel in PANELS and route in ROUTES,'formal partition required')
+    rows=[r for r in release['runs'] if r['panel']==panel and r['route']==route]
+    require(len(rows)==20 and sum(r['updates'] for r in rows)==5800,'formal partition budget')
+    return rows
 
 
 def write_new(path,value):

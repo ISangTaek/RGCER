@@ -19,6 +19,27 @@ def test_matrix():
     assert all(r['seed']==42 for r in rows)
 
 
+def test_formal_partitions():
+    from p2_execution import selected_runs
+    from p2_contract import run_matrix
+    r=release();r.update(stage='FORMAL',runs=run_matrix(),updates_max=23200)
+    parts=[selected_runs(r,p,t) for p in ('mouse','rat') for t in ('oral','intraperitoneal')]
+    assert len({v['run_id'] for part in parts for v in part})==80
+    assert sum(v['updates'] for part in parts for v in part)==23200
+    with pytest.raises(P2Error):selected_runs(r)
+
+
+def test_formal_release(tmp_path,monkeypatch):
+    import p2_execution
+    from p2_contract import run_matrix
+    original=p2_execution.bound_json
+    monkeypatch.setattr(p2_execution,'bound_json',lambda p,s: {'budget_status':'APPROVED'} if p=='approval' else original(p,s))
+    r=release();r.update(stage='FORMAL',runs=run_matrix(),updates_max=23200)
+    path=tmp_path/'formal.json';sha=write_new(path,r)
+    assert load_release(path,sha,'approval','FORMAL')==r
+    with pytest.raises(P2Error):load_release(path,sha,'approval')
+
+
 @pytest.mark.parametrize('mutation',['nan','member','group','label','split','macro','mae','count','best','epoch'])
 def test_independent_audit_negative(mutation):
     from tests.test_p2_engine import engine
