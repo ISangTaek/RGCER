@@ -1,0 +1,77 @@
+{
+  "schema": "p1d_accepted_s3_reuse_v1",
+  "review_owner": "CODEX",
+  "review_date": "2026-09-20",
+  "source_archive_sha256": "234f3557c6f51bfeb082b8dc6785fbdfd2ad5101c841f09d6069d61447590003",
+  "source_request": "configs/p1d2_reuse_asset_request.json",
+  "setting": "ToxAcute",
+  "arm": "HF_low",
+  "decision": "REUSE_TRAINING_ASSET",
+  "execution_authorized": false,
+  "test_authorized": false,
+  "validation_predictions_replayed_in_this_review": false,
+  "runtime_requirements": [
+    "Verify exact file identities and effective configuration before use",
+    "Recompute validation predictions when importing the selected historical best",
+    "Never silently retrain when an accepted reused asset is missing or mismatched",
+    "Do not use initial_model.pt as the post-overlay training initialization"
+  ],
+  "initial_model_pt_role": "PRE_OVERLAY_SCRATCH_EVIDENCE_ONLY",
+  "selection_score_encoding": "best_val_score = negative validation Human3 macro RMSE",
+  "epochs": 40,
+  "updates_per_epoch": 6,
+  "total_updates": 240,
+  "freeze_epochs": 5,
+  "backbone_lr": 0.0001,
+  "head_lr": 0.001,
+  "runs": [
+    {
+      "run_id": "s3_e40_s42",
+      "seed": 42,
+      "condition": "SCREEN_ALWAYS_REUSE",
+      "relative_path": "artifacts/runs/d7/d7_stage_b/s3/d7_s3_e40/seed_42",
+      "best_epoch": 35,
+      "best_validation_macro_rmse": 1.0236153193378144,
+      "initial_training_tensor_sha256": "1f4064101f322afe37da660618280d0c5036c51ba38477ca42822aa5d230b527",
+      "training_init_path": "artifacts/inits/d7_stage_b/b1_init_seed42.pt",
+      "training_init_file_sha256": "a404da30c68fe783283770b10d40406290dfa25896e8b1d10535b6e6604189f1",
+      "weight_sha256": {
+        "graphormer_d7_s3_e40_seed42_best.pt": "c786a76600a22ba01d5c60c3ec36f6c93641783bcf514738919ede177e9c9d93",
+        "graphormer_d7_s3_e40_seed42_last.pt": "95e9b0ff9cc6e12ce0dbad10579bfe741fb27ffe2c2a4e728e2d3496b99b32cf",
+        "initial_model.pt": "cfbc2768beb41b0ae2e236f9bb1c90cda00280f9652efec723a071385bb695ba"
+      }
+    },
+    {
+      "run_id": "s3_e40_s44",
+      "seed": 44,
+      "condition": "ONLY_IF_TOXACUTE_HF_LOW_SELECTED",
+      "relative_path": "artifacts/runs/d7/d7_stage_b/s3/d7_s3_e40/seed_44",
+      "best_epoch": 1,
+      "best_validation_macro_rmse": 1.1429747992669987,
+      "initial_training_tensor_sha256": "e1bf8c5637973932107c7b76e7fa9ff407f7051faf3089fed6499d4d7975d535",
+      "training_init_path": "artifacts/inits/d7_stage_b/b1_init_seed44.pt",
+      "training_init_file_sha256": "d94a2b669ac3426e6de3dbb33bb64128c384cba92e08b45f1a4b2e7c7f4619f6",
+      "weight_sha256": {
+        "graphormer_d7_s3_e40_seed44_best.pt": "0fa4f92979c18c6782e1d7086684b212aeb7b8bf18e5ca7ad1fe592375d162ab",
+        "graphormer_d7_s3_e40_seed44_last.pt": "6c0972b9bd09dc8b180f5d93af6e7ee8d2fccd379b469c822a0d10d491c22fd7",
+        "initial_model.pt": "34981d0de4201c2828ff4c0afc11aaa2c588c1e67e3ad946172aae48393c864a"
+      }
+    },
+    {
+      "run_id": "s3_e40_s46",
+      "seed": 46,
+      "condition": "ONLY_IF_TOXACUTE_HF_LOW_SELECTED",
+      "relative_path": "artifacts/runs/d7/d7_stage_b/s3/d7_s3_e40/seed_46",
+      "best_epoch": 18,
+      "best_validation_macro_rmse": 1.0993251098652708,
+      "initial_training_tensor_sha256": "8d0386cc58f530171190506b4adcaa7b62311e9b672a93f8425a43b11bc8eaa9",
+      "training_init_path": "artifacts/inits/d7_stage_b/b1_init_seed46.pt",
+      "training_init_file_sha256": "b34c47a1b0326fa7b2e4766495564622822d4b50f5c513c26b438cd31dc9e6c0",
+      "weight_sha256": {
+        "graphormer_d7_s3_e40_seed46_best.pt": "36a22f306b75b8ebaa55841833561d76f7d30f3755bb0e248a517e57f50f461a",
+        "graphormer_d7_s3_e40_seed46_last.pt": "84cdfe5c83ec74a498074ec695f7966c885c36c78afcfc49591d1a4089204fd7",
+        "initial_model.pt": "731ac0f5afa044c22560721a13db3367202e336cf6c9c079cd127298b681fc25"
+      }
+    }
+  ]
+}
