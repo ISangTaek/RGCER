@@ -87,7 +87,7 @@ def _write_json(path, value):
 class RouteBTrainer:
     ROUTE = 'B'
 
-    def __init__(self, args, source, source_identity, train, validation, *, method, seed, config, device):
+    def __init__(self, args, source, source_identity, train, validation, *, method, seed, config, device, optimization=None):
         require(train.route == validation.route == self.ROUTE and train.role == validation.role == 'target', 'Route '+self.ROUTE+' target required')
         require(train.split == 'train' and validation.split == 'validation', 'train/validation only')
         require(train.input_identity == validation.input_identity, 'input identity')
@@ -113,6 +113,13 @@ class RouteBTrainer:
         self.initial_heads = state_digest(self.model.decoders.state_dict())
         self.optimizer = torch.optim.AdamW([p for p in self.model.parameters() if p.requires_grad],
             lr=config.learning_rate, weight_decay=config.weight_decay)
+        self.optimization = None
+        if optimization is not None:
+            from p1d_optimization import OptimizationControl
+            require(method == 'B1' and config.learning_rate == .001
+                    and config.weight_decay == 1e-5 and config.grad_clip == 1., 'P1D base configuration')
+            self.optimization = OptimizationControl(self.model, optimization)
+            self.optimizer = self.optimization.optimizer
         self.datasets = {split: {t: GraphTaskView(v, t) for t in PRIMARY}
                          for split, v in [('train', train), ('validation', validation)]}
         require(all(len(d) for ds in self.datasets.values() for d in ds.values()), 'empty task')
@@ -125,6 +132,8 @@ class RouteBTrainer:
             task_names=list(PRIMARY), selection='validation_primary5_macro_rmse_strict_min_first_tie',
             sampling='one_pass_shuffled_task_batches_proportional', tasks_per_update=1,
             loss='QuantileRegressionLoss_EW_single_active_task', torch_version=str(torch.__version__), device=device)
+        if self.optimization is not None:
+            self.identity['optimization'] = optimization.identity()
         self.identity_sha = semantic_digest(self.identity)
         self.history = []; self.best_state = None; self.best_rows = None; self.best_epoch = None
         self.total_steps = 0
@@ -182,6 +191,8 @@ class RouteBTrainer:
         require(all(torch.isfinite(v).all() for state in [p['model_state'],p['best_model_state']] for v in state.values()), 'resume finite weights')
         self.model.load_state_dict(p['model_state'], strict=True)
         if self.method == 'RPT': require(state_digest(self.model.encoder.state_dict()) == self.initial_encoder, 'resume frozen encoder')
+        if self.optimization is not None:
+            self.optimization.validate_optimizer_state(p['optimizer_state'], p['epoch'], p['model_state'])
         self.optimizer.load_state_dict(p['optimizer_state'])
         self.history = history; self.best_epoch = best; self.best_state = p['best_model_state']; self.best_rows = p['best_rows']
         self.total_steps = p['total_steps']
@@ -207,6 +218,8 @@ class RouteBTrainer:
         loss_fn = QuantileRegressionLoss(); checkpoints = []
         counts = {t:len(d) for t,d in self.datasets['train'].items()}
         for epoch in range(start, limit):
+            if self.optimization is not None:
+                self.optimization.begin_epoch(epoch)
             self.model.train(); losses = {t:[] for t in PRIMARY}; exposure = {t:0 for t in PRIMARY}
             max_norm = 0.0
             for t,indices in task_batches(counts, self.config.batch_size, self.seed, epoch):
@@ -217,6 +230,8 @@ class RouteBTrainer:
                 loss.backward()
                 norm = torch.nn.utils.clip_grad_norm_([p for p in self.model.parameters() if p.requires_grad], self.config.grad_clip, error_if_nonfinite=True)
                 if self.method == 'RPT': require(all(p.grad is None for p in self.model.encoder.parameters()), 'frozen gradient leak')
+                if self.optimization is not None:
+                    self.optimization.verify_frozen()
                 self.optimizer.step(); self.total_steps += 1
                 max_norm = max(max_norm, float(norm)); losses[t].append(float(loss.detach())); exposure[t] += len(indices)
             require(exposure == counts, 'training exposure differs')
@@ -227,6 +242,8 @@ class RouteBTrainer:
                 self.best_epoch = epoch; self.best_state = _cpu_state(self.model); self.best_rows = rows
             self.history.append(dict(epoch=epoch, total_steps=self.total_steps, exposure=exposure,
                 mean_batch_loss={t:float(np.mean(losses[t])) for t in PRIMARY}, max_grad_norm=max_norm, validation=metrics))
+            if self.optimization is not None:
+                self.history[-1]['optimization'] = self.optimization.record()
             _write_json(output/f'validation_epoch_{epoch:03d}.json', rows)
             state = _cpu_state(self.model)
             p = dict(identity=self.identity, identity_sha256=self.identity_sha, epoch=epoch,
