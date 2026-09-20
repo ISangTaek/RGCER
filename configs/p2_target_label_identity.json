@@ -1,0 +1,12 @@
+{
+  "train": {
+    "man_oral_TDLo": "2c1d0b3a0c34980974b427c1f35c4560be4ee16360178a735d7b6157531ae242",
+    "women_oral_TDLo": "b8bffbe5e697049b6bfd133729532669dd84b40c9bd11d33ad8bd3183a3a0837",
+    "human_oral_TDLo": "09f47ff7429903fa66f250e1219bc8a68c4e446a053fc19778d0e6e07fd53d0d"
+  },
+  "validation": {
+    "man_oral_TDLo": "cafe763d37feb5355ec6aa3832c8ec5e350a09f07a2384831e8e587e31d095ef",
+    "women_oral_TDLo": "6e0ca81870cd9f30d17caf6e7ccb4881b4fac7fbec18caab666106130ea96df2",
+    "human_oral_TDLo": "23646aaf6b3ec0656a23607cd50f83c8b71c21447d950ca20275a8be88889be0"
+  }
+}
