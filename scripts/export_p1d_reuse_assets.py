@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -11,15 +12,38 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.collect_p1d_reuse import safe, sha, write_json
 
 
-def strict_json(raw):
+def _read_json(raw, *, legacy=False):
     def pairs(items):
         result={}
         for k,v in items:
             if k in result:raise ValueError('duplicate JSON key')
             result[k]=v
         return result
-    def bad(value):raise ValueError('nonfinite JSON')
-    return json.loads(raw,object_pairs_hook=pairs,parse_constant=bad)
+    def constant(value):
+        if not legacy:raise ValueError('nonfinite JSON')
+        return {'NaN':float('nan'),'Infinity':float('inf'),'-Infinity':-float('inf')}[value]
+    value=json.loads(raw,object_pairs_hook=pairs,parse_constant=constant)
+    if not legacy and nonfinite_locations(value):raise ValueError('nonfinite JSON number')
+    return value
+
+
+def strict_json(raw):
+    """New requests/manifests remain strict, including numeric overflow."""
+    return _read_json(raw)
+
+
+def nonfinite_locations(value, pointer=''):
+    """Evidence annotation only; never rewrite or repair the raw input."""
+    result=[]
+    if isinstance(value,float) and not math.isfinite(value):
+        token='NaN' if math.isnan(value) else ('Infinity' if value>0 else '-Infinity')
+        result.append(dict(json_pointer=pointer,token=token,value=None,reason='NONFINITE_IN_LEGACY_SOURCE'))
+    elif isinstance(value,dict):
+        for k,v in value.items():
+            result.extend(nonfinite_locations(v,pointer+'/'+k.replace('~','~0').replace('/','~1')))
+    elif isinstance(value,list):
+        for i,v in enumerate(value):result.extend(nonfinite_locations(v,pointer+'/'+str(i)))
+    return result
 
 
 def check_args(value):
@@ -41,7 +65,7 @@ def export(repo, output, request):
     if output.exists() or output==repo or repo.is_relative_to(output):raise ValueError('new output required')
     if request['schema']!='p1d2_reuse_assets_v1':raise ValueError('request schema')
     if [r['seed'] for r in request['runs']]!=[42,44,46]:raise ValueError('three-seed request required')
-    planned=[]
+    planned=[];legacy_diagnostics=[]
     for run in request['runs']:
         seed=run['seed'];expected=f'artifacts/runs/d7/d7_stage_b/s3/d7_s3_e40/seed_{seed}'
         if run['relative_path']!=expected or run['run_id']!=f's3_e40_s{seed}':raise ValueError('run scope')
@@ -50,8 +74,15 @@ def export(repo, output, request):
         for name,field in [('run_metadata.json','metadata_sha256'),('metrics.json','metrics_sha256'),('args.json','args_sha256')]:
             path=safe(repo,expected+'/'+name)
             if not path.is_file() or path.stat().st_size>16*1024*1024 or sha(path)!=run[field]:raise ValueError('061 metadata changed or missing: '+run['run_id']+'/'+name)
-            obj=strict_json(path.read_bytes())
-            if name=='args.json':check_args(obj)
+            # These exact legacy bytes were pinned by 061. This operation is
+            # evidence transport, not acceptance of their scientific metrics.
+            try:
+                obj=_read_json(path.read_bytes(),legacy=True)
+                if name=='args.json':check_args(obj)
+            except ValueError as exc:
+                raise ValueError(run['run_id']+'/'+name+': '+str(exc)) from exc
+            legacy_diagnostics.append(dict(run_id=run['run_id'],name=name,source_sha256=run[field],
+                                           nonfinite=nonfinite_locations(obj)))
             planned.append((run['run_id'],name,path,path.stat().st_size,run[field]))
         for weight in run['weights']:
             path=safe(repo,expected+'/'+weight['name'])
@@ -72,6 +103,7 @@ def export(repo, output, request):
                             expected_sha_source='061_metadata' if expected_sha else 'NEW_READ_ONLY_FILE_BINDING_NOT_REUSE_PASS'))
     write_json(output/'request.json',request)
     write_json(output/'manifest.json',dict(schema='p1d2_asset_export_v1',records=records,
+                legacy_json_diagnostics=legacy_diagnostics,
                 trained=False,deserialized=False,inference=False,acceptance_status='PENDING_CODEX_REVIEW'))
     with (output/'checksums.sha256').open('x',encoding='utf8') as f:
         f.write(''.join(sha(p)+'  '+p.relative_to(output).as_posix()+'\n' for p in sorted(output.rglob('*')) if p.is_file() and p.name!='checksums.sha256'))
@@ -86,11 +118,20 @@ def verify(output):
               [w['name'] for w in r['weights']]+['args.json','run_metadata.json','metrics.json']}
     records=manifest['records']
     if len(records)!=18 or len(expected)!=18 or {(r['run_id'],r['name']) for r in records}!=expected:raise ValueError('export matrix')
-    members={'manifest.json','request.json','checksums.sha256'}
+    members={'manifest.json','request.json','checksums.sha256'};legacy_diagnostics=[]
     for r in records:
         if r['member']!=f"files/{r['run_id']}/{r['name']}":raise ValueError('member identity')
         p=safe(output,r['member']);members.add(r['member'])
         if p.stat().st_size!=r['size'] or sha(p)!=r['sha256']:raise ValueError('member bytes')
+        if r['name'].endswith('.json'):
+            run=next(x for x in request['runs'] if x['run_id']==r['run_id'])
+            field={'args.json':'args_sha256','metrics.json':'metrics_sha256','run_metadata.json':'metadata_sha256'}[r['name']]
+            if r['sha256']!=run[field]:raise ValueError('legacy metadata changed from 061')
+            obj=_read_json(p.read_bytes(),legacy=True)
+            if r['name']=='args.json':check_args(obj)
+            legacy_diagnostics.append(dict(run_id=r['run_id'],name=r['name'],source_sha256=r['sha256'],
+                                           nonfinite=nonfinite_locations(obj)))
+    if manifest.get('legacy_json_diagnostics')!=legacy_diagnostics:raise ValueError('legacy diagnostics not independently reproducible')
     if {p.relative_to(output).as_posix() for p in output.rglob('*') if p.is_file()}!=members:raise ValueError('extra/missing export member')
     listed=[]
     for line in (output/'checksums.sha256').read_text(encoding='utf8').splitlines():

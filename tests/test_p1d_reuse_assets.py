@@ -70,3 +70,32 @@ def test_pack_outside_and_no_self_zip(tmp_path):
     assert Path(str(dest)+'.sha256').read_text().startswith(sha(dest))
     (work/'server/old.zip').write_bytes(b'old')
     with pytest.raises(ValueError,match='nested'):package(work,tmp_path/'blocked.zip')
+
+
+@pytest.mark.parametrize('literal',['NaN','Infinity','-Infinity','1e999'])
+def test_legacy_nonfinite_preserved_while_new_json_strict(tmp_path,literal):
+    from scripts.export_p1d_reuse_assets import strict_json
+    repo,req=fixture(tmp_path);row=req['runs'][0];path=repo/row['relative_path']/'metrics.json'
+    raw=('{"history":[{"validation":{"routing":{"task":{"x":'+literal+'}}}}]}').encode()
+    path.write_bytes(raw);row['metrics_sha256']=sha(path)
+    out=tmp_path/'out';export(repo,out,req)
+    copied=out/'files'/row['run_id']/'metrics.json'
+    assert copied.read_bytes()==raw
+    m=verify(out);item=next(x for x in m['legacy_json_diagnostics'] if x['run_id']==row['run_id'] and x['name']=='metrics.json')
+    assert item['nonfinite'][0]['json_pointer']=='/history/0/validation/routing/task/x'
+    assert item['nonfinite'][0]['value'] is None
+    with pytest.raises(ValueError,match='nonfinite'):strict_json(raw)
+    strict_json((out/'manifest.json').read_bytes())
+
+
+def test_legacy_duplicates_still_rejected_with_filename(tmp_path):
+    repo,req=fixture(tmp_path);row=req['runs'][0];p=repo/row['relative_path']/'metrics.json'
+    p.write_text('{"x":NaN,"x":0}');row['metrics_sha256']=sha(p)
+    with pytest.raises(ValueError,match='s3_e40_s42/metrics.json: duplicate'):
+        export(repo,tmp_path/'out',req)
+
+
+def test_diagnostics_recomputed_not_trusted(tmp_path):
+    repo,req=fixture(tmp_path);out=tmp_path/'out';export(repo,out,req)
+    p=out/'manifest.json';m=json.loads(p.read_text());m['legacy_json_diagnostics']=[];p.write_text(json.dumps(m))
+    with pytest.raises(ValueError,match='independently reproducible'):verify(out)
