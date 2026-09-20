@@ -195,6 +195,8 @@ def _verify_optimization(output, trainer):
         receipt = read_json(Path(output)/f'epoch_{epoch:03d}.receipt.json')
         require(hashlib.sha256(raw).hexdigest() == receipt['sha256'], 'optimization checkpoint SHA')
         payload = torch.load(io.BytesIO(raw), map_location='cpu', weights_only=True)
+        _exact(payload['epoch'], epoch, 'checkpoint epoch')
+        _exact(payload['identity'], trainer.identity, 'checkpoint identity')
         opt = payload['optimizer_state']
         control.validate_optimizer_state(opt, epoch, payload['model_state'])
         head_steps = {}

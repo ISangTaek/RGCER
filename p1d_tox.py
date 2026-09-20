@@ -52,7 +52,7 @@ class ToxFactory:
         self.repo=Path(repo).resolve();self.contract=deepcopy(contract);self.device=device
         require(device in ('cpu','cuda:0'), 'device')
         c=self.contract; a=c['args']
-        require(a['seed']==42 and type(a['seed']) is int and a['arch']=='Graphormer', 'Tox seed/architecture')
+        require(type(a['seed']) is int and a['seed'] in range(42,47) and a['arch']=='Graphormer', 'Tox seed/architecture')
         for key,value in dict(epochs=40,bs=64,lr=.001,weight_decay=1e-5,grad_clip=1,
                               optim='adamw',weighting='EW',task_sampling='proportional',
                               train_eval_scope='validation_only',fit_conformal=False,
@@ -70,7 +70,7 @@ class ToxFactory:
         require(all(isinstance(v,torch.Tensor) and torch.isfinite(v).all() for v in self.initial.values()),'init tensors')
         wrapper=DataloaderWrapper(task_list=list(TASKS),data_store=self.store,batch_size=64,
             splitting='scaffold',valid_size=.1,calibration_size=.1,test_size=.1,
-            num_workers=0,split_seed=42,max_nodes_filter=512,loader_seed=42,
+            num_workers=0,split_seed=42,max_nodes_filter=512,loader_seed=a['seed'],
             collate_fn_for_loader=DataCollator(spatial_pos_max_clip=20,max_node_filter=None))
         # Do not call get_data_loaders(), which constructs all four split views.
         self.datasets={split:{t:ToxAcuteTaskDataset(self.store,t,split=split,max_nodes=512)
@@ -94,7 +94,8 @@ class ToxFactory:
                  datastore_metadata=self.store.metadata,datastore_context=self.store.context,
                  data_store_dir=str(self.store.root))
         params=SimpleNamespace(**a)
-        seed_everything(42)
+        require(type(a['seed']) is int and a['seed'] in range(42,47),'Tox seed')
+        seed_everything(a['seed'])
         kw,optim=prepare_args(params)
         enc,arch,heads=_build_model_components(params,list(TASKS),torch.device(self.device))
         trainer=Trainer(build_task_dict(params,list(TASKS)),weighting.EW,arch,enc,heads,
@@ -106,7 +107,7 @@ class ToxFactory:
         require(trainer.initial_model_sha256==self.contract['initial_full_model_digest'],'Tox actual training init')
         # Reset each independent train-loader generator before the inherited fit.
         from reproducibility import reseed_train_loaders
-        reseed_train_loaders(self.loaders['train'],42,0)
+        reseed_train_loaders(self.loaders['train'],a['seed'],0)
         trainer._fit_task_scalers(self.loaders['train'])
         require({t:s['count'] for t,s in trainer.task_scalers.items()}==self.contract['counts']['train'], 'scaler population')
         trainer.optimization=None
@@ -123,7 +124,7 @@ class ToxFactory:
         return batch.to(self.device)
 
     def identity(self):
-        return dict(setting='ToxAcute',seed=42,contract=self.contract,
+        return dict(setting='ToxAcute',seed=self.contract['args']['seed'],contract=self.contract,
                     batch_policy='first_two_train_records_per_task_in_fixed_view',
                     tasks=list(TASKS),test_accessed=False,calibration_accessed=False)
 
@@ -188,6 +189,7 @@ def validate_replay_rows(factory,rows):
     require(len(keys)==len(set(keys)) and set(keys)==set(expected),'replay population')
     for r in rows:
         require(r['split']=='validation' and r['label']==expected[(r['task'],r['sample_id'])]
+                and type(r['label']) in (int,float) and math.isfinite(r['label'])
                 and type(r['prediction']) in (int,float) and math.isfinite(r['prediction']),'replay raw identity')
     metrics={t:dict(n=sum(r['task']==t for r in rows),
                    rmse=math.sqrt(math.fsum((r['prediction']-r['label'])**2 for r in rows if r['task']==t)/factory.contract['counts']['validation'][t])) for t in TASKS}
