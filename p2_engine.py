@@ -114,6 +114,7 @@ class P2Engine:
                         frozen=epoch<self.control.warmup,backbone_lr=self.control.backbone_lr,head_lr=.001)
             if self.method!='SOURCE':
                 rows,score=self.evaluate();record['validation']=score
+                record['validation_rows']=rows
                 if self.best_epoch is None or score['macro_rmse']<self.history[self.best_epoch]['validation']['macro_rmse']:
                     self.best_epoch=epoch;self.best_state=cpu_state(self.model);self.best_rows=rows
             self.history.append(record);self.epoch+=1;self.offset=0;self.running=[]

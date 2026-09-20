@@ -20,6 +20,8 @@ def build_model(role, seed, source_encoder=None):
         torch.random.default_generator.manual_seed(seed)
         decoders = nn.ModuleDict({t:TaskPredictionHead(96, mode='quantile',head_hidden_dim=96,dropout=.1) for t in tasks})
         model = Graphormer(list(tasks),Encoder,decoders,torch.device('cpu'),args)
+    # Legacy Encoder discards atoms_input_dropout_rate; enforce P2 locally.
+    model.encoder.backbone.input_dropout.p = 0.
     require(model.card is None, 'P2 forbids CARD')
     require(isinstance(model.encoder.readout,nn.Identity), 'P2 readout must be parameterless')
     if source_encoder is not None:
