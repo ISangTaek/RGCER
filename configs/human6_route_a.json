@@ -1,0 +1,434 @@
+{
+  "schema": "human6_route_a_protocol_v1",
+  "status": "APPROVED_2026-09-21",
+  "training_authorized": true,
+  "test_authorized": false,
+  "implementation_ready": true,
+  "research_role": "same_database_endpoint_extension_not_external_confirmation",
+  "task_order": [
+    "child_oral_LDLo",
+    "women_oral_LDLo",
+    "man_oral_LDLo",
+    "human_intravenous_TDLo",
+    "man_intravenous_TDLo",
+    "man_unreported_LDLo"
+  ],
+  "known_route_tasks": [
+    "child_oral_LDLo",
+    "women_oral_LDLo",
+    "man_oral_LDLo",
+    "human_intravenous_TDLo",
+    "man_intravenous_TDLo"
+  ],
+  "counts": {
+    "train": {
+      "child_oral_LDLo": 24,
+      "women_oral_LDLo": 39,
+      "man_oral_LDLo": 41,
+      "human_intravenous_TDLo": 26,
+      "man_intravenous_TDLo": 19,
+      "man_unreported_LDLo": 34
+    },
+    "validation": {
+      "child_oral_LDLo": 7,
+      "women_oral_LDLo": 11,
+      "man_oral_LDLo": 14,
+      "human_intravenous_TDLo": 8,
+      "man_intravenous_TDLo": 5,
+      "man_unreported_LDLo": 13
+    },
+    "test": {
+      "child_oral_LDLo": 7,
+      "women_oral_LDLo": 11,
+      "man_oral_LDLo": 15,
+      "human_intravenous_TDLo": 8,
+      "man_intravenous_TDLo": 5,
+      "man_unreported_LDLo": 13
+    }
+  },
+  "unique_population": {
+    "train": {
+      "observations": 151,
+      "unique_canonical": 151,
+      "split_groups": 104
+    },
+    "validation": {
+      "observations": 48,
+      "unique_canonical": 48,
+      "split_groups": 38
+    },
+    "calibration": {
+      "observations": 47,
+      "unique_canonical": 47,
+      "split_groups": 38
+    },
+    "test": {
+      "observations": 48,
+      "unique_canonical": 48,
+      "split_groups": 35
+    }
+  },
+  "data": {
+    "csv_path": "data/115-endpoint_acute_toxiciy_dataset/dataset115endpoints.csv",
+    "csv_sha256": "2119b3641edc8fc7577f7efbaa4c283aad47bef418f06e50bd26ad64e6a18716",
+    "split_sha256": "9caffcebed884840ad1817da5413cb1704a306c26ebdcf0f41235faf3cb0dd32",
+    "route": "A",
+    "split_seed": 42,
+    "source": "Nonhuman104 train only",
+    "calibration_access": false,
+    "source_pretraining": false,
+    "old_target_head_reuse": false
+  },
+  "source_assets": [
+    {
+      "seed": 42,
+      "checkpoint_role": "fixed_final_epoch39_source",
+      "server_path": "/home/shangzeli/RGCER/.tmp/s5f2_work_20260916T012948Z/route_a_20/runs/source_seed42/epoch_039.pt",
+      "sha256": "981f684d1977843585d35e49960c7832e52be9de0a7f314a82dd9e2a0051c0e9",
+      "size_bytes": 19564929,
+      "encoder_state_sha256": "712bd6b96a2389c8254125181c16e1f3f374d0c5cc941f0d36b8e3a49ce5fad0",
+      "source_identity_sha256": "ed8c786a84a0bf2d192858f9742bace3ad0df60d9599cf62f4b41bb0c21636d5",
+      "receipt_member": "runs/source_seed42/epoch_039.receipt.json",
+      "canonical_archive_sha256": "da80589413d453f100de8f23bad868bbf6fed124d0095c35e6ddd2c90830a3c4",
+      "outer_archive_sha256": "01f66bd83543a444738f9fdd44c6bae9e93f35acdb6f7e59f811b34f7ac62d64",
+      "reuse_basis": "055 accepted source and 065 same-seed binding; current server presence not rechecked"
+    },
+    {
+      "seed": 43,
+      "checkpoint_role": "fixed_final_epoch39_source",
+      "server_path": "/home/shangzeli/RGCER/.tmp/s5f2_work_20260916T012948Z/route_a_20/runs/source_seed43/epoch_039.pt",
+      "sha256": "11bbc67c147d48793924316fd95520ff233ae72d4d26bf4cd53d586f732b14fd",
+      "size_bytes": 19564929,
+      "encoder_state_sha256": "84cf2bdaec8285474835b04f9955f2f399d18e132f26d5fe1be20bee0884a5e4",
+      "source_identity_sha256": "84ac939e2fadd40dc2c740b8e3f0d09cb032dc682145c67ee46e109672f02c3b",
+      "receipt_member": "runs/source_seed43/epoch_039.receipt.json",
+      "canonical_archive_sha256": "da80589413d453f100de8f23bad868bbf6fed124d0095c35e6ddd2c90830a3c4",
+      "outer_archive_sha256": "01f66bd83543a444738f9fdd44c6bae9e93f35acdb6f7e59f811b34f7ac62d64",
+      "reuse_basis": "055 accepted source and 065 same-seed binding; current server presence not rechecked"
+    },
+    {
+      "seed": 44,
+      "checkpoint_role": "fixed_final_epoch39_source",
+      "server_path": "/home/shangzeli/RGCER/.tmp/s5f2_work_20260916T012948Z/route_a_20/runs/source_seed44/epoch_039.pt",
+      "sha256": "e04eb414a46bbff0e008f122b4ab75b2867fbc5bfd7c87cd3a69e61e953f092f",
+      "size_bytes": 19564929,
+      "encoder_state_sha256": "c7a2096f4a0193b13e9a53a5b9ce683486bce1bd0ef9ba336664421d40285f68",
+      "source_identity_sha256": "8430c0bf00484ef06a9205716e3db2ccf0983943373ada55d85746ae301c86d3",
+      "receipt_member": "runs/source_seed44/epoch_039.receipt.json",
+      "canonical_archive_sha256": "da80589413d453f100de8f23bad868bbf6fed124d0095c35e6ddd2c90830a3c4",
+      "outer_archive_sha256": "01f66bd83543a444738f9fdd44c6bae9e93f35acdb6f7e59f811b34f7ac62d64",
+      "reuse_basis": "055 accepted source and 065 same-seed binding; current server presence not rechecked"
+    },
+    {
+      "seed": 45,
+      "checkpoint_role": "fixed_final_epoch39_source",
+      "server_path": "/home/shangzeli/RGCER/.tmp/s5f2_work_20260916T012948Z/route_a_20/runs/source_seed45/epoch_039.pt",
+      "sha256": "654e7e14791387c4fcb913883c8eece454309c19c1746a7cc88d6e34981814e5",
+      "size_bytes": 19564929,
+      "encoder_state_sha256": "e6b74e01c8292b1f3a067b0d0694ee87d73f8ac13f3f9cef99c0c279811b2000",
+      "source_identity_sha256": "e44786e40091f2435b0e2e38da33fc1a8528974945fa7276176496a00fcd53cc",
+      "receipt_member": "runs/source_seed45/epoch_039.receipt.json",
+      "canonical_archive_sha256": "da80589413d453f100de8f23bad868bbf6fed124d0095c35e6ddd2c90830a3c4",
+      "outer_archive_sha256": "01f66bd83543a444738f9fdd44c6bae9e93f35acdb6f7e59f811b34f7ac62d64",
+      "reuse_basis": "055 accepted source and 065 same-seed binding; current server presence not rechecked"
+    },
+    {
+      "seed": 46,
+      "checkpoint_role": "fixed_final_epoch39_source",
+      "server_path": "/home/shangzeli/RGCER/.tmp/s5f2_work_20260916T012948Z/route_a_20/runs/source_seed46/epoch_039.pt",
+      "sha256": "fe8b7a7005d9f87b8867a1818d0bcb1e42ccfa9c402c8140b82f744797c5ba45",
+      "size_bytes": 19564929,
+      "encoder_state_sha256": "90efb71ffa68f7bd4af8baf9517edc9baaa6214d539eba1a5f58bc5d0c2d8736",
+      "source_identity_sha256": "c162e19b643f67cd09c4e6b70425c6815f41dae102d6a7df31b659611561b840",
+      "receipt_member": "runs/source_seed46/epoch_039.receipt.json",
+      "canonical_archive_sha256": "da80589413d453f100de8f23bad868bbf6fed124d0095c35e6ddd2c90830a3c4",
+      "outer_archive_sha256": "01f66bd83543a444738f9fdd44c6bae9e93f35acdb6f7e59f811b34f7ac62d64",
+      "reuse_basis": "055 accepted source and 065 same-seed binding; current server presence not rechecked"
+    }
+  ],
+  "architecture": {
+    "hidden_dim": 96,
+    "a_layers": 8,
+    "a_heads": 4,
+    "mid_dim": 128,
+    "head_hidden_dim": 96,
+    "head_dropout": 0.1,
+    "edge_bias_mode": "path",
+    "spatial_pos_clip": 20
+  },
+  "methods": {
+    "FROZEN": {
+      "backbone_lr": 0,
+      "head_lr": 0.001,
+      "frozen_epochs": 40,
+      "head_optimizer_reset": false
+    },
+    "B1_low": {
+      "backbone_lr": 0.0001,
+      "head_lr": 0.001,
+      "frozen_epochs": 0,
+      "head_optimizer_reset": false
+    },
+    "HF_low": {
+      "backbone_lr": 0.0001,
+      "head_lr": 0.001,
+      "frozen_epochs": 5,
+      "head_optimizer_reset": false
+    }
+  },
+  "optimization": {
+    "optimizer": "AdamW",
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-8,
+    "amsgrad": false,
+    "weight_decay": 0.00001,
+    "grad_clip_norm": 1,
+    "scheduler": null,
+    "precision": "float32_no_amp",
+    "encoder_train_mode_dropout": true,
+    "head_dropout": 0.1,
+    "no_backbone_grad_state_or_weight_decay_while_frozen": true
+  },
+  "sampling": {
+    "batch_size": 32,
+    "batches_per_epoch": {
+      "child_oral_LDLo": 1,
+      "women_oral_LDLo": 2,
+      "man_oral_LDLo": 2,
+      "human_intravenous_TDLo": 1,
+      "man_intravenous_TDLo": 1,
+      "man_unreported_LDLo": 2
+    },
+    "updates_per_epoch": 9,
+    "drop_last": false,
+    "oversampling": false,
+    "tasks_per_update": 1,
+    "order": "per-task default_rng(SeedSequence([seed,epoch,task_index])); schedule default_rng(seed+epoch).shuffle",
+    "row_order": "ascending frozen row_index; same across methods",
+    "weighting": "mean loss per active-task batch; tail batches not rescaled"
+  },
+  "model": {
+    "head": "LayerNorm96-Linear96-GELU-Dropout0.1-Linear3; width biases -1",
+    "head_init": "CPU fork_rng(seed); heads in fixed task order constructed before encoder; matched across methods",
+    "readout": "graph_token",
+    "card": false,
+    "max_path_distance": 8,
+    "quantile": [
+      0.05,
+      0.95
+    ],
+    "loss": "Huber(center,delta=1)+pinball(lower,.05)+pinball(upper,.95)",
+    "decoding": "center=raw0; lower=center-softplus(raw1); upper=center+softplus(raw2)",
+    "target_scale": "published negative_log_mol_per_kg; no new dose conversion",
+    "scaler": "each target train only, float64 mean/std ddof0, std floor1e-6; missing mask preserved"
+  },
+  "selection": {
+    "metric": "unweighted mean of six endpoint validation RMSEs on original published scale",
+    "rule": "strict improvement after each epoch; first tie retained; epochs0..39",
+    "missing_endpoint": "fail, never reduce macro denominator",
+    "ensemble": false,
+    "hpo": false
+  },
+  "statistics": {
+    "primary": "mean_over_5_seeds(macro6_RMSE(FROZEN)-macro6_RMSE(HF_low))",
+    "secondary": [
+      "FROZEN-B1_low",
+      "B1_low-HF_low"
+    ],
+    "positive_means": "second named method has lower error",
+    "report": [
+      "per-seed and mean/sample-SD macro6 RMSE/MAE",
+      "per-endpoint RMSE/MAE/N/groups",
+      "known-route-five sensitivity using same selected checkpoints"
+    ],
+    "bootstrap": {
+      "replicates": 10000,
+      "seed": 20260921,
+      "unit": "frozen test split_group",
+      "sample": "35 groups with replacement; keep all records/endpoints in group; same draw across models/seeds",
+      "statistic": "recompute each seed endpoint RMSE, macro6, then paired seed-average difference; no prediction ensemble",
+      "interval": "2.5/97.5 percentile; conditional on five fitted seeds and endpoint-complete resamples",
+      "missing_endpoint": "reject whole draw; count/report rejection; stop at100000 attempts, report noCI if fewer than10000 valid",
+      "family_inference": "descriptive pointwise intervals only; no confirmatory significance or universal ranking"
+    },
+    "seed_pvalues": false,
+    "task_independence_claim": false
+  },
+  "budget": {
+    "formal_runs": 15,
+    "formal_model_epochs": 600,
+    "formal_updates": 5400,
+    "smoke_runs": 3,
+    "smoke_seed": 42,
+    "smoke_epochs_per_run": 6,
+    "smoke_updates_per_run": 54,
+    "smoke_model_epochs": 18,
+    "smoke_updates_cap": 162,
+    "total_model_epochs_cap": 618,
+    "total_updates_cap": 5562,
+    "formal_training_observation_exposures": 109800,
+    "source_pretraining_updates": 0,
+    "additional_hpo_runs": 0,
+    "max_independent_gpus": 4,
+    "smoke_not_reused_as_formal": true,
+    "spare_budget_not_reallocated": true
+  },
+  "runs": [
+    {
+      "run_id": "H6A_FROZEN_s42",
+      "method": "FROZEN",
+      "seed": 42,
+      "source_seed": 42,
+      "source_sha256": "981f684d1977843585d35e49960c7832e52be9de0a7f314a82dd9e2a0051c0e9",
+      "epochs": 40,
+      "optimizer_updates": 360,
+      "backbone_active_updates": 0
+    },
+    {
+      "run_id": "H6A_FROZEN_s43",
+      "method": "FROZEN",
+      "seed": 43,
+      "source_seed": 43,
+      "source_sha256": "11bbc67c147d48793924316fd95520ff233ae72d4d26bf4cd53d586f732b14fd",
+      "epochs": 40,
+      "optimizer_updates": 360,
+      "backbone_active_updates": 0
+    },
+    {
+      "run_id": "H6A_FROZEN_s44",
+      "method": "FROZEN",
+      "seed": 44,
+      "source_seed": 44,
+      "source_sha256": "e04eb414a46bbff0e008f122b4ab75b2867fbc5bfd7c87cd3a69e61e953f092f",
+      "epochs": 40,
+      "optimizer_updates": 360,
+      "backbone_active_updates": 0
+    },
+    {
+      "run_id": "H6A_FROZEN_s45",
+      "method": "FROZEN",
+      "seed": 45,
+      "source_seed": 45,
+      "source_sha256": "654e7e14791387c4fcb913883c8eece454309c19c1746a7cc88d6e34981814e5",
+      "epochs": 40,
+      "optimizer_updates": 360,
+      "backbone_active_updates": 0
+    },
+    {
+      "run_id": "H6A_FROZEN_s46",
+      "method": "FROZEN",
+      "seed": 46,
+      "source_seed": 46,
+      "source_sha256": "fe8b7a7005d9f87b8867a1818d0bcb1e42ccfa9c402c8140b82f744797c5ba45",
+      "epochs": 40,
+      "optimizer_updates": 360,
+      "backbone_active_updates": 0
+    },
+    {
+      "run_id": "H6A_B1_low_s42",
+      "method": "B1_low",
+      "seed": 42,
+      "source_seed": 42,
+      "source_sha256": "981f684d1977843585d35e49960c7832e52be9de0a7f314a82dd9e2a0051c0e9",
+      "epochs": 40,
+      "optimizer_updates": 360,
+      "backbone_active_updates": 360
+    },
+    {
+      "run_id": "H6A_B1_low_s43",
+      "method": "B1_low",
+      "seed": 43,
+      "source_seed": 43,
+      "source_sha256": "11bbc67c147d48793924316fd95520ff233ae72d4d26bf4cd53d586f732b14fd",
+      "epochs": 40,
+      "optimizer_updates": 360,
+      "backbone_active_updates": 360
+    },
+    {
+      "run_id": "H6A_B1_low_s44",
+      "method": "B1_low",
+      "seed": 44,
+      "source_seed": 44,
+      "source_sha256": "e04eb414a46bbff0e008f122b4ab75b2867fbc5bfd7c87cd3a69e61e953f092f",
+      "epochs": 40,
+      "optimizer_updates": 360,
+      "backbone_active_updates": 360
+    },
+    {
+      "run_id": "H6A_B1_low_s45",
+      "method": "B1_low",
+      "seed": 45,
+      "source_seed": 45,
+      "source_sha256": "654e7e14791387c4fcb913883c8eece454309c19c1746a7cc88d6e34981814e5",
+      "epochs": 40,
+      "optimizer_updates": 360,
+      "backbone_active_updates": 360
+    },
+    {
+      "run_id": "H6A_B1_low_s46",
+      "method": "B1_low",
+      "seed": 46,
+      "source_seed": 46,
+      "source_sha256": "fe8b7a7005d9f87b8867a1818d0bcb1e42ccfa9c402c8140b82f744797c5ba45",
+      "epochs": 40,
+      "optimizer_updates": 360,
+      "backbone_active_updates": 360
+    },
+    {
+      "run_id": "H6A_HF_low_s42",
+      "method": "HF_low",
+      "seed": 42,
+      "source_seed": 42,
+      "source_sha256": "981f684d1977843585d35e49960c7832e52be9de0a7f314a82dd9e2a0051c0e9",
+      "epochs": 40,
+      "optimizer_updates": 360,
+      "backbone_active_updates": 315
+    },
+    {
+      "run_id": "H6A_HF_low_s43",
+      "method": "HF_low",
+      "seed": 43,
+      "source_seed": 43,
+      "source_sha256": "11bbc67c147d48793924316fd95520ff233ae72d4d26bf4cd53d586f732b14fd",
+      "epochs": 40,
+      "optimizer_updates": 360,
+      "backbone_active_updates": 315
+    },
+    {
+      "run_id": "H6A_HF_low_s44",
+      "method": "HF_low",
+      "seed": 44,
+      "source_seed": 44,
+      "source_sha256": "e04eb414a46bbff0e008f122b4ab75b2867fbc5bfd7c87cd3a69e61e953f092f",
+      "epochs": 40,
+      "optimizer_updates": 360,
+      "backbone_active_updates": 315
+    },
+    {
+      "run_id": "H6A_HF_low_s45",
+      "method": "HF_low",
+      "seed": 45,
+      "source_seed": 45,
+      "source_sha256": "654e7e14791387c4fcb913883c8eece454309c19c1746a7cc88d6e34981814e5",
+      "epochs": 40,
+      "optimizer_updates": 360,
+      "backbone_active_updates": 315
+    },
+    {
+      "run_id": "H6A_HF_low_s46",
+      "method": "HF_low",
+      "seed": 46,
+      "source_seed": 46,
+      "source_sha256": "fe8b7a7005d9f87b8867a1818d0bcb1e42ccfa9c402c8140b82f744797c5ba45",
+      "epochs": 40,
+      "optimizer_updates": 360,
+      "backbone_active_updates": 315
+    }
+  ],
+  "changes_from_preparation": [
+    "HF 20% proposal corrected to accepted P1D 5/40 epochs (12.5%); no new warmup search"
+  ]
+}
