@@ -25,24 +25,42 @@ SPEC = dict(schema='v9_srgt_v1', target_width=48, target_layers=2,
 def training_records(factory, trainer, setting):
     """Metadata only. No source/validation/test row enters the reference pool."""
     if setting == 'ToxAcute':
+        from toxacute_datastore import SPLIT_CODES
         manifest = read(factory.store.root / 'split_manifest.json')
-        by_row = {r['row_index']: r for r in manifest['records']}
-        require(len(by_row) == len(manifest['records']), 'duplicate manifest rows')
+        # DataStore V2 row_indices are dense graph positions. Manifest
+        # row_index preserves raw CSV positions, including gaps after invalid
+        # molecules. Their common identity is sample_id, never a row number.
+        by_id = {}
+        for record in manifest['records']:
+            sid = record.get('sample_id')
+            require(type(sid) is str and bool(sid) and sid not in by_id, 'manifest sample IDs')
+            by_id[sid] = record
+        store_ids = [str(sid) for sid in factory.store.sample_ids]
+        require(len(store_ids) == len(set(store_ids)) and set(store_ids) == set(by_id), 'manifest/store sample ID bijection')
+        require(len(factory.store.row_indices) == len(factory.store.split_codes)
+                == len(store_ids), 'store metadata lengths')
+        for index, sid in enumerate(store_ids):
+            record = by_id[sid]
+            require(int(factory.store.row_indices[index]) == index, 'dense DataStore graph index')
+            require(record['split'] in SPLIT_CODES and SPLIT_CODES[record['split']]
+                    == int(factory.store.split_codes[index]), 'manifest/store split identity')
         datasets = factory.datasets['train']
     else:
         require(setting in ('A', 'B') and trainer.train.split == 'train', 'target train required')
         datasets = trainer.datasets['train']
     records = []
     for task, ds in datasets.items():
+        require(len(ds.indices) == len(set(int(i) for i in ds.indices)), 'duplicate task indices')
         for i, global_index in enumerate(ds.indices):
             sid = str(ds.get_sample_id(i))
             if setting == 'ToxAcute':
                 require(ds.split == 'train', 'Tox reference split')
-                record = by_row[int(factory.store.row_indices[int(global_index)])]
+                require(0 <= int(global_index) < len(store_ids), 'Tox graph index bounds')
+                require(store_ids[int(global_index)] == sid and sid in by_id, 'dataset/store sample identity')
+                record = by_id[sid]
+                require(record['sample_id'] == sid, 'manifest sample ID')
                 require(record['split'] == 'train', 'manifest reference split')
                 canonical, group = record['canonical_smiles'], record['split_group']
-                if 'sample_id' in record:
-                    require(str(record['sample_id']) == sid, 'manifest sample ID')
             else:
                 require(ds.view.split == 'train' and ds.view.role == 'target', 'reference role/split')
                 canonical, group = ds.view.canonical[global_index], ds.view.groups[global_index]

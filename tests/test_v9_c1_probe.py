@@ -70,6 +70,7 @@ def test_full_twelve_update_candidate_path_on_real_synthetic_graphs(job,tmp_path
 def full_suite(root,make):
     root.mkdir()
     mod.write(root/'launch.json',dict(task=mod.TASK,commit='a'*40,jobs=mod.jobs()))
+    mod.write(root/'metadata_preflight.json',mod.metadata_preflight('a'*40,root/'split',root/'source'))
     for job in mod.jobs():
         f,t=make(job['setting']);out=root/job['id'];out.mkdir()
         r=mod.one_job(f,t,job,out,'a'*40,'cpu')
@@ -93,6 +94,7 @@ def test_forged_self_consistent_evidence_rejected(tmp_path,synthetic_runtime,cha
     # Verification rejects on the first job; later outputs deliberately absent.
     root=tmp_path/'suite';root.mkdir()
     mod.write(root/'launch.json',dict(task=mod.TASK,commit='a'*40,jobs=mod.jobs()))
+    mod.write(root/'metadata_preflight.json',mod.metadata_preflight('a'*40,root/'split',root/'source'))
     job=mod.jobs()[0];out=root/job['id'];out.mkdir();f,t=synthetic_runtime(job['setting'])
     r=mod.one_job(f,t,job,out,'a'*40,'cpu');r.update(peak_allocated_bytes=1,peak_reserved_bytes=2)
     if change=='members':
@@ -147,6 +149,8 @@ def test_supervisor_failure_stops_and_consumes_attempt(tmp_path,monkeypatch,fail
     monkeypatch.setattr(mod.c0,'check_code',lambda *a:None)
     monkeypatch.setattr(mod,'gate',lambda *a:None)
     monkeypatch.setattr(mod,'prior_gate',lambda *a:dict(accepted=True))
+    monkeypatch.setattr(mod,'failed_attempt_gate',lambda *a:dict(accepted_zero_updates=True))
+    monkeypatch.setattr(mod,'metadata_preflight',lambda *a:dict(optimizer_updates=0))
     monkeypatch.setattr(mod.c0,'gpu_uuid',lambda *a:'GPU-synthetic')
     monkeypatch.setattr(p1d4_batch,'free_gpus',lambda x:x)
     for role in ('wsl','server'):(tmp_path/role).mkdir()
@@ -158,7 +162,7 @@ def test_supervisor_failure_stops_and_consumes_attempt(tmp_path,monkeypatch,fail
         return SimpleNamespace(returncode=3)
     monkeypatch.setattr(subprocess,'run',child)
     with pytest.raises((ValueError,subprocess.TimeoutExpired)):
-        mod.run(tmp_path/'run','a'*40,0,tmp_path/'split',tmp_path/'source',tmp_path/'wsl',tmp_path/'server',tmp_path/'prior')
+        mod.run(tmp_path/'run','a'*40,0,tmp_path/'split',tmp_path/'source',tmp_path/'wsl',tmp_path/'server',tmp_path/'prior',tmp_path/'failed_prior')
     assert len(calls)==1 and (tmp_path/'run/failed.json').exists()
     assert (tmp_path/mod.REGISTRY/'attempt.json').exists()
 
@@ -172,3 +176,67 @@ def test_failure_package_preserves_checkpoint_and_refuses_overwrite(tmp_path):
     assert result['scientific_acceptance']=='NOT_ASSESSED'
     assert mod.sha(tmp_path/'run.zip')==result['sha256']
     with pytest.raises(ValueError):mod.package(root)
+
+
+@pytest.fixture
+def immutable_failure(tmp_path,monkeypatch):
+    monkeypatch.setattr(mod,'REPO',tmp_path)
+    root=tmp_path/'old_failure';root.mkdir()
+    mod.write(root/'launch.json',dict(commit='b'*40))
+    mod.write(root/'failed.json',dict(optimizer_updates=0))
+    (root/'checksums.sha256').write_text('synthetic checksum fixture',encoding='utf8')
+    registry='.tmp/old_attempt';(tmp_path/registry).mkdir(parents=True)
+    claim=tmp_path/registry/'attempt.json';mod.write(claim,dict(commit='b'*40))
+    identity=dict(commit='b'*40,canonical_sha256='c'*64,registry_relative=registry,
+                  attempt_sha256=mod.sha(claim),files_sha256={p.name:mod.sha(p) for p in root.iterdir()})
+    lock=tmp_path/'retry_lock.json';mod.write(lock,dict(replaces_zero_update_failure=identity))
+    monkeypatch.setattr(mod,'LOCK',lock)
+    return root,claim
+
+
+@pytest.mark.parametrize('archived',[False,True])
+def test_replacement_accepts_only_exact_audited_failure_with_original_claim(immutable_failure,archived):
+    root,claim=immutable_failure
+    if not archived:(root/'checksums.sha256').unlink()
+    value=mod.failed_attempt_gate(root)
+    assert value['prior_optimizer_updates']==0
+    assert claim.exists()
+
+
+@pytest.mark.parametrize('change',['extra_update','modified_bytes','missing_file','modified_claim'])
+def test_replacement_rejects_unreviewed_prior_attempt(immutable_failure,change):
+    root,claim=immutable_failure
+    if change=='extra_update':mod.write(root/'update_00.intent.json',dict(step=0))
+    if change=='modified_bytes':(root/'failed.json').write_text('{}')
+    if change=='missing_file':(root/'failed.json').unlink()
+    if change=='modified_claim':claim.write_text('{}')
+    with pytest.raises(ValueError):mod.failed_attempt_gate(root)
+
+
+def test_cpu_metadata_preflight_checks_all_three_real_synthetic_graph_views(tmp_path,synthetic_runtime):
+    value=mod.metadata_preflight('a'*40,tmp_path/'split',tmp_path/'source')
+    assert value['optimizer_updates']==value['model_forward_calls']==0
+    assert value['holdout_predictions_accessed'] is False
+    assert set(value['settings'])==set(mod.c0.SETTINGS)
+    assert all(r['graph_observations_checked']==sum(r['counts'].values()) for r in value['settings'].values())
+
+
+def test_metadata_failure_stops_before_any_gpu_worker(tmp_path,monkeypatch):
+    import p1d4_batch
+    monkeypatch.setattr(mod,'REPO',tmp_path)
+    monkeypatch.setattr(mod.c0,'check_code',lambda *a:None)
+    monkeypatch.setattr(mod,'gate',lambda *a:None)
+    monkeypatch.setattr(mod,'prior_gate',lambda *a:dict(accepted=True))
+    monkeypatch.setattr(mod,'failed_attempt_gate',lambda *a:dict(accepted_zero_updates=True))
+    monkeypatch.setattr(mod.c0,'gpu_uuid',lambda *a:'GPU-synthetic')
+    monkeypatch.setattr(p1d4_batch,'free_gpus',lambda x:x)
+    for role in ('wsl','server'):(tmp_path/role).mkdir()
+    def invalid(*args):raise ValueError('train graph identity failed')
+    def forbidden(*args,**kwargs):pytest.fail('GPU worker must not start')
+    monkeypatch.setattr(mod,'metadata_preflight',invalid)
+    monkeypatch.setattr(subprocess,'run',forbidden)
+    with pytest.raises(ValueError,match='train graph identity'):
+        mod.run(tmp_path/'run','a'*40,0,tmp_path/'split',tmp_path/'source',tmp_path/'wsl',tmp_path/'server',tmp_path/'prior',tmp_path/'failed_prior')
+    assert (tmp_path/'run/failed.json').exists()
+    assert not list((tmp_path/'run').glob('update_*.json'))
+    assert (tmp_path/mod.REGISTRY/'attempt.json').exists()

@@ -1,0 +1,48 @@
+{
+  "schema": "v9_c1r1_lock_v1",
+  "task": "V9_C1R1_SRGT_REFINE_SMOKE_20260929",
+  "accepted_c0_commit": "ccd7d337442fee03b006ba3a0b6e9e781d5b2528",
+  "accepted_c0_outer_sha256": "22846e82d45b244a0762b6c96178fe390123ac1431f2d243b9827a666ed90040",
+  "accepted_c0_zip_sha256": "fb468850937e1f8b5bc0abdafce2da5ecf8c6e84e59f750ee5ed1e58d4ded292",
+  "verification_sha256": "2cf99acae497c7b78bcd4d94e32457ea5406671655877f625734523e8cd8ab1b",
+  "receipt_sha256": {
+    "A_frozen_s42": "4c603cb632eef2410a362d4378616654c710a0f1da597b7ef0f23e224f601a64",
+    "A_full_s42": "bae074644d08185fb71fab5ddd21bece8b8dee763ea194bb86073d9ca648a4bc",
+    "B_frozen_s42": "948ed7b06dc9200ed3293da2a3b4b15e68dc7493a4a97e32b20383f3611e70f1",
+    "B_full_s42": "58eba3e88a92f1daa0003bfdc0a989fc760bbc30235306e2b54f44ca1aeba19a",
+    "ToxAcute_frozen_s42": "842d90a71a32cf19676ed553abcaf4c164a106e89db888fda86e4c177f70baf8",
+    "ToxAcute_full_s42": "dddff9102ba811e51cbcf16b408f457052ee4992941d20d39ad168ec5eb1078c"
+  },
+  "initial_encoders": {
+    "ToxAcute": "be8b12b7209d4110dffe0a83db165d7f82253a9d5fe46bb1ea5b0b14e1a84423",
+    "A": "4b0fd061a327bc095c952f8077071f53af3860b6372e5c60bd387a415df05c0b",
+    "B": "be8b12b7209d4110dffe0a83db165d7f82253a9d5fe46bb1ea5b0b14e1a84423"
+  },
+  "max_optimizer_updates": 72,
+  "max_wall_seconds": 1800,
+  "formal_training_authorized": false,
+  "replaces_zero_update_failure": {
+    "commit": "660bb1be03e982a64c74a5abd6f9ebb8e95db1cd",
+    "outer_sha256": "b769120ee25047a6632ac54c55a4a35e307a3e3519fcf2cfbea3a2ced1d72fc8",
+    "canonical_sha256": "534b780eef023bbff63d2aa318b0f7c4d573a073488652a2e2dadc7289d1b44f",
+    "registry_relative": ".tmp/v9_c1_attempts_20260929",
+    "attempt_sha256": "4dfd6faddf2ad28ee313258d99300276047f19872c8818c163b0c10160d610c4",
+    "files_sha256": {
+      "ToxAcute_REFINE_GRAPH_s42.command.json": "6e04955103be6d550d2dcd3439c099bf9c22b3d82da58e2ef6d3cc63a4127ddf",
+      "ToxAcute_REFINE_GRAPH_s42.log": "0d071420c5acca6c9477ddca2cc05a7e8cf74ff80236367186a492a6c18e154d",
+      "ToxAcute_REFINE_GRAPH_s42/started.json": "b8c0eba8f4aff45f8d295ab9c3babee7189652c239ed4edaad59e78e8d545723",
+      "checksums.sha256": "88e6dc9f9f4100be23d964faf544b1c5c122f39bd6233eb0eec4e64a8cb582b2",
+      "failed.json": "847563af9c04a4090c5c93192b9dc0ce97c3258800556c843e2ea2f84325b4e8",
+      "launch.json": "13944e1fe0f0bc016640add753833312eef13c7d01475ac52256a49b553d76a8",
+      "server_evidence/command.json": "1d291c04c903821ac612ed3d5bac38c506ae0a45acf40b601de99a0e45d5eff7",
+      "server_evidence/gate.json": "6b190c49909e8c42d4c35e765e6bd35a5762bde7ba080b482931e792fc1da85e",
+      "server_evidence/tests.log": "4e2fac871e0b3bfdeda6090832b1fa09879ec6f763135256b3806887a9765155",
+      "server_evidence/tests.xml": "5eeda6e22240d3e672fe9a854917335c01431053915a0b53030cca04ec9ea03b",
+      "wsl_evidence/command.json": "7c77b909466f62a5a179d098149f57e810a3f724c38b02c981181461a45c658c",
+      "wsl_evidence/gate.json": "c11b7af49f50b266340153bbd66ce4f6f342dff99d2b4f56a9c86ab317e94057",
+      "wsl_evidence/tests.log": "f8aa6df50129d7d1c4efd29b48ad072e546ecf286303b9289236bb9942e435b7",
+      "wsl_evidence/tests.xml": "e2bc96129e7a3110e9753ca09c1564968a4177f987eb0b616a0e5148a426e8e9"
+    },
+    "optimizer_updates": 0
+  }
+}

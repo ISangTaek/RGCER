@@ -163,10 +163,11 @@ def test_target_can_change_prediction_while_source_features_are_identical():
 
 def test_training_metadata_joins_tox_rows_and_checks_split(tmp_path):
     path=tmp_path/'split_manifest.json'
-    rows=[dict(row_index=17,split='train',sample_id='s17',canonical_smiles='CC',split_group='g1')]
+    rows=[dict(row_index=17,split='train',sample_id='s17',canonical_smiles='CC',split_group='g1',num_nodes=2)]
     path.write_text(json.dumps(dict(records=rows)),encoding='utf8')
     ds=SimpleNamespace(indices=[0],split='train',get_sample_id=lambda i:'s17')
-    factory=SimpleNamespace(store=SimpleNamespace(root=tmp_path,row_indices=[17]),datasets={'train':{'t':ds}})
+    factory=SimpleNamespace(store=SimpleNamespace(root=tmp_path,row_indices=[0],sample_ids=['s17'],
+                            split_codes=[0],num_nodes=[2]),datasets={'train':{'t':ds}})
     assert training_records(factory,None,'ToxAcute')==[rec('s17','CC','g1')]
     rows[0]['split']='test';path.write_text(json.dumps(dict(records=rows)),encoding='utf8')
     with pytest.raises(ValueError):training_records(factory,None,'ToxAcute')

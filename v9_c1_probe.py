@@ -1,4 +1,4 @@
-"""V9-C1: SRGT / matched ReFine graph smoke, 6 jobs, at most 72 updates.
+"""V9-C1R1: identity-join repair; replace 071's zero-update attempt only.
 
 No full epochs, validation selection, holdout inference, source training,
 automatic retry, or permission to start the 180-run formal matrix.
@@ -18,10 +18,11 @@ import v9_cost_probe as c0
 from v9_srgt import DualGraph, TrainSupport, METHODS, SPEC, optimizer_for, training_records, save_smoke, load_smoke
 
 REPO=Path(__file__).resolve().parent
-LOCK=REPO/'configs/v9_c1_lock.json'
-TASK='V9_C1_SRGT_REFINE_SMOKE_20260929'
-REGISTRY='.tmp/v9_c1_attempts_20260929'
-TESTS=('tests/test_v9_srgt.py','tests/test_v9_c1_probe.py','tests/test_v9_cost_probe.py','tests/test_p1d4_identity.py')
+LOCK=REPO/'configs/v9_c1r1_lock.json'
+TASK='V9_C1R1_SRGT_REFINE_SMOKE_20260929'
+REGISTRY='.tmp/v9_c1r1_attempts_20260929'
+TESTS=('tests/test_v9_srgt.py','tests/test_v9_c1_probe.py','tests/test_v9_cost_probe.py',
+       'tests/test_p1d4_identity.py','tests/test_v9_tox_identity.py')
 WALL_SECONDS=1800
 read,write,sha,digest,require=c0.read,c0.write,c0.sha,c0.digest,c0.require
 
@@ -44,7 +45,7 @@ def summarize(rows,tasks,counts,batch_size):
 
 def prior_gate(root):
     lock=read(LOCK)
-    require(lock['schema']=='v9_c1_lock_v1' and lock['task']==TASK and lock['formal_training_authorized'] is False,'C1 lock')
+    require(lock['schema']=='v9_c1r1_lock_v1' and lock['task']==TASK and lock['formal_training_authorized'] is False,'C1R1 lock')
     require(sha(root/'verification.json')==lock['verification_sha256'],'accepted C0 verification bytes')
     for name,value in lock['receipt_sha256'].items():
         require(sha(root/name/'receipt.json')==value,'accepted C0 receipt bytes')
@@ -52,6 +53,51 @@ def prior_gate(root):
     require(value['optimizer_updates']==72 and value['completed_jobs']==6,'C0 scope')
     return dict(c0_commit=lock['accepted_c0_commit'],canonical_sha256=lock['accepted_c0_zip_sha256'],
                 verification_sha256=lock['verification_sha256'],source='070_ACCEPTED_COST_ONLY')
+
+
+def failed_attempt_gate(root):
+    """Only the audited 071 zero-update failure can authorize this replacement."""
+    lock=read(LOCK)['replaces_zero_update_failure']
+    expected=lock['files_sha256']
+    require(root.is_dir(),'071 failure evidence missing')
+    paths=list(root.rglob('*'))
+    require(all(not p.is_symlink() for p in paths),'symlink in 071 evidence')
+    actual={p.relative_to(root).as_posix() for p in paths if p.is_file()}
+    # checksums.sha256 is written inside the canonical ZIP, not the live run.
+    required=set(expected)-{'checksums.sha256'}
+    require(actual in (required,set(expected)),'071 zero-update file population')
+    require(all(sha(root/name)==expected[name] for name in actual),'071 immutable failure bytes')
+    claim_path=REPO/lock['registry_relative']/'attempt.json'
+    require(sha(claim_path)==lock['attempt_sha256'],'071 original attempt must remain unchanged')
+    require(read(root/'launch.json')['commit']==lock['commit'],'071 source commit')
+    return dict(source='071_ACCEPTED_ZERO_UPDATE_DIAGNOSTIC',commit=lock['commit'],
+                canonical_sha256=lock['canonical_sha256'],prior_optimizer_updates=0,
+                attempt_sha256=lock['attempt_sha256'])
+
+
+def metadata_preflight(commit,split_manifest,source_lock):
+    """CPU-only identity check over all allowed TRAIN observations, no forward/update."""
+    from p1d4_runtime import factory_for
+    from reproducibility import state_dict_sha256
+    tick=time.perf_counter();settings={};lock=read(LOCK)
+    for setting in c0.SETTINGS:
+        factory=factory_for(REPO,setting=setting,seed=42,split_manifest=split_manifest,source_lock=source_lock,device='cpu')
+        trainer=factory.make_trainer() if setting=='ToxAcute' else factory.make_trainer(original=True,device='cpu')
+        tasks,counts=c0.tasks_and_counts(setting)
+        datasets=factory.datasets['train'] if setting=='ToxAcute' else trainer.datasets['train']
+        require({t:len(datasets[t]) for t in tasks}==counts,'preflight train counts')
+        require(state_dict_sha256(trainer.model.encoder)==lock['initial_encoders'][setting],'preflight source identity')
+        bank=TrainSupport(training_records(factory,trainer,setting))
+        for task,ds in datasets.items():
+            for i in range(len(ds)):
+                graph=ds[i];sid=str(ds.get_sample_id(i))
+                require(graph.sample_id==sid,'preflight train graph sample identity')
+                bank.for_train_batch(task,[sid],[graph.canonical_smiles])
+        settings[setting]=dict(counts=counts,support=bank.identity,
+                               initial_encoder=lock['initial_encoders'][setting],graph_observations_checked=sum(counts.values()))
+    return dict(task=TASK,commit=commit,scope='TRAIN_IDENTITY_ONLY',optimizer_updates=0,
+                model_forward_calls=0,holdout_predictions_accessed=False,settings=settings,
+                elapsed_seconds=time.perf_counter()-tick)
 
 
 def gate(root,commit,role):
@@ -125,8 +171,8 @@ def one_job(factory,trainer,job,out,commit,device):
         if job['setting']=='ToxAcute':
             batch=factory.collator([datasets[task][i] for i in indices]).to(device)
         else:batch=trainer._batch('train',task,indices)
-        if job['method']=='SRGT':
-            batch.v9_support=bank.for_train_batch(task,batch.sample_id,batch.canonical_smiles).to(device)
+        checked_support=bank.for_train_batch(task,batch.sample_id,batch.canonical_smiles)
+        if job['method']=='SRGT':batch.v9_support=checked_support.to(device)
         sync();batch_seconds=time.perf_counter()-tick
         require(not batch.is_empty and batch.y.numel()==len(indices) and list(batch.sample_id)==expected_ids,'train batch identity')
         write(out/f'update_{item["step"]:02d}.intent.json',dict(step=item['step'],max_total=item['step']+1))
@@ -213,6 +259,11 @@ def verify(root,commit,split_manifest,source_lock):
     from p1d4_runtime import factory_for
     launch=read(root/'launch.json')
     require(launch['task']==TASK and launch['commit']==commit and digest(launch['jobs'])==digest(jobs()),'suite identity')
+    metadata=read(root/'metadata_preflight.json')
+    require(metadata['task']==TASK and metadata['commit']==commit and metadata['scope']=='TRAIN_IDENTITY_ONLY'
+            and metadata['optimizer_updates']==0 and metadata['model_forward_calls']==0
+            and metadata['holdout_predictions_accessed'] is False
+            and set(metadata['settings'])==set(c0.SETTINGS),'metadata preflight scope')
     lock=read(LOCK);reports={};current_setting=None;trusted_trainer=None;trusted_records=None
     for job in jobs():
         out=root/job['id'];r=read(out/'receipt.json');tasks,counts=c0.tasks_and_counts(job['setting'])
@@ -228,6 +279,8 @@ def verify(root,commit,split_manifest,source_lock):
         require(r['initial_target']!=r['final_target'] and r['initial_heads']!=r['final_heads'],'plasticity')
         bank=TrainSupport(read(out/'support_records.json'))
         trusted_bank=TrainSupport(trusted_records)
+        require(digest(metadata['settings'][job['setting']])==digest(dict(counts=counts,support=trusted_bank.identity,
+            initial_encoder=lock['initial_encoders'][job['setting']],graph_observations_checked=sum(counts.values()))),'metadata preflight identity')
         require(digest(bank.records)==digest(trusted_bank.records),'support members differ from actual target train')
         require(digest(bank.identity)==digest(read(out/'support_identity.json')),'support recomputation')
         require(Counter(row['task'] for row in bank.records)==Counter(counts),'support task populations')
@@ -283,20 +336,25 @@ def verify(root,commit,split_manifest,source_lock):
         formal_training_authorized=False,results=reports)
 
 
-def run(root,commit,gpu,split,source,wsl,server,prior):
+def run(root,commit,gpu,split,source,wsl,server,prior,failed_prior):
     from p1d4_batch import free_gpus
     os.environ['CUDA_VISIBLE_DEVICES']=''  # CPU supervisor; workers receive the selected UUID.
     c0.check_code(REPO,commit);gate(wsl,commit,'wsl');gate(server,commit,'server')
     accepted=prior_gate(prior)
+    replacement=failed_attempt_gate(failed_prior)
     require(free_gpus([gpu])==[gpu],'GPU occupied')
     root.mkdir(parents=True,exist_ok=False);claim(root,commit)
     uuid=c0.gpu_uuid(gpu)
     write(root/'launch.json',dict(task=TASK,commit=commit,jobs=jobs(),gpu=gpu,gpu_uuid=uuid,
-                                max_optimizer_updates=72,max_wall_seconds=WALL_SECONDS,prior=accepted))
+                                max_optimizer_updates=72,max_wall_seconds=WALL_SECONDS,prior=accepted,replacement=replacement))
     for role,path in (('wsl',wsl),('server',server)):
         shutil.copytree(path,root/(role+'_evidence'),ignore=shutil.ignore_patterns('pytest_tmp'))
-    deadline=time.monotonic()+WALL_SECONDS
     try:
+        print('C1R1 CPU train-identity preflight: starting (0 model forwards / 0 updates)',flush=True)
+        metadata=metadata_preflight(commit,split,source)
+        write(root/'metadata_preflight.json',metadata)
+        print('C1R1 CPU train-identity preflight: PASS; starting bounded GPU workers',flush=True)
+        deadline=time.monotonic()+WALL_SECONDS
         for job in jobs():
             require(free_gpus([gpu])==[gpu],'GPU occupied before next job')
             remaining=deadline-time.monotonic();require(remaining>0,'C1 wall limit')
@@ -343,6 +401,7 @@ def main():
     p.add_argument('--commit',required=True);p.add_argument('--output',type=Path,required=True)
     p.add_argument('--role',choices=['wsl','server']);p.add_argument('--gpu',type=int,choices=range(4))
     p.add_argument('--wsl-evidence',type=Path);p.add_argument('--server-evidence',type=Path);p.add_argument('--c0-evidence',type=Path)
+    p.add_argument('--c1-failure-evidence',type=Path)
     p.add_argument('--split-manifest',type=Path);p.add_argument('--source-lock',type=Path)
     p.add_argument('--job',choices=[j['id'] for j in jobs()]);a=p.parse_args();root=a.output.resolve()
     if a.action=='code-gate':code_gate(root,a.commit,a.role)
@@ -357,9 +416,10 @@ def main():
         require(a.split_manifest is not None and a.source_lock is not None,'asset paths required')
         if a.action=='run':
             require(a.gpu is not None and a.wsl_evidence is not None and a.server_evidence is not None
-                    and a.c0_evidence is not None,'GPU, both gates, accepted C0 evidence required')
+                    and a.c0_evidence is not None and a.c1_failure_evidence is not None,
+                    'GPU, both gates, accepted C0 and 071 zero-update failure evidence required')
             run(root,a.commit,a.gpu,a.split_manifest.resolve(),a.source_lock.resolve(),a.wsl_evidence.resolve(),
-                a.server_evidence.resolve(),a.c0_evidence.resolve())
+                a.server_evidence.resolve(),a.c0_evidence.resolve(),a.c1_failure_evidence.resolve())
         else:
             require(a.job is not None,'worker job')
             worker(root,next(j for j in jobs() if j['id']==a.job),a.commit,a.split_manifest.resolve(),a.source_lock.resolve())
