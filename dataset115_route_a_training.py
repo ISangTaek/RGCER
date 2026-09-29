@@ -138,11 +138,57 @@ class SourceTrainer:
         return summary
 
 
-def verify_source(output, trainer):
-    """Bind all epochs to a fresh trainer built from actual frozen train input."""
+def _reuse_identity(stored, trainer, expected):
+    """Authenticate historical provenance before separating the CPU audit device.
+
+    Only the recorded device may differ from the freshly reconstructed identity.
+    Train inputs, scalers, architecture, software, seed and config remain exact.
+    This does not mutate a trainer's identity or grant permission to train.
+    """
+    keys={'seed','route','selection','teacher_sha256','init_sha256','source_identity_sha256'}
+    require(type(expected) is dict and set(expected)==keys, 'source reuse expectation fields')
+    require(type(expected['seed']) is int and expected['seed']==trainer.seed
+            and expected['route']=='A' and expected['selection']=='fixed_final_epoch39', 'source reuse binding')
+    for key in ('teacher_sha256','init_sha256','source_identity_sha256'):
+        value=expected[key]
+        require(type(value) is str and len(value)==64 and all(c in '0123456789abcdef' for c in value), 'source reuse SHA')
+    require(trainer.device=='cpu' and trainer.identity['device']=='cpu', 'source reuse CPU only')
+    require(type(stored) is dict and stored.get('device') in ('cpu','cuda:0'), 'source provenance device')
+    require(semantic_digest(stored)==expected['source_identity_sha256'], 'source historical identity SHA')
+    reconstructed=dict(trainer.identity,device=stored['device'])
+    require(semantic_digest(reconstructed)==semantic_digest(stored), 'source config identity')
+    return stored, expected['source_identity_sha256']
+
+
+def _check_recorded_train_probe(output, trainer):
+    """Schema/IDs only; never claim historical GPU numbers were replayed on CPU."""
+    rows=read_json(output/'train_reload_probe.json')
+    require(type(rows) is list and len(rows)==len(trainer.tasks), 'source recorded probe task matrix')
+    for row,task in zip(rows,trainer.tasks):
+        ds=trainer.datasets[task];ids=[ds.get_sample_id(i) for i in range(min(2,len(ds)))]
+        require(type(row) is dict and set(row)=={'task','sample_ids','standardized_prediction'}
+                and row['task']==task and row['sample_ids']==ids, 'source recorded probe identity')
+        pred=row['standardized_prediction']
+        require(type(pred) is list and len(pred)==len(ids)
+                and all(type(v) is list and len(v)==3 and all(type(x) in (float,int) and math.isfinite(x) for x in v)
+                        for v in pred), 'source recorded probe finite/shape')
+
+
+def verify_source(output, trainer, *, reuse_expectation=None):
+    """Bind all epochs to actual train input; default retains exact device replay.
+
+    Explicit CPU reuse additionally requires independent frozen source hashes.
+    It audits all original epochs but performs no source forward. GPU workers
+    still use the default exact replay before any candidate optimizer update.
+    """
     output = Path(output); summary = read_json(output/'training_summary.json')
-    require(read_json(output/'resolved_config.json') == trainer.identity, 'source config identity')
-    require(summary['task_id'] == TASK_ID and summary['identity_sha256'] == trainer.identity_sha, 'source summary identity')
+    stored=read_json(output/'resolved_config.json')
+    identity,identity_sha=trainer.identity,trainer.identity_sha
+    if reuse_expectation is None:
+        require(stored == identity, 'source config identity')
+    else:
+        identity,identity_sha=_reuse_identity(stored,trainer,reuse_expectation)
+    require(summary['task_id'] == TASK_ID and summary['identity_sha256'] == identity_sha, 'source summary identity')
     epochs = trainer.config.epochs
     require(type(summary['completed_epochs']) is int and summary['completed_epochs'] == epochs
         and summary['selected_epoch'] == epochs-1 and summary['selection']=='fixed_final_epoch', 'source epoch/selection')
@@ -162,7 +208,7 @@ def verify_source(output, trainer):
         import hashlib
         require(len(raw)==receipt['size_bytes'] and hashlib.sha256(raw).hexdigest()==receipt['sha256'], 'source file SHA')
         p = torch.load(io.BytesIO(raw),map_location='cpu',weights_only=True)
-        require(p['identity']==trainer.identity and p['identity_sha256']==trainer.identity_sha and p['epoch']==epoch, 'source checkpoint identity')
+        require(p['identity']==identity and p['identity_sha256']==identity_sha and p['epoch']==epoch, 'source checkpoint identity')
         require(p['initial_digest']==trainer.initial_digest and p['initial_encoder']==trainer.initial_encoder, 'source initialization')
         require(p['history']==summary['history'][:epoch+1], 'source checkpoint history')
         state = p['model_state']; require(set(state)==set(reference), 'source tensor keys')
@@ -181,23 +227,31 @@ def verify_source(output, trainer):
             elif item is not None: require(float(item['step'])==nsteps*(epoch+1), 'source encoder optimizer steps')
             if item is not None: require(all(torch.isfinite(v).all() for v in item.values() if isinstance(v,torch.Tensor)), 'source optimizer finite')
     trainer.model.load_state_dict(p['model_state'],strict=True)
-    require(trainer.probe()==read_json(output/'train_reload_probe.json'), 'source fresh reload forward')
     encoder={k[len('encoder.'):]:v for k,v in p['model_state'].items() if k.startswith('encoder.')}
+    extra={}
+    if reuse_expectation is None:
+        require(trainer.probe()==read_json(output/'train_reload_probe.json'), 'source fresh reload forward')
+    else:
+        require(summary['checkpoints'][-1]['sha256']==reuse_expectation['teacher_sha256'], 'source selected checkpoint SHA')
+        require(state_digest(encoder)==reuse_expectation['init_sha256'], 'source locked encoder SHA')
+        _check_recorded_train_probe(output,trainer)
+        extra=dict(verification_mode='LOCKED_CPU_CONTENT',source_device=identity['device'],runtime_device=trainer.device,
+                   train_probe_replayed=False,source_forward_calls=0)
     return dict(task_id=TASK_ID, content_status='PASS', acceptance_status='PENDING_REVIEW', seed=trainer.seed,
-        epochs_checked=epochs, selected_epoch=epochs-1, identity_sha256=trainer.identity_sha,
+        epochs_checked=epochs, selected_epoch=epochs-1, identity_sha256=identity_sha,
         source_sha256=summary['checkpoints'][-1]['sha256'], encoder_sha256=state_digest(encoder),
-        total_steps=nsteps*epochs, source_tasks=list(trainer.tasks), formal_source=trainer.config==CONFIG)
+        total_steps=nsteps*epochs, source_tasks=list(trainer.tasks), formal_source=trainer.config==CONFIG,**extra)
 
 
-def load_source(output, trainer):
+def load_source(output, trainer, *, reuse_expectation=None):
     """Full content re-verification before target may consume a source file."""
-    receipt = verify_source(output, trainer)
+    receipt = verify_source(output, trainer, reuse_expectation=reuse_expectation)
     require(receipt['formal_source'] is True, 'nonformal source cannot initialize formal target')
     p=torch.load(Path(output)/f'epoch_{trainer.config.epochs-1:03d}.pt',map_location='cpu',weights_only=True)
     encoder={k[len('encoder.'):]:v for k,v in p['model_state'].items() if k.startswith('encoder.')}
     return encoder, dict(seed=trainer.seed, teacher_sha256=receipt['source_sha256'],
         init_sha256=receipt['encoder_sha256'], route='A', selection='fixed_final_epoch39',
-        source_identity_sha256=trainer.identity_sha), receipt
+        source_identity_sha256=receipt['identity_sha256']), receipt
 
 
 class RouteATrainer(RouteBTrainer):

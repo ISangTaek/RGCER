@@ -162,7 +162,7 @@ def test_supervisor_failure_stops_and_consumes_attempt(tmp_path,monkeypatch,fail
         return SimpleNamespace(returncode=3)
     monkeypatch.setattr(subprocess,'run',child)
     with pytest.raises((ValueError,subprocess.TimeoutExpired)):
-        mod.run(tmp_path/'run','a'*40,0,tmp_path/'split',tmp_path/'source',tmp_path/'wsl',tmp_path/'server',tmp_path/'prior',tmp_path/'failed_prior')
+        mod.run(tmp_path/'run','a'*40,0,tmp_path/'split',tmp_path/'source',tmp_path/'wsl',tmp_path/'server',tmp_path/'prior',tmp_path/'failed_prior',tmp_path/'failed_r1')
     assert len(calls)==1 and (tmp_path/'run/failed.json').exists()
     assert (tmp_path/mod.REGISTRY/'attempt.json').exists()
 
@@ -189,28 +189,30 @@ def immutable_failure(tmp_path,monkeypatch):
     claim=tmp_path/registry/'attempt.json';mod.write(claim,dict(commit='b'*40))
     identity=dict(commit='b'*40,canonical_sha256='c'*64,registry_relative=registry,
                   attempt_sha256=mod.sha(claim),files_sha256={p.name:mod.sha(p) for p in root.iterdir()})
-    lock=tmp_path/'retry_lock.json';mod.write(lock,dict(replaces_zero_update_failure=identity))
+    lock=tmp_path/'retry_lock.json';mod.write(lock,dict(replaces_zero_update_failure=identity,replaces_c1r1_zero_update_failure=identity))
     monkeypatch.setattr(mod,'LOCK',lock)
     return root,claim
 
 
 @pytest.mark.parametrize('archived',[False,True])
-def test_replacement_accepts_only_exact_audited_failure_with_original_claim(immutable_failure,archived):
+@pytest.mark.parametrize('revision',['071','072'])
+def test_replacement_accepts_only_exact_audited_failure_with_original_claim(immutable_failure,archived,revision):
     root,claim=immutable_failure
     if not archived:(root/'checksums.sha256').unlink()
-    value=mod.failed_attempt_gate(root)
+    value=mod.failed_attempt_gate(root,revision)
     assert value['prior_optimizer_updates']==0
     assert claim.exists()
 
 
 @pytest.mark.parametrize('change',['extra_update','modified_bytes','missing_file','modified_claim'])
-def test_replacement_rejects_unreviewed_prior_attempt(immutable_failure,change):
+@pytest.mark.parametrize('revision',['071','072'])
+def test_replacement_rejects_unreviewed_prior_attempt(immutable_failure,change,revision):
     root,claim=immutable_failure
     if change=='extra_update':mod.write(root/'update_00.intent.json',dict(step=0))
     if change=='modified_bytes':(root/'failed.json').write_text('{}')
     if change=='missing_file':(root/'failed.json').unlink()
     if change=='modified_claim':claim.write_text('{}')
-    with pytest.raises(ValueError):mod.failed_attempt_gate(root)
+    with pytest.raises(ValueError):mod.failed_attempt_gate(root,revision)
 
 
 def test_cpu_metadata_preflight_checks_all_three_real_synthetic_graph_views(tmp_path,synthetic_runtime):
@@ -236,7 +238,7 @@ def test_metadata_failure_stops_before_any_gpu_worker(tmp_path,monkeypatch):
     monkeypatch.setattr(mod,'metadata_preflight',invalid)
     monkeypatch.setattr(subprocess,'run',forbidden)
     with pytest.raises(ValueError,match='train graph identity'):
-        mod.run(tmp_path/'run','a'*40,0,tmp_path/'split',tmp_path/'source',tmp_path/'wsl',tmp_path/'server',tmp_path/'prior',tmp_path/'failed_prior')
+        mod.run(tmp_path/'run','a'*40,0,tmp_path/'split',tmp_path/'source',tmp_path/'wsl',tmp_path/'server',tmp_path/'prior',tmp_path/'failed_prior',tmp_path/'failed_r1')
     assert (tmp_path/'run/failed.json').exists()
     assert not list((tmp_path/'run').glob('update_*.json'))
     assert (tmp_path/mod.REGISTRY/'attempt.json').exists()

@@ -55,11 +55,12 @@ def setup_factory(monkeypatch):
             return deepcopy(encoder), args(), dict(teacher={'sha256': source['teacher_sha256']},
                                                    init={'sha256': source['init_sha256']})
 
-        def load_a(output, trainer):
+        def load_a(output, trainer, *, reuse_expectation=None):
             calls.append(('A', output, trainer))
             assert type(trainer) is SourceTrainer
             assert trainer.config == mod.CONFIG and trainer.seed == seed
             assert trainer.train.split == 'train' and trainer.train.role == 'source'
+            assert reuse_expectation is None or reuse_expectation == source
             return deepcopy(encoder), deepcopy(source), {'formal_source': True}
 
         monkeypatch.setattr(mod, 'load_route_b_encoder', load_b)

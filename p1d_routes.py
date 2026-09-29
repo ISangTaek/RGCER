@@ -131,11 +131,13 @@ class RouteFactory:
     def expected_identity(self):
         return deepcopy(self._expected)
 
-    def make_trainer(self, *, original=False, arm='B1_high', device='cpu'):
+    def make_trainer(self, *, original=False, arm='B1_high', device='cpu', source_content_only=False):
         require(type(original) is bool, 'original must be boolean')
         spec = OptimizationSpec(arm)
         require(not original or arm == 'B1_high', 'original requires B1_high')
         require(type(device) is str and device in ('cpu', 'cuda:0'), 'device scope')
+        require(type(source_content_only) is bool and (not source_content_only or
+                (device=='cpu' and original and self._route=='A')), 'source content-only scope')
         table, route, seed = self._table, self._route, self._seed
         _exact(table.identity, self._expected['input_identity'], 'input_identity')
         train = table.view(route, 'target', 'train')
@@ -154,7 +156,11 @@ class RouteFactory:
             args = SimpleNamespace(**deepcopy(ARCH))
             source_trainer = SourceTrainer(args, table.view('A', 'source', 'train'),
                                            seed=seed, config=CONFIG, device=device)
-            encoder, source, _ = load_source(self._output, source_trainer)
+            if source_content_only:
+                encoder, source, _ = load_source(self._output, source_trainer,
+                                                reuse_expectation=self._expected['source_identity'])
+            else:
+                encoder, source, _ = load_source(self._output, source_trainer)
             trainer_type = RouteATrainer
         _exact(source, self._expected['source_identity'], 'source_identity')
         _exact(vars(args), self._expected['architecture'], 'architecture')
