@@ -99,6 +99,9 @@ class TrainSupport:
             others = [v for c,v in fingerprints.items() if c != canonical and unique[c] != unique[canonical]]
             values[canonical] = (max(DataStructs.BulkTanimotoSimilarity(fp, others)) if others else 0., float(bool(others)))
         self.values = values
+        self._fingerprints = fingerprints
+        self._groups = unique
+        self._generator = generator
         self.identity = dict(schema='v9_support_v1', records_sha256=digest(self.records),
             policy=SPEC['support'], radius=2, bits=2048, chirality=True,
             molecules=len(unique), groups=len(set(unique.values())),
@@ -111,6 +114,21 @@ class TrainSupport:
             key = (task, str(sid))
             require(key in self.by_key and self.by_key[key]['canonical'] == molecule, 'support sample/chemical identity')
             rows.append(self.values[molecule])
+        return torch.tensor(rows, dtype=torch.float32)
+
+    def for_inference(self, canonical, groups):
+        """Query immutable train references, never insert a held-out molecule."""
+        from rdkit import Chem, DataStructs
+        require(len(canonical) == len(groups) and bool(canonical), 'inference support population')
+        rows = []
+        for molecule, group in zip(canonical, groups):
+            require(type(molecule) is str and type(group) is str and group, 'query identity')
+            mol = Chem.MolFromSmiles(molecule)
+            require(mol is not None, 'invalid query molecule')
+            others = [fp for c,fp in self._fingerprints.items()
+                      if c != molecule and self._groups[c] != group]
+            query = self._generator.GetFingerprint(mol)
+            rows.append((max(DataStructs.BulkTanimotoSimilarity(query, others)) if others else 0., float(bool(others))))
         return torch.tensor(rows, dtype=torch.float32)
 
 
