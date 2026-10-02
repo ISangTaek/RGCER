@@ -104,20 +104,50 @@ def optimizer_steps(model, optimizer):
     return {n:int(optimizer.state[p]['step']) for n,p in model.named_parameters() if p in optimizer.state}
 
 
-def identity_for(trainer, source, job, training, validation, commit, spec):
-    return dict(task=TASK,job=job,commit=commit,spec=spec,contract_sha256=digest(s2.c0.contract(job['setting'])),
+def check_populations(setting, training, validation, source_rows, *, excluded_canonical=None):
+    """Route B excludes exact molecules across databases, not shared scaffolds."""
+    require(setting in s2.c0.SETTINGS, 'population setting')
+    for rows, split in ((training,'train'),(validation,'validation'),(source_rows,'train')):
+        require(rows and all(r['split'] == split for r in rows), 'population split')
+        require(all(type(r[k]) is str and r[k] for r in rows for k in ('canonical','group')), 'population metadata')
+    train_c={r['canonical'] for r in training}; valid_c={r['canonical'] for r in validation}
+    train_g={r['group'] for r in training}; valid_g={r['group'] for r in validation}
+    source_c={r['canonical'] for r in source_rows}; source_g={r['group'] for r in source_rows}
+    require(not train_c & valid_c, 'target train/validation canonical overlap')
+    require(not train_g & valid_g, 'target train/validation scaffold overlap')
+    require(not source_c & valid_c, 'auxiliary/target validation canonical overlap')
+    shared=sorted(source_g & valid_g)
+    if setting == 'B':
+        require(type(excluded_canonical) in (set,frozenset) and
+                all(type(v) is str and v for v in excluded_canonical), 'all-partition Tox canonical reference required')
+        require(not (train_c | valid_c) & excluded_canonical, 'Route B target/all-partition Tox canonical overlap')
+    else:
+        require(not shared, 'same-dataset auxiliary/target validation scaffold overlap')
+    return dict(setting=setting,rule='exact_canonical_all_tox_partitions' if setting == 'B' else 'same_dataset_scaffold_disjoint',
+                canonical_overlap=[],shared_scaffold_groups=shared,
+                validation_observations_in_shared_scaffolds=[r for r in validation if r['group'] in shared],
+                excluded_canonical_sha256=digest(sorted(excluded_canonical)) if setting == 'B' else None)
+
+
+def population_check(factory, source, setting, training, validation):
+    # Dataset115Table.load binds this set to the frozen full Tox manifest.
+    excluded=factory._table.overlaps if setting == 'B' else None
+    return check_populations(setting,training,validation,source.rows,excluded_canonical=excluded)
+
+
+def identity_for(trainer, source, job, training, validation, commit, spec, *, task_id=TASK):
+    return dict(task=task_id,job=job,commit=commit,spec=spec,contract_sha256=digest(s2.c0.contract(job['setting'])),
                 initial_encoder=state_dict_sha256(trainer.model.encoder),initial_target_heads=state_dict_sha256(trainer.model.decoders),
                 source=source.identity,train_sha256=digest(training),validation_sha256=digest(validation))
 
 
-def train_one(factory, trainer, source, job, out, commit, device, reference, spec=SPEC):
+def train_one(factory, trainer, source, job, out, commit, device, reference, spec=SPEC, *, task_id=TASK):
     require(job in jobs(), 'job outside nine-run matrix')
     setting,method = job['setting'],job['method']; tasks,counts = s2.c0.tasks_and_counts(setting)
     require({t:len(d) for t,d in s2.datasets_for(factory,trainer,setting)['train'].items()} == counts, 'target counts')
     training = s2.observations(factory,trainer,setting,'train'); validation = s2.observations(factory,trainer,setting,'validation')
-    require(not {r['canonical'] for r in source.rows} & {r['canonical'] for r in validation}
-            and not {r['group'] for r in source.rows} & {r['group'] for r in validation}, 'auxiliary/target validation overlap')
-    identity = identity_for(trainer,source,job,training,validation,commit,spec)
+    population_check(factory,source,setting,training,validation)
+    identity = identity_for(trainer,source,job,training,validation,commit,spec,task_id=task_id)
     old = reference['identity']
     require(identity['initial_encoder'] == read(s2.c2b.LOCK)['initial_encoders'][setting] == old['initial_encoder']
             and identity['initial_target_heads'] == old['initial_heads']
@@ -163,7 +193,7 @@ def train_one(factory, trainer, source, job, out, commit, device, reference, spe
     rows,score = s2.evaluate(factory,trainer,setting,None,validation,device,best_epoch-1)
     require(rows == read(out/f'validation_epoch_{best_epoch:03d}.json'), 'selected checkpoint replay')
     write(out/'selected_validation.json',rows)
-    result = dict(task=TASK,job=job,commit=commit,identity=identity,history=history,best_epoch=best_epoch,updates=updates,
+    result = dict(task=task_id,job=job,commit=commit,identity=identity,history=history,best_epoch=best_epoch,updates=updates,
                   selected=score,checkpoint_sha256=sha(out/'best.pt'),selected_state_sha256=state_dict_sha256(model),
                   selected_encoder=state_dict_sha256(model.encoder),final_encoder=final_encoder,
                   checkpoint_validation_replay=True,test_evaluated=False,scientific_acceptance='PENDING_REVIEW',
@@ -193,11 +223,12 @@ def check_optimizer(model, opt, actual, recorded, target_plan, auxiliary_plan, w
                 and all(value[k].shape == p.shape and value[k].dtype == p.dtype for k in ('exp_avg','exp_avg_sq')), 'Adam state '+n)
 
 
-def verify_job(factory, trainer, source, job, out, commit, reference, spec=SPEC):
+def verify_job(factory, trainer, source, job, out, commit, reference, spec=SPEC, *, task_id=TASK):
     r = read(out/'receipt.json'); setting=job['setting']; tasks,counts=s2.c0.tasks_and_counts(setting)
     training=s2.observations(factory,trainer,setting,'train'); validation=s2.observations(factory,trainer,setting,'validation')
-    identity=identity_for(trainer,source,job,training,validation,commit,spec)
-    require(r['identity'] == read(out/'identity.json') == identity and r['task'] == TASK and r['job'] == job and r['commit'] == commit, 'receipt identity')
+    population_check(factory,source,setting,training,validation)
+    identity=identity_for(trainer,source,job,training,validation,commit,spec,task_id=task_id)
+    require(r['identity'] == read(out/'identity.json') == identity and r['task'] == task_id and r['job'] == job and r['commit'] == commit, 'receipt identity')
     for name,value in [('train_observations',training),('validation_observations',validation),('source_train_observations',source.rows)]:
         require(read(out/(name+'.json')) == value, 'trusted '+name)
     old=reference['identity']
