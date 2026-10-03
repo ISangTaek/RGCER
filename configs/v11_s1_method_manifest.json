@@ -1,0 +1,195 @@
+{
+  "schema": "v11_s1_methods_v1",
+  "implementations": "independent_core_adaptations_not_full_author_benchmark_reproductions",
+  "configuration_multiplier": [
+    1.0,
+    0.3
+  ],
+  "configurations": {
+    "REALMLP_MV": {
+      "width": 256,
+      "depth": 3,
+      "lr": 0.07,
+      "decay": 0.0,
+      "betas": [
+        0.9,
+        0.95
+      ],
+      "schedule": "coslog4"
+    },
+    "TABM_MV": {
+      "width": 512,
+      "depth": 3,
+      "k": 32,
+      "dropout": 0.1,
+      "lr": 0.002,
+      "decay": 0.0003
+    },
+    "FT_TRANSFORMER_MV": {
+      "width": 192,
+      "depth": 3,
+      "heads": 8,
+      "lr": 0.0001,
+      "decay": 1e-05
+    },
+    "EXCELFORMER_MV": {
+      "width": 192,
+      "depth": 3,
+      "heads": 8,
+      "lr": 0.0001,
+      "decay": 1e-05
+    },
+    "AMFORMER_MV": {
+      "width": 192,
+      "depth": 3,
+      "heads": 8,
+      "groups": 32,
+      "lr": 0.0001,
+      "decay": 1e-05
+    },
+    "T2G_FORMER_MV": {
+      "width": 192,
+      "depth": 3,
+      "heads": 8,
+      "lr": 0.0001,
+      "decay": 1e-05
+    },
+    "MAMBULAR_MV": {
+      "width": 64,
+      "depth": 4,
+      "state": 128,
+      "expand": 2,
+      "conv": 4,
+      "lr": 0.0001,
+      "decay": 1e-06
+    },
+    "GRANDE_MV": {
+      "depth": 5,
+      "trees": 1024,
+      "selected": 50,
+      "dropout": 0.2,
+      "lr": 0.001,
+      "decay": 0.0
+    },
+    "MODERNNCA_MV": {
+      "width": 128,
+      "depth": 1,
+      "block": 512,
+      "dropout": 0.1,
+      "sample_rate": 0.5,
+      "lr": 0.01,
+      "decay": 0.0002
+    },
+    "TCF": {
+      "width": 64,
+      "rank": 4,
+      "lr": 0.001,
+      "decay": 0.0001
+    },
+    "MV_CONCAT_MLP": {
+      "width": 64,
+      "rank": 4,
+      "lr": 0.001,
+      "decay": 0.0001
+    },
+    "TCF_GRAPH_ONLY": {
+      "width": 64,
+      "rank": 4,
+      "lr": 0.001,
+      "decay": 0.0001
+    }
+  },
+  "upstream": {
+    "amformer": {
+      "repo": "aigc-apps/AMFormer",
+      "commit": "afd31a30aa0942ee8274fe2e0e0fb044ea9c21ee",
+      "inspected_sources_sha256": {
+        "config/cfg.py": "ce931210c744e0aa3cc015b0b3ce5198ff298c55918ddba3289a276256293695",
+        "LICENSE": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+        "models/__init__.py": "a1e8ce7a8ae6e73e43f7e2957dafce77f7b506b349b1b73c4e299616b18ea610",
+        "models/AM_Former.py": "457b4d84414f203cfcf2545a42409807c269a45b9c2add4333c2eee9f7531f81",
+        "models/Attention/blocks.py": "3d21cfd8bac5fd705f5614a0544c0656c5c8ddf41bcc0404ef9a8c97e1627df6",
+        "models/Attention/blocks1_9.py": "1567bd21ff62d5a23f554d2289125724af6016438f0edd6dc219a7a6ea725da7"
+      }
+    },
+    "excelformer": {
+      "repo": "WhatAShot/ExcelFormer",
+      "commit": "17f70526390e70390bb8c8ec3850697eb730f9cd",
+      "inspected_sources_sha256": {
+        "bin/excel_former.py": "f3b0e8fb7ba5968f956bc042adfb8293784bee06b70cc51e88cb288b01ce470c"
+      }
+    },
+    "fttransformer": {
+      "repo": "yandex-research/rtdl-revisiting-models",
+      "commit": "e3ed46cac38568785289d8fa16b8cfa585bde27e",
+      "inspected_sources_sha256": {
+        "LICENSE": "bd39fcc730a79d256b14fcdccbfc8ac9f0c7fad4a2e8d01fc513def67980fe35",
+        "package/rtdl_revisiting_models.py": "ca7cef3b44cd54b1aeb51f2cc733bef01fbfe3eff00b5c2bd28ca4b4db6b01b2"
+      }
+    },
+    "grande": {
+      "repo": "s-marton/GRANDE",
+      "commit": "07f7278b30ab9ebbbdc544e5f9a91f1b5df7fecb",
+      "inspected_sources_sha256": {
+        "GRANDE/__init__.py": "04cd9d9fc74e4cc8ba5fcae2d7f3ada10e76a2642bccb45c684cc56fed3e7735",
+        "GRANDE/GRANDE.py": "53f58a980b751aca88ef61615d9e4b1904525952afcbed2678396c877f998064",
+        "GRANDE/tf_legacy/GRANDE.py": "8a5c42dc87c77f9816dcfc44db78afc96142f737f897694f4f6dca330f13ae3e",
+        "LICENSE": "c433b2b805878f09d67ab901d67ee26168779f39ec192dabc414b5ccfc7ab99a"
+      }
+    },
+    "mambular": {
+      "repo": "basf/mamba-tabular",
+      "commit": "f6b85fc2f6537ae4782519abc6ff756d9ebd22fc",
+      "inspected_sources_sha256": {
+        "deeptab/architectures/mambular.py": "f7bc2bc747be38924b61fbb6dbd87969da674cf894799b13f4341851fe196093",
+        "deeptab/configs/models/mambular_config.py": "f57d6b3e29ba6b63a0866ac20fbd1c4c61e18a71d32c0b89e4e376595f1d627e",
+        "deeptab/models/mambular.py": "fb80cb1efabd759748c150a6b0669d7d043cfa1e4d1dad022e0b3e79b2d10420",
+        "deeptab/nn/blocks/mamba.py": "8fa04d0b1e86fa7c2c46b28722d5818721375227f2f88868fa8468080d610048",
+        "LICENSE": "ea218d93d8e7d93fa7bf4ebde9fdc819a1a0bea19a6465cd9365b98a91c0ba5c"
+      }
+    },
+    "modernnca": {
+      "repo": "LAMDA-Tabular/TALENT",
+      "commit": "1b973adffa4203c3f62c4949957b1ba3efbe60d3",
+      "inspected_sources_sha256": {
+        "LICENSE": "93cf90600c386cb5719779090fbc37080d5833eeec8d1f66cc370ba48af2d422",
+        "TALENT/configs/default/modernNCA.json": "ea4dc58f92ea9c5d0be7e1c35b38d28d247b6d3c589da10e16c2dcd951a74700",
+        "TALENT/model/methods/modernNCA.py": "91348eac32918fb5fe74f6f8813e3966b434bc2c994eb4bc19cba0c69d018565",
+        "TALENT/model/models/modernNCA.py": "02fce6a107998ab7212774507998e77535f630fbf4ee328acf8519ad7c10632f"
+      }
+    },
+    "realmlp": {
+      "repo": "dholzmueller/pytabkit",
+      "commit": "c126ea51187c5080b91f28d352481dbd3b2194b0",
+      "inspected_sources_sha256": {
+        "LICENSE.txt": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1",
+        "pytabkit/models/nn_models/activations.py": "e5b0f797dd055068856dc90b5072c281fc3beaab025c08a072b933a23d135cfd",
+        "pytabkit/models/nn_models/models.py": "73fae0a13d019d677c7e40dc96f4c594019ddecf4894fb53109da6eb4e7e29d0",
+        "pytabkit/models/nn_models/nn.py": "ed3e78bb87a0efa8d18de8bf5a22de41b4748ab0fdef8d57c618e51c77cba6f9",
+        "pytabkit/models/nn_models/pipeline.py": "0e5d905d43c8410270a87215bcad18c367efdaa0d3266eb2abdce1d90e88d866",
+        "pytabkit/models/sklearn/default_params.py": "2ef2e46ac5909121e506c0cefbbbb7f711cc83e89676515605d8d7105b43a8bf",
+        "pytabkit/models/training/nn_creator.py": "1916809520f7dc475e304de06c88aa6ec94b4721154f1b7c8cca5e4f280e1d7e",
+        "pytabkit/models/training/scheduling.py": "610483b913945c8ac7e2613b48edd2ef135198da9d826628ebed8d84ff54867e"
+      }
+    },
+    "t2g": {
+      "repo": "jyansir/t2g-former",
+      "commit": "3ad093d7967b726b265606251ec267daa0756427",
+      "inspected_sources_sha256": {
+        "bin/t2g_former.py": "69bd82f3f5a84478543a1818414bcd2b1b25d3519418b44f387512ce0441c219",
+        "configs/default/T2GFormer/cfg.json": "84000c19e69910da81958631945eb405cc411aebc3f90a1ae96e7fc8d4c3db46",
+        "LICENSE": "64bf656b294f236b834b09fc0df0b1db83b0a1c8afc9ab091e25c311fca70a35",
+        "run_t2g.py": "0f2dbc2133cf0b556068557ddeb89409b229283a5568593654c9d72352e2bc0a",
+        "tune_t2g.py": "88a17d69ea41819dfa59a13ac5d72ccc9796fd7433d3842301345aae38f22dc4"
+      }
+    },
+    "tabm": {
+      "repo": "yandex-research/tabm",
+      "commit": "28e47ae301c92ec37787dde1ce923a0793f405b4",
+      "inspected_sources_sha256": {
+        "LICENSE": "24330ebf083bc17c1db833b0109ef6ffc9019449330e9e4ec9797c061185c7a6",
+        "paper/bin/model.py": "81144b9f520d3e57d9c5b3a8b0dfb1f800191d57dee229148fe88211df15dd19"
+      }
+    }
+  }
+}
