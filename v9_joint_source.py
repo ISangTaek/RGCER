@@ -73,13 +73,15 @@ class Source:
         return batch
 
 
-def load(factory, trainer, setting, repo, source_lock):
+def load(factory, trainer, setting, repo, source_lock, *, seed=42):
+    require(type(seed) is int and seed in range(42,47), 'source seed scope')
     base = trainer.model
     if setting == 'A':
         from dataset115_adapter import GraphTaskView, TrainOnlyScaler
         from dataset115_contract import semantic_digest
         path = factory._output/'epoch_039.pt'
         binding = factory.expected_identity['source_identity']
+        require(binding['seed'] == seed, 'same-seed Route A source')
         require(sha(path) == binding['teacher_sha256'], 'Route A source checkpoint SHA')
         payload = torch.load(path, map_location='cpu', weights_only=True)
         require(type(payload['epoch']) is int and payload['epoch'] == 39 and semantic_digest(payload['identity']) == payload['identity_sha256']
@@ -103,7 +105,7 @@ def load(factory, trainer, setting, repo, source_lock):
         from s4e_mechanism_smoke import state_from_asset
         from p1d4_identity import LOCK
         from toxacute_datastore import ToxAcuteDataStore, ToxAcuteTaskDataset
-        teacher,_ = load_binding(source_lock,42)
+        teacher,_ = load_binding(source_lock,seed)
         payload,state,_ = state_from_asset(repo,teacher)
         store = factory.store if setting == 'ToxAcute' else ToxAcuteDataStore.resolve(repo/read(LOCK)['inputs']['datastore_relative'])
         require(all(payload['data_config'][k] == teacher['data_config'][k] == store.metadata[k]
