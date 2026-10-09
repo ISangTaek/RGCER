@@ -1,0 +1,127 @@
+{
+  "schema": "v12_s1_input_lock_v1",
+  "reference_commit": "8a58dc56c6111675fcc7ef8421a57c316e274122",
+  "graph_commit": "9111793be3adf87ca335be8f44aa86065e38427e",
+  "reference_manifest_sha256": "0cc6d8965c4c0bfcbdf3fbf0e1e46f03e167bb71155b16225d6922e0ecd63cbe",
+  "files": {
+    "checksums.sha256": "0cc6d8965c4c0bfcbdf3fbf0e1e46f03e167bb71155b16225d6922e0ecd63cbe",
+    "reference_086/reference_085/cache/ToxAcute/manifest.json": "9d1db3176b9efd09dab2a72a97972dad2bb828b99e6d205d0d04ee6118fad356",
+    "reference_086/reference_085/cache/ToxAcute/cache.pt": "7274ddbf7e3a8528464a3941cce0da05818b5017ddcf11b434cbbc38fb1d6f87",
+    "chemical/ToxAcute/manifest.json": "801242b44f0757141552fd7e7adbc6e1d4da59d40b8b82356499b52d363e9205",
+    "chemical/ToxAcute/chemical.pt": "811303cca517161ae43c52d4e37b9bc65cc71525b7c707c0cb76da6d8545722a",
+    "reference_086/reference_085/references/084/ToxAcute_lr1e3_s42/source_evidence/source_train_observations.json": "427a71421c82de0733ba5099e228f6cd4f3fa89aef5e0d9429ff9ab86970e184",
+    "reference_086/reference_085/references/084/ToxAcute_lr1e3_s42/source_evidence/train_observations.json": "548e3039767baf1ab5df0ded1912d3115b531dd3818330f36ffc0e65891d4dd4",
+    "reference_086/reference_085/references/084/ToxAcute_lr1e3_s42/source_evidence/validation_observations.json": "dea62b0dc9c0834106f34f7dc326ac45157e9cbafa17eaa08b1d4f56d1590ea5",
+    "reference_086/ToxAcute_DCR_RETRIEVAL_FIRST_c0_s42/selected_validation.json": "b733d497c294c77ba7b81de17e6e86292230a59f51d76ad92b1fde047dda41b9",
+    "reference_086/reference_085/cache/A/manifest.json": "86026e1d8350a69eb493607de0b511dac325c2db45e9c52325f4d69c6e457a30",
+    "reference_086/reference_085/cache/A/cache.pt": "8dd2887eb23175d77aecc2ca4e87b6272234de7704daeafe0b68df207ce4239d",
+    "chemical/A/manifest.json": "6e04c4c7f965a693dbc6be39d153fdbe011b1342c22f25e8d78b0f552604c730",
+    "chemical/A/chemical.pt": "c10ff2623673d3481a03205fc3160e3469f76e005e59be609ee8d3fcded264e7",
+    "reference_086/reference_085/references/084/A_lr1e3_s42/source_evidence/source_train_observations.json": "30dbff92b11d24da1a32abeb937da527328db13c3a8d240239b0f47b48d043d3",
+    "reference_086/reference_085/references/084/A_lr1e3_s42/source_evidence/train_observations.json": "587bb1e79d0c308a6027420c6d3a0d05fda3d805d6a2b9c926ab08ce9bdfe24e",
+    "reference_086/reference_085/references/084/A_lr1e3_s42/source_evidence/validation_observations.json": "3ee20dede5726a4d6a45b61425e30b3d92e3a1aae6cbcf828123ecce7a9ad23c",
+    "A_MV_CONCAT_MLP_c0_s42/selected_validation.json": "b98630f37fa5aac1fcc72a6c084350f13360b4d7b76370b2d306b7b134b7fe26",
+    "reference_086/reference_085/cache/B/manifest.json": "c69892722dccb422099232502d0191d1b89a3dfeade00bc75189c45ff9361583",
+    "reference_086/reference_085/cache/B/cache.pt": "021c69ca9340c3a58b81ceff4305c17156a1f9035010af2be72f1a69eacb095c",
+    "chemical/B/manifest.json": "16bd18ed7932fc2cba43165215ec0409593ba2bc5e32bb62d771d45949c5eb6a",
+    "chemical/B/chemical.pt": "ad7aa7cda26c2108256bd5ec31418a7c0d1044854a3d2c8a40ae0690cb4a175c",
+    "reference_086/reference_085/references/084/B_lr1e3_s42/source_evidence/source_train_observations.json": "427a71421c82de0733ba5099e228f6cd4f3fa89aef5e0d9429ff9ab86970e184",
+    "reference_086/reference_085/references/084/B_lr1e3_s42/source_evidence/train_observations.json": "5c700c2dcc603e32dca23bdcf1ac4c47f1e22b2373cbe7779f9248805be8fdc5",
+    "reference_086/reference_085/references/084/B_lr1e3_s42/source_evidence/validation_observations.json": "6ec29db6e10ee7895fba9092327e42687b8567f2f3a21ac23aef010ef60ba0b3",
+    "B_TCF_GRAPH_ONLY_c0_s42/selected_validation.json": "88a44bb802414bcff38ce8cd505872cd306f8fbd683de702704ed79310118263"
+  },
+  "scenes": {
+    "ToxAcute": {
+      "graph_manifest": "reference_086/reference_085/cache/ToxAcute/manifest.json",
+      "graph_cache": "reference_086/reference_085/cache/ToxAcute/cache.pt",
+      "chemical_manifest": "chemical/ToxAcute/manifest.json",
+      "chemical_cache": "chemical/ToxAcute/chemical.pt",
+      "source_rows": "reference_086/reference_085/references/084/ToxAcute_lr1e3_s42/source_evidence/source_train_observations.json",
+      "target_rows": "reference_086/reference_085/references/084/ToxAcute_lr1e3_s42/source_evidence/train_observations.json",
+      "validation_rows": "reference_086/reference_085/references/084/ToxAcute_lr1e3_s42/source_evidence/validation_observations.json",
+      "reference_predictions": "reference_086/ToxAcute_DCR_RETRIEVAL_FIRST_c0_s42/selected_validation.json",
+      "expected_counts": {
+        "sources": 56,
+        "targets": 3,
+        "source_observations": 78063,
+        "target_observations": 262,
+        "validation_observations": 39,
+        "target_train_shared_source_molecules": 225
+      }
+    },
+    "A": {
+      "graph_manifest": "reference_086/reference_085/cache/A/manifest.json",
+      "graph_cache": "reference_086/reference_085/cache/A/cache.pt",
+      "chemical_manifest": "chemical/A/manifest.json",
+      "chemical_cache": "chemical/A/chemical.pt",
+      "source_rows": "reference_086/reference_085/references/084/A_lr1e3_s42/source_evidence/source_train_observations.json",
+      "target_rows": "reference_086/reference_085/references/084/A_lr1e3_s42/source_evidence/train_observations.json",
+      "validation_rows": "reference_086/reference_085/references/084/A_lr1e3_s42/source_evidence/validation_observations.json",
+      "reference_predictions": "A_MV_CONCAT_MLP_c0_s42/selected_validation.json",
+      "expected_counts": {
+        "sources": 104,
+        "targets": 5,
+        "source_observations": 75872,
+        "target_observations": 407,
+        "validation_observations": 133,
+        "target_train_shared_source_molecules": 270
+      }
+    },
+    "B": {
+      "graph_manifest": "reference_086/reference_085/cache/B/manifest.json",
+      "graph_cache": "reference_086/reference_085/cache/B/cache.pt",
+      "chemical_manifest": "chemical/B/manifest.json",
+      "chemical_cache": "chemical/B/chemical.pt",
+      "source_rows": "reference_086/reference_085/references/084/B_lr1e3_s42/source_evidence/source_train_observations.json",
+      "target_rows": "reference_086/reference_085/references/084/B_lr1e3_s42/source_evidence/train_observations.json",
+      "validation_rows": "reference_086/reference_085/references/084/B_lr1e3_s42/source_evidence/validation_observations.json",
+      "reference_predictions": "B_TCF_GRAPH_ONLY_c0_s42/selected_validation.json",
+      "expected_counts": {
+        "sources": 56,
+        "targets": 5,
+        "source_observations": 78063,
+        "target_observations": 261,
+        "validation_observations": 83,
+        "target_train_shared_source_molecules": 0
+      }
+    }
+  },
+  "feature_spec": {
+    "schema": "v11_chemical_views_v1",
+    "rdkit": "2025.09.6",
+    "fingerprint": {
+      "radius": 2,
+      "fpSize": 2048,
+      "includeChirality": true
+    },
+    "descriptors": [
+      "MolWt",
+      "MolLogP",
+      "TPSA",
+      "NumHDonors",
+      "NumHAcceptors",
+      "NumRotatableBonds",
+      "RingCount",
+      "NumAromaticRings",
+      "NumAliphaticRings",
+      "NumSaturatedRings",
+      "NumHeterocycles",
+      "FractionCSP3",
+      "HeavyAtomCount",
+      "NHOHCount",
+      "NOCount",
+      "NumValenceElectrons",
+      "BertzCT",
+      "BalabanJ",
+      "Chi0v",
+      "Chi1v",
+      "HallKierAlpha",
+      "Kappa1",
+      "Kappa2",
+      "Kappa3"
+    ],
+    "bitorder": "little",
+    "statistics": "all_legal_train_observations_with_multiplicity",
+    "standardization": "accepted_canonical_SMILES_no_new_standardization"
+  }
+}
