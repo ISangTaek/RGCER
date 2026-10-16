@@ -1,0 +1,51 @@
+{
+  "format": "PGTV2_METHODS_1",
+  "input_policy": "All methods use GraphCache.read registered Mol; display SMILES never reparsed",
+  "methods": {
+    "M0": "Morgan radius2 2048 chiral RF per original-scale endpoint",
+    "M1": "Chemprop D-MPNN 59 outputs depth3/5",
+    "M2": "Graph token HPS",
+    "M3": "ToxACoL-harmonized",
+    "M4": "Existing molecule-adaptive Prompt Router; factor residual .1, relation0, topk8",
+    "M5": "Shared-query atom attention",
+    "M6": "Task-ID atom attention",
+    "A1": "Metadata atom attention; factor residual 1",
+    "A2": "ADD-C task-query attention with signed task-conditioned values",
+    "A3": "Mean atom linear additive"
+  },
+  "point_head_methods": [
+    "M2",
+    "M4",
+    "M5",
+    "M6",
+    "A1"
+  ],
+  "point_head": "LayerNorm96 Linear96 GELU Dropout.1 Linear1",
+  "M5_M6_capacity": "Only query bank differs: 1x96 versus Tx96; no unused dummy parameters",
+  "toxacol": {
+    "commit": "704edcb951ab397e31561bc130154d01e0103b3c",
+    "native_subject_channels": 15,
+    "preserved": [
+      "1024 Avalon features",
+      "26 endpoint features",
+      "768/512/384/64 MLP GCN correlation network",
+      "native 15 subjects including man/women/human"
+    ],
+    "harmonized": [
+      "shared corrected structures and grouped folds",
+      "train-visible adjacency only; minshared15 PCC>=.75",
+      "train-visible per-task standardization and equal-endpoint loss",
+      "AdamW constant LR 1e-4/3e-4 wd1e-4 clip5",
+      "dropout .1/.3 across all four FCL blocks",
+      "200 epochs; min40 patience30; validation macroRMSE",
+      "BN singleton tail merged, fixed microbatch; running statistics saved"
+    ]
+  },
+  "chemprop": {
+    "version": "1.6.1",
+    "commit": "f3d1bff19a6e1b03d28e9cfabdf4c80dd8c67382",
+    "fallback": null,
+    "changes": "Same common train/scaler/loss/selection as other neural models; constant LR instead of Noam"
+  },
+  "real_data_fit_authorized_in_C03": false
+}

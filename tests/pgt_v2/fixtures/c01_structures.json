@@ -1,0 +1,56 @@
+{
+  "fixture_version": "C01-20261016-1",
+  "rdkit_observed": "2025.09.6",
+  "label_values_included": false,
+  "is_new_input_policy_fully_implemented": false,
+  "cases": [
+    {
+      "raw_row_index": 12241,
+      "record_id": "row_12241",
+      "TAID": "TOX-15100",
+      "raw_smiles_upper": "O=[N+]([O-])c1cc/c2c(c1)=C(c1ccccc1)/N=c1/ccc([N+](=O)[O-])cc1=C(c1ccccc1)/N=2",
+      "selected_smiles_lower": "O=[N+]([O-])c1cc/c2c(c1)=C(c1ccccc1)/N=c1\\ccc([N+](=O)[O-])cc1=C(c1ccccc1)/N=2",
+      "locked_author_raw_smiles": "O=[N+]([O-])c1cc/c2c(c1)=C(c1ccccc1)/N=c1/ccc([N+](=O)[O-])cc1=C(c1ccccc1)/N=2",
+      "upstream_RTECS_ID": "0005688653",
+      "upper_to_author_full_graph_with_chirality_match": true,
+      "case_type": "STEREO_ROUNDTRIP_CONFLICT",
+      "new_input_disposition": "Hold automatic materialization. C02 must preserve a verified parsed reference graph and validate mappings; no repeated serialization until convergence, no stereo dropping.",
+      "reference_scope": "Author raw SMILES parsed graph is an implementation reference; it does not recover stereochemistry of the original toxicity experiment."
+    },
+    {
+      "raw_row_index": 14108,
+      "record_id": "row_14108",
+      "TAID": "TOX-16967",
+      "raw_smiles_upper": "O=C(c1ccccc1C(=O)N1C(=O)c2ccccc2C1=O)N1C(=O)c2ccccc2C1=O",
+      "selected_smiles_lower": "O=C1c2ccccc2C(=O)N1C(=O)c1ccccc1C(=O)N1C(=O)c2ccccc2C1=O",
+      "locked_author_raw_smiles": "O=C(c1ccccc1C(=O)N1C(=O)c2ccccc2C1=O)N1C(=O)c2ccccc2C1=O",
+      "upstream_RTECS_ID": "0007399066",
+      "upper_to_author_full_graph_with_chirality_match": true,
+      "case_type": "GRAPH_EQUIVALENT_CANONICAL_STRING_CYCLE",
+      "new_input_disposition": "Hold automatic materialization. C02 must preserve a verified parsed reference graph and validate mappings; no repeated serialization until convergence, no stereo dropping.",
+      "reference_scope": "Author raw SMILES parsed graph is an implementation reference; it does not recover stereochemistry of the original toxicity experiment."
+    },
+    {
+      "raw_row_index": 62606,
+      "record_id": "row_62606",
+      "TAID": "TOX-65467",
+      "raw_smiles_upper": "Cc1nc2c(Br)cc(Br)cc2c(=O)n1CCOC(=O)CNC1CCCCC1",
+      "selected_smiles_lower": "Cc1nc2c(Br)cc(Br)cc2c(=O)n1CCOC(=O)CNC1CCCCC1",
+      "source_inchikey": "MOPMVAJJRVXFKE-UHFFFAOYSA-N",
+      "computed_inchikey": "LGDRKYNOCCLWIH-UHFFFAOYSA-N",
+      "case_type": "SOURCE_IDENTIFIER_COLLISION_NOT_CHEMICAL_DUPLICATE",
+      "new_input_disposition": "Preserve source identifier as unverified metadata; never merge by this source field alone."
+    },
+    {
+      "raw_row_index": 79722,
+      "record_id": "row_79722",
+      "TAID": "TOX-113366",
+      "raw_smiles_upper": "Cc1nc2c(Br)cc(Br)cc2c(=O)n1CCOC(=O)CNc1ccccc1",
+      "selected_smiles_lower": "Cc1nc2c(Br)cc(Br)cc2c(=O)n1CCOC(=O)CNc1ccccc1",
+      "source_inchikey": "MOPMVAJJRVXFKE-UHFFFAOYSA-N",
+      "computed_inchikey": "MOPMVAJJRVXFKE-UHFFFAOYSA-N",
+      "case_type": "SOURCE_IDENTIFIER_COLLISION_NOT_CHEMICAL_DUPLICATE",
+      "new_input_disposition": "Preserve source identifier as unverified metadata; never merge by this source field alone."
+    }
+  ]
+}

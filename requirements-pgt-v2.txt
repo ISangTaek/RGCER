@@ -1,0 +1,17 @@
+# Dedicated PGT V2 environment; keep existing GPU torch stack intact.
+# Install the suitable PyTorch/PyG stack first, then these small dependencies.
+numpy==1.26.4
+pandas==2.3.3
+scipy==1.15.3
+scikit-learn==1.7.2
+joblib==1.6.0
+lmdb==2.3.0
+rdkit==2025.9.6
+Cython==3.2.9
+typed-argument-parser==1.12.0
+tensorboardX==2.6.5
+hyperopt==0.3.0
+pandas-flavor==0.8.1
+descriptastorus==2.8.0
+pytest==9.0.3
+tqdm==4.67.3

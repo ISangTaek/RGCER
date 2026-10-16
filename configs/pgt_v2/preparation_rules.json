@@ -1,0 +1,237 @@
+{
+  "design_id": "PGTV2-C01-SPLIT-DESIGN-1",
+  "status": "RULES_REGISTERED_NOT_MATERIALIZED",
+  "source_sha256": "47b406217dfbe916b0644a11ca071783791dd8a73f2f93685876560b0ab97eae",
+  "task_catalog": "task_catalog.tsv",
+  "candidate_task_names": [
+    "mouse_intraperitoneal_LD50",
+    "mouse_intraperitoneal_LDLo",
+    "mouse_intravenous_LD50",
+    "mouse_intravenous_LDLo",
+    "mouse_oral_LD50",
+    "mouse_oral_LDLo",
+    "mouse_unreported_LD50",
+    "mouse_skin_LD50",
+    "mouse_subcutaneous_LD50",
+    "mouse_subcutaneous_LDLo",
+    "mouse_intramuscular_LD50",
+    "mouse_parenteral_LD50",
+    "rat_intraperitoneal_LD50",
+    "rat_intraperitoneal_LDLo",
+    "rat_intravenous_LD50",
+    "rat_intravenous_LDLo",
+    "rat_oral_LD50",
+    "rat_oral_LDLo",
+    "rat_unreported_LD50",
+    "rat_skin_LD50",
+    "rat_subcutaneous_LD50",
+    "rat_subcutaneous_LDLo",
+    "rat_intramuscular_LD50",
+    "mammal (species unspecified)_intraperitoneal_LD50",
+    "mammal (species unspecified)_oral_LD50",
+    "mammal (species unspecified)_unreported_LD50",
+    "mammal (species unspecified)_subcutaneous_LD50",
+    "guinea pig_intraperitoneal_LD50",
+    "guinea pig_intravenous_LD50",
+    "guinea pig_intravenous_LDLo",
+    "guinea pig_oral_LD50",
+    "guinea pig_skin_LD50",
+    "guinea pig_subcutaneous_LD50",
+    "guinea pig_subcutaneous_LDLo",
+    "rabbit_intraperitoneal_LD50",
+    "rabbit_intravenous_LD50",
+    "rabbit_intravenous_LDLo",
+    "rabbit_oral_LD50",
+    "rabbit_oral_LDLo",
+    "rabbit_skin_LD50",
+    "rabbit_skin_LDLo",
+    "rabbit_subcutaneous_LD50",
+    "rabbit_subcutaneous_LDLo",
+    "dog_intravenous_LD50",
+    "dog_intravenous_LDLo",
+    "dog_oral_LD50",
+    "dog_oral_LDLo",
+    "cat_intravenous_LD50",
+    "cat_intravenous_LDLo",
+    "cat_oral_LD50",
+    "cat_oral_LDLo",
+    "bird-wild_oral_LD50",
+    "quail_oral_LD50",
+    "duck_oral_LD50",
+    "chicken_oral_LD50",
+    "frog_subcutaneous_LDLo",
+    "man_oral_TDLo",
+    "women_oral_TDLo",
+    "human_oral_TDLo"
+  ],
+  "selected_task_names": null,
+  "source_label_values_permitted_for_design": false,
+  "presence_and_structure_inventory_only": true,
+  "source_row_ids": "row_<zero-based original CSV row index>; TAID retained separately",
+  "grouping": {
+    "implementation_state": "PENDING_C02_G01",
+    "identity_prerequisite": "Graph/stereo-preserving model input identity; raw fields and provisional canonical hashes are not final proof.",
+    "union_rule": "Connected components of verified identical model inputs, verified same constitutional/parent-family links, and scaffold or acyclic cluster links; all linked records stay together.",
+    "stereoisomers": "May remain distinct input graphs but may not cross structure groups.",
+    "scaffold": "Non-stereochemical Bemis-Murcko; preserve the complete molecular input; parent normalization only for grouping.",
+    "empty_scaffold": {
+      "algorithm": "RDKit Butina",
+      "fingerprint": "Morgan",
+      "radius": 2,
+      "bits": 2048,
+      "useChirality": false,
+      "similarity_threshold": 0.8,
+      "distance_threshold": 0.2,
+      "input_order": "ascending verified chemical identity",
+      "reordering": false,
+      "cross_cluster_similarity_guarantee": false
+    },
+    "parent_family": "Do not automatically largest-fragment strip salts/metals/mixtures. Simple spectator/uncharger candidate scan found zero distinct-input links; tautomer/complex mixture equivalence remains unproven. Any additional parent union requires a written chemical rule before fold allocation.",
+    "source_inchikey_or_missing_id": "Never merge using a missing ID or an unverified source ID alone.",
+    "group_id": "SHA256 of sorted unique verified identity members with unambiguous length-delimited serialization",
+    "diagnostic_current_group_count": 26578,
+    "diagnostic_is_final": false,
+    "largest_diagnostic_group": {
+      "key": "scaffold::c1ccccc1",
+      "records": 10086,
+      "fraction": 0.1265162253358588
+    },
+    "large_group_policy": "Never split the group to attain a nominal proportion. Report realized proportions; review resource or coverage failure before training."
+  },
+  "default_outer_folds": 5,
+  "fallback_outer_folds": 3,
+  "selected_outer_folds": null,
+  "split_seed": 20261016,
+  "calibration_partition": false,
+  "nominal_fractions_5fold": {
+    "train": 0.7,
+    "validation": 0.1,
+    "test": 0.2
+  },
+  "nominal_fractions_3fold": {
+    "train": 0.5833333333333334,
+    "validation": 0.08333333333333333,
+    "test": 0.3333333333333333
+  },
+  "deterministic_assignment": {
+    "status": "C01 operational default; implementation and actual coverage must be checked before C04 lock",
+    "order": "descending group record count, then ascending SHA256(seed || group_id)",
+    "outer_destinations": "fold IDs 0..K-1; all tasks share this assignment",
+    "objective_lexicographic": [
+      "Sum over partition/task of max(0, minimum_required_groups - groups_with_any_observed_label).",
+      "Mean squared relative-to-total record allocation error plus mean squared relative-to-total task-positive-group allocation error against target fractions."
+    ],
+    "greedy": "For each ordered group, choose the destination minimizing the global objective after placement; exact tie -> lowest destination ID.",
+    "bounded_repair": "At most 20 deterministic passes over the same group order. Move one whole group only for strict lexicographic improvement; destination ties -> lowest ID. Stop on a no-improvement pass. Do not split groups or try alternate seeds.",
+    "inner": "For each outer fold use remaining groups, same ordered greedy/repair to train and validation at ratio 7:1. Group minimums are train=5, validation=2. Outer target minimum=2.",
+    "interpretation": "Failure means the registered algorithm did not meet coverage; not proof no mathematically feasible allocation exists.",
+    "forbidden": "No label magnitude, loss, model performance, error, or candidate-split performance search."
+  },
+  "coverage": {
+    "full_view_min_groups_per_task_per_fold": {
+      "train": 5,
+      "validation": 2,
+      "test": 2
+    },
+    "five_fold_failure": "Run the same registered algorithm once with K=3; preserve both diagnostic reports.",
+    "three_fold_failure": "Return to Codex with exact failing tasks/groups. No silent task removal or automatic relaxation.",
+    "actual_counts": null
+  },
+  "target_block": {
+    "status": "CANDIDATE_ONLY",
+    "qualified_human_priority": [
+      "man_oral_TDLo",
+      "women_oral_TDLo",
+      "human_oral_TDLo"
+    ],
+    "nonhuman_pool": "All 56 other tasks; the 12 sparse rows in target_block_candidates.tsv are diagnostics, not an exclusion list.",
+    "ranking": "Ascending minimum number of independent full-training structure groups across all selected outer folds; task_name lexicographic tie-break.",
+    "max_additional_nonhuman": 3,
+    "unknown_species_or_route": "Kept under their literal unknown category; not silently omitted from the 59 tasks or called a known species/route.",
+    "eligibility": "Full-view coverage rules above; final names frozen at C04 without model results.",
+    "selected": null
+  },
+  "sparse_views": {
+    "new_fractions": [
+      0.1,
+      0.3
+    ],
+    "reuse_full_fraction": 1.0,
+    "subset_seeds": [
+      1042,
+      1043,
+      1044
+    ],
+    "paired_train_seeds": [
+      42,
+      43,
+      44
+    ],
+    "selection_unit": "verified chemical identity; all linked records for the selected target are visible together",
+    "ranking": "SHA256(length-delimited fold_id, task_name, subset_seed, verified chemical_id); identity tie-break",
+    "count": "ceil(fraction * count of full-training labeled chemical identities for that target)",
+    "nested": true,
+    "source_labels": "All non-target labels remain exactly identical between fractions.",
+    "train_visible_min": 1,
+    "train_zero_action": "stop this view; never skip task silently",
+    "scalers_counts_adjacency": "Derived only after applying this exact visible training mask.",
+    "validation_and_test": "Unchanged; disclose full validation label cost, no test-led choice.",
+    "actual_counts": null
+  },
+  "endpoint_differences": {
+    "ordered_candidates": [
+      [
+        "rat_oral_LD50",
+        "mouse_oral_LD50"
+      ],
+      [
+        "rat_oral_LD50",
+        "rat_intravenous_LD50"
+      ],
+      [
+        "mouse_oral_LD50",
+        "mouse_intravenous_LD50"
+      ]
+    ],
+    "difference_direction": "first task minus second task on supplied transformed scale",
+    "min_oof_independent_groups": 20,
+    "min_test_pair_groups_each_fold": 1,
+    "min_train_paired_molecules_each_fold": 10,
+    "eligibility_uses": "label presence, verified chemical identity, same measurement and nominal scale; no difference magnitude",
+    "duplicates": "Preserve source observations; establish any within-task aggregation rule before model fitting. Do not form Cartesian pseudo-replicates.",
+    "causal_paired_experiment": false,
+    "selected_pairs": null
+  },
+  "explanations": {
+    "endpoint_candidates": [
+      "rat_oral_LD50",
+      "mouse_oral_LD50",
+      "rat_intravenous_LD50",
+      "mouse_intravenous_LD50",
+      "man_oral_TDLo",
+      "women_oral_TDLo",
+      "human_oral_TDLo"
+    ],
+    "endpoint_count_max": 7,
+    "fixed_selection": "Use all coverage-qualified candidates; if one fails explain eligibility and leave its slot empty. No replacement based on attractive maps.",
+    "final_panel_freeze": "C06C; retain failures; no explanation image inspection for selection",
+    "mmp": {
+      "cuts": 1,
+      "cut_bond": "single non-ring bond",
+      "common_core_fraction_each_min": 0.6,
+      "variable_fragment_heavy_atoms_each_max": 8,
+      "same_outer_fold": true,
+      "both_labels_required": true,
+      "atom_map_symmetry": "Verified maps; use equivalence classes where ambiguous, never arbitrary numbering.",
+      "counts": null
+    }
+  },
+  "prerequisites_before_training": [
+    "C02 graph/stereo-safe identities and explicit FeatureSpec",
+    "C03 interfaces and environment checks",
+    "G01 actual cache and deterministic fold reports",
+    "C04 signed final protocol lock"
+  ],
+  "old_split_reusable_as_new": false,
+  "internal_historical_development_exposure": true
+}

@@ -1,0 +1,10 @@
+{
+  "row_12241": {
+    "source_sha256": "47b406217dfbe916b0644a11ca071783791dd8a73f2f93685876560b0ab97eae",
+    "TAID": "TOX-15100",
+    "raw_smiles_upper": "O=[N+]([O-])c1cc/c2c(c1)=C(c1ccccc1)/N=c1/ccc([N+](=O)[O-])cc1=C(c1ccccc1)/N=2",
+    "selected_input_smiles": "O=[N+]([O-])c1cc/c2c(c1)=C(c1ccccc1)/N=c1\\ccc([N+](=O)[O-])cc1=C(c1ccccc1)/N=2",
+    "uncertainty": "Author raw SMILES parsed graph is an implementation reference; it does not recover stereochemistry of the original toxicity experiment.",
+    "reference": "C01 locked ToxACoL 704edcb951ab397e31561bc130154d01e0103b3c, RTECS 0005688653"
+  }
+}

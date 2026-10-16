@@ -1,0 +1,356 @@
+{
+  "mouse_intraperitoneal_LD50": {
+    "organism": "mouse",
+    "route": "intraperitoneal",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "mouse_intraperitoneal_LDLo": {
+    "organism": "mouse",
+    "route": "intraperitoneal",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "mouse_intravenous_LD50": {
+    "organism": "mouse",
+    "route": "intravenous",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "mouse_intravenous_LDLo": {
+    "organism": "mouse",
+    "route": "intravenous",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "mouse_oral_LD50": {
+    "organism": "mouse",
+    "route": "oral",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "mouse_oral_LDLo": {
+    "organism": "mouse",
+    "route": "oral",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "mouse_unreported_LD50": {
+    "organism": "mouse",
+    "route": "unreported",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "mouse_skin_LD50": {
+    "organism": "mouse",
+    "route": "skin",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "mouse_subcutaneous_LD50": {
+    "organism": "mouse",
+    "route": "subcutaneous",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "mouse_subcutaneous_LDLo": {
+    "organism": "mouse",
+    "route": "subcutaneous",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "mouse_intramuscular_LD50": {
+    "organism": "mouse",
+    "route": "intramuscular",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "mouse_parenteral_LD50": {
+    "organism": "mouse",
+    "route": "parenteral",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "rat_intraperitoneal_LD50": {
+    "organism": "rat",
+    "route": "intraperitoneal",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "rat_intraperitoneal_LDLo": {
+    "organism": "rat",
+    "route": "intraperitoneal",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "rat_intravenous_LD50": {
+    "organism": "rat",
+    "route": "intravenous",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "rat_intravenous_LDLo": {
+    "organism": "rat",
+    "route": "intravenous",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "rat_oral_LD50": {
+    "organism": "rat",
+    "route": "oral",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "rat_oral_LDLo": {
+    "organism": "rat",
+    "route": "oral",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "rat_unreported_LD50": {
+    "organism": "rat",
+    "route": "unreported",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "rat_skin_LD50": {
+    "organism": "rat",
+    "route": "skin",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "rat_subcutaneous_LD50": {
+    "organism": "rat",
+    "route": "subcutaneous",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "rat_subcutaneous_LDLo": {
+    "organism": "rat",
+    "route": "subcutaneous",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "rat_intramuscular_LD50": {
+    "organism": "rat",
+    "route": "intramuscular",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "mammal (species unspecified)_intraperitoneal_LD50": {
+    "organism": "mammal (species unspecified)",
+    "route": "intraperitoneal",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "mammal (species unspecified)_oral_LD50": {
+    "organism": "mammal (species unspecified)",
+    "route": "oral",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "mammal (species unspecified)_unreported_LD50": {
+    "organism": "mammal (species unspecified)",
+    "route": "unreported",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "mammal (species unspecified)_subcutaneous_LD50": {
+    "organism": "mammal (species unspecified)",
+    "route": "subcutaneous",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "guinea pig_intraperitoneal_LD50": {
+    "organism": "guinea pig",
+    "route": "intraperitoneal",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "guinea pig_intravenous_LD50": {
+    "organism": "guinea pig",
+    "route": "intravenous",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "guinea pig_intravenous_LDLo": {
+    "organism": "guinea pig",
+    "route": "intravenous",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "guinea pig_oral_LD50": {
+    "organism": "guinea pig",
+    "route": "oral",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "guinea pig_skin_LD50": {
+    "organism": "guinea pig",
+    "route": "skin",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "guinea pig_subcutaneous_LD50": {
+    "organism": "guinea pig",
+    "route": "subcutaneous",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "guinea pig_subcutaneous_LDLo": {
+    "organism": "guinea pig",
+    "route": "subcutaneous",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "rabbit_intraperitoneal_LD50": {
+    "organism": "rabbit",
+    "route": "intraperitoneal",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "rabbit_intravenous_LD50": {
+    "organism": "rabbit",
+    "route": "intravenous",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "rabbit_intravenous_LDLo": {
+    "organism": "rabbit",
+    "route": "intravenous",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "rabbit_oral_LD50": {
+    "organism": "rabbit",
+    "route": "oral",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "rabbit_oral_LDLo": {
+    "organism": "rabbit",
+    "route": "oral",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "rabbit_skin_LD50": {
+    "organism": "rabbit",
+    "route": "skin",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "rabbit_skin_LDLo": {
+    "organism": "rabbit",
+    "route": "skin",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "rabbit_subcutaneous_LD50": {
+    "organism": "rabbit",
+    "route": "subcutaneous",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "rabbit_subcutaneous_LDLo": {
+    "organism": "rabbit",
+    "route": "subcutaneous",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "dog_intravenous_LD50": {
+    "organism": "dog",
+    "route": "intravenous",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "dog_intravenous_LDLo": {
+    "organism": "dog",
+    "route": "intravenous",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "dog_oral_LD50": {
+    "organism": "dog",
+    "route": "oral",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "dog_oral_LDLo": {
+    "organism": "dog",
+    "route": "oral",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "cat_intravenous_LD50": {
+    "organism": "cat",
+    "route": "intravenous",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "cat_intravenous_LDLo": {
+    "organism": "cat",
+    "route": "intravenous",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "cat_oral_LD50": {
+    "organism": "cat",
+    "route": "oral",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "cat_oral_LDLo": {
+    "organism": "cat",
+    "route": "oral",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "bird-wild_oral_LD50": {
+    "organism": "bird-wild",
+    "route": "oral",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "quail_oral_LD50": {
+    "organism": "quail",
+    "route": "oral",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "duck_oral_LD50": {
+    "organism": "duck",
+    "route": "oral",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "chicken_oral_LD50": {
+    "organism": "chicken",
+    "route": "oral",
+    "measurement": "LD50",
+    "population": "not_population_stratified"
+  },
+  "frog_subcutaneous_LDLo": {
+    "organism": "frog",
+    "route": "subcutaneous",
+    "measurement": "LDLo",
+    "population": "not_population_stratified"
+  },
+  "man_oral_TDLo": {
+    "organism": "human",
+    "route": "oral",
+    "measurement": "TDLo",
+    "population": "male_as_recorded"
+  },
+  "women_oral_TDLo": {
+    "organism": "human",
+    "route": "oral",
+    "measurement": "TDLo",
+    "population": "female_as_recorded"
+  },
+  "human_oral_TDLo": {
+    "organism": "human",
+    "route": "oral",
+    "measurement": "TDLo",
+    "population": "unspecified_human_population"
+  }
+}

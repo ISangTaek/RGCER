@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import torch
 from torch import nn
 
-from molecular_features import ATOM_CARDINALITIES, BOND_CARDINALITIES
+from molecular_features import ATOM_CARDINALITIES, BOND_CARDINALITIES, FEATURE_SCHEMA_VERSION, FeatureSpec
+
+
+@dataclass(frozen=True)
+class BackboneTokens:
+    graph_token: torch.Tensor
+    atom_tokens: torch.Tensor
+    atom_mask: torch.Tensor
+    attentions: tuple[torch.Tensor, ...] = ()
 
 
 class MultiHeadAttention(nn.Module):
@@ -22,7 +31,7 @@ class MultiHeadAttention(nn.Module):
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, attn_bias=None, key_padding_mask=None):
+    def forward(self, x, attn_bias=None, key_padding_mask=None, *, return_attention=False):
         batch_size, sequence_length, hidden_dim = x.shape
         q = self.q_proj(x).view(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
@@ -33,9 +42,15 @@ class MultiHeadAttention(nn.Module):
         if key_padding_mask is not None:
             scores = scores.masked_fill(key_padding_mask[:, None, None, :], float("-inf"))
         weights = torch.softmax(scores, dim=-1)
+        if key_padding_mask is not None:
+            # Padded queries have no meaningful attribution, even though the
+            # graph token keeps their softmax finite.
+            weights = weights.masked_fill(key_padding_mask[:, None, :, None], 0.0)
+        attention = weights
         weights = self.dropout(weights)
         output = torch.matmul(weights, v).transpose(1, 2).reshape(batch_size, sequence_length, hidden_dim)
-        return self.out_proj(output)
+        output = self.out_proj(output)
+        return (output, attention) if return_attention else output
 
 
 class GraphormerBlock(nn.Module):
@@ -53,18 +68,20 @@ class GraphormerBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x, attn_bias, key_padding_mask, node_padding_mask):
+    def forward(self, x, attn_bias, key_padding_mask, node_padding_mask, *, return_attention=False):
         residual = x
         x = self.attention_norm(x)
-        x = residual + self.attention_dropout(
-            self.attention(x, attn_bias=attn_bias, key_padding_mask=key_padding_mask)
-        )
+        attended = self.attention(x, attn_bias=attn_bias, key_padding_mask=key_padding_mask,
+                                  return_attention=return_attention)
+        if return_attention:
+            attended, attention = attended
+        x = residual + self.attention_dropout(attended)
         residual = x
         x = residual + self.ffn(self.ffn_norm(x))
         if node_padding_mask is not None:
             node_values = x[:, 1:, :].masked_fill(node_padding_mask.unsqueeze(-1), 0.0)
             x = torch.cat([x[:, :1, :], node_values], dim=1)
-        return x
+        return (x, attention) if return_attention else x
 
 
 class MolecularGraphormerBackbone(nn.Module):
@@ -79,6 +96,7 @@ class MolecularGraphormerBackbone(nn.Module):
         dropout=0.1,
         spatial_pos_max_clip=20,
         edge_bias_mode="path",
+        feature_spec: FeatureSpec | None = None,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -87,19 +105,27 @@ class MolecularGraphormerBackbone(nn.Module):
         if edge_bias_mode not in {"path", "direct", "direct_plus_path"}:
             raise ValueError("edge_bias_mode must be 'path', 'direct', or 'direct_plus_path'")
         self.edge_bias_mode = edge_bias_mode
+        self.feature_spec = feature_spec
+        if feature_spec is not None and edge_bias_mode != "direct":
+            raise ValueError("Explicit PGT FeatureSpec requires direct edge bias")
+        atom_cardinalities = feature_spec.atom_cardinalities if feature_spec else ATOM_CARDINALITIES
+        bond_cardinalities = feature_spec.bond_cardinalities if feature_spec else BOND_CARDINALITIES
+        if feature_spec is not None:
+            self.register_buffer("_feature_spec_identity", torch.tensor(list(bytes.fromhex(feature_spec.sha256)), dtype=torch.uint8))
         self.atom_embeddings = nn.ModuleList(
-            [nn.Embedding(cardinality + 1, hidden_dim, padding_idx=0) for cardinality in ATOM_CARDINALITIES]
+            [nn.Embedding(cardinality + 1, hidden_dim, padding_idx=0) for cardinality in atom_cardinalities]
         )
         self.in_degree_embedding = nn.Embedding(64, hidden_dim, padding_idx=0)
         self.out_degree_embedding = nn.Embedding(64, hidden_dim, padding_idx=0)
         self.spatial_embedding = nn.Embedding(self.spatial_pos_max_clip + 2, num_heads, padding_idx=0)
         self.direct_bond_embeddings = nn.ModuleList(
-            [nn.Embedding(cardinality + 1, num_heads, padding_idx=0) for cardinality in BOND_CARDINALITIES]
+            [nn.Embedding(cardinality + 1, num_heads, padding_idx=0) for cardinality in bond_cardinalities]
         )
         # edge_input has one extra index because the raw Cython output uses
         # -1 for padding and the collator shifts it to 0.
         self.path_bond_embeddings = nn.ModuleList(
-            [nn.Embedding(cardinality + 1, num_heads, padding_idx=0) for cardinality in BOND_CARDINALITIES]
+            [nn.Embedding(cardinality + 1, num_heads, padding_idx=0) for cardinality in bond_cardinalities]
+            if feature_spec is None else []
         )
         self.graph_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
         self.graph_token_distance = nn.Parameter(torch.zeros(1, num_heads, 1))
@@ -151,14 +177,37 @@ class MolecularGraphormerBackbone(nn.Module):
         bias[:, :, 0:1, :] = bias[:, :, 0:1, :] + self.graph_token_distance.unsqueeze(2)
         return bias
 
-    def forward(self, batch):
-        required = ("x", "in_degree", "out_degree", "spatial_pos", "attn_bias", "attn_edge_type", "edge_input")
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        identity = state_dict.get(prefix + "_feature_spec_identity")
+        if self.feature_spec is not None:
+            expected = torch.tensor(list(bytes.fromhex(self.feature_spec.sha256)), dtype=torch.uint8)
+            if (not isinstance(identity, torch.Tensor) or identity.dtype != torch.uint8 or
+                    not torch.equal(identity.detach().cpu(), expected)):
+                raise RuntimeError("FeatureSpec mismatch: new features require matching new weights, even with strict=False")
+        elif identity is not None:
+            raise RuntimeError("PGT FeatureSpec weights cannot be loaded into a legacy backbone")
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+
+    def encode_tokens(self, batch, *, return_attention=False, atom_embeddings=None):
+        required = ("x", "in_degree", "out_degree", "spatial_pos", "attn_bias", "attn_edge_type")
+        if self.edge_bias_mode != "direct":
+            required += ("edge_input",)
         missing = [name for name in required if not hasattr(batch, name)]
         if missing:
             raise ValueError(f"Graphormer batch is missing fields: {missing}")
+        if self.feature_spec is not None:
+            if (getattr(batch, "feature_schema_version", None) != self.feature_spec.version or
+                    getattr(batch, "feature_spec_sha256", None) != self.feature_spec.sha256):
+                raise ValueError("Batch FeatureSpec mismatch; old caches are not PGT inputs")
+        elif getattr(batch, "feature_schema_version", FEATURE_SCHEMA_VERSION) not in (None, FEATURE_SCHEMA_VERSION):
+            raise ValueError("Explicit FeatureSpec is required for non-legacy batches")
         x = batch.x.long()
         batch_size, n_nodes = x.shape[:2]
-        node_feature = self._encode_atoms(batch.x, batch.in_degree.long(), batch.out_degree.long())
+        node_feature = self._encode_atoms(x, batch.in_degree.long(), batch.out_degree.long())
+        if atom_embeddings is not None:
+            if atom_embeddings.shape != node_feature.shape or atom_embeddings.device != node_feature.device:
+                raise ValueError("Atom embedding override must match the complete padded input")
+            node_feature = atom_embeddings
         graph_token = self.graph_token.expand(batch_size, -1, -1)
         sequence = torch.cat([graph_token, node_feature], dim=1)
         sequence = self.input_dropout(sequence)
@@ -170,6 +219,18 @@ class MolecularGraphormerBackbone(nn.Module):
             [torch.zeros((batch_size, 1), dtype=torch.bool, device=x.device), node_padding_mask], dim=1
         )
         attn_bias = self._encode_attention_bias(batch, n_nodes)
+        attentions = []
         for layer in self.layers:
-            sequence = layer(sequence, attn_bias, key_padding_mask, node_padding_mask)
-        return self.final_norm(sequence)[:, 0, :]
+            result = layer(sequence, attn_bias, key_padding_mask, node_padding_mask, return_attention=return_attention)
+            if return_attention:
+                sequence, attention = result
+                attentions.append(attention)
+            else:
+                sequence = result
+        sequence = self.final_norm(sequence)
+        atoms = sequence[:, 1:, :].masked_fill(node_padding_mask.unsqueeze(-1), 0.0)
+        return BackboneTokens(sequence[:, 0, :], atoms, ~node_padding_mask, tuple(attentions))
+
+    def forward(self, batch):
+        """Preserve the graph-only interface and legacy checkpoint key layout."""
+        return self.encode_tokens(batch).graph_token

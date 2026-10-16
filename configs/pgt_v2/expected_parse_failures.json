@@ -1,0 +1,34 @@
+{
+  "row_78171": {
+    "row_index": "78171",
+    "record_id": "row_78171",
+    "TAID": "TOX-110074",
+    "smiles": "CCCC[SnH2+](CCCC)CCCC",
+    "label_count": "6",
+    "reason": "RDKit MolFromSmiles returned None"
+  },
+  "row_78260": {
+    "row_index": "78260",
+    "record_id": "row_78260",
+    "TAID": "TOX-110163",
+    "smiles": "C[NH+2](C)([O-])CCOC(c1ccccc1)c1ccccc1",
+    "label_count": "2",
+    "reason": "RDKit MolFromSmiles returned None"
+  },
+  "row_79045": {
+    "row_index": "79045",
+    "record_id": "row_79045",
+    "TAID": "TOX-110950",
+    "smiles": "C=CCC=CC=[NH3+2]",
+    "label_count": "1",
+    "reason": "RDKit MolFromSmiles returned None"
+  },
+  "row_79046": {
+    "row_index": "79046",
+    "record_id": "row_79046",
+    "TAID": "TOX-110951",
+    "smiles": "C=CCC=CC=[NH2+2]C",
+    "label_count": "1",
+    "reason": "RDKit MolFromSmiles returned None"
+  }
+}

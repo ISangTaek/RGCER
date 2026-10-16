@@ -1,0 +1,118 @@
+{
+  "source_sha256": "47b406217dfbe916b0644a11ca071783791dd8a73f2f93685876560b0ab97eae",
+  "label_values_included": false,
+  "cases": [
+    {
+      "record_id": "row_14883",
+      "TAID": "TOX-17742",
+      "raw_row_index": "14883",
+      "num_atoms": "136",
+      "raw_smiles_upper": "CC(C)CC(NC(=O)C(C)NC(=O)CNC(=O)C(NC=O)C(C)C)C(=O)NC(C)C(=O)NC(C(=O)NC(C(=O)NC(C(=O)NC(Cc1c[nH]c2ccccc12)C(=O)NC(CC(C)C)C(=O)NC(Cc1c[nH]c2ccccc12)C(=O)NC(CC(C)C)C(=O)NC(Cc1c[nH]c2ccccc12)C(=O)NC(CC(C)C)C(=O)NC(Cc1c[nH]c2ccccc12)C(=O)NCCO)C(C)C)C(C)C)C(C)C",
+      "selected_input_smiles": "CC(C)CC(NC(=O)C(C)NC(=O)CNC(=O)C(NC=O)C(C)C)C(=O)NC(C)C(=O)NC(C(=O)NC(C(=O)NC(C(=O)NC(Cc1c[nH]c2ccccc12)C(=O)NC(CC(C)C)C(=O)NC(Cc1c[nH]c2ccccc12)C(=O)NC(CC(C)C)C(=O)NC(Cc1c[nH]c2ccccc12)C(=O)NC(CC(C)C)C(=O)NC(Cc1c[nH]c2ccccc12)C(=O)NCCO)C(C)C)C(C)C)C(C)C"
+    },
+    {
+      "record_id": "row_36703",
+      "TAID": "TOX-39563",
+      "raw_row_index": "36703",
+      "num_atoms": "139",
+      "raw_smiles_upper": "CC(=O)NC(C)(C)C(=O)N1CCCC1C(=O)NC(C)(C)C(=O)NC(C)C(=O)NC(C)(C)C(=O)NC(C)C(=O)NC(CCC(N)=O)C(=O)NC(C)(C)C(=O)NC(C(=O)NC(C)(C)C(=O)NCC(=O)NC(CC(C)C)C(=O)NC(C)(C)C(=O)N1CCCC1C(=O)NC(C(=O)NC(C)(C)C(=O)NC(C)(C)C(=O)NC(CCC(=O)O)C(=O)NC(CCC(N)=O)C(=O)NC(CO)Cc1ccccc1)C(C)C)C(C)C",
+      "selected_input_smiles": "CC(=O)NC(C)(C)C(=O)N1CCCC1C(=O)NC(C)(C)C(=O)NC(C)C(=O)NC(C)(C)C(=O)NC(C)C(=O)NC(CCC(N)=O)C(=O)NC(C)(C)C(=O)NC(C(=O)NC(C)(C)C(=O)NCC(=O)NC(CC(C)C)C(=O)NC(C)(C)C(=O)N1CCCC1C(=O)NC(C(=O)NC(C)(C)C(=O)NC(C)(C)C(=O)NC(CCC(=O)O)C(=O)NC(CCC(N)=O)C(=O)NC(CO)Cc1ccccc1)C(C)C)C(C)C"
+    },
+    {
+      "record_id": "row_37451",
+      "TAID": "TOX-40311",
+      "raw_row_index": "37451",
+      "num_atoms": "135",
+      "raw_smiles_upper": "CCCCCC=CCCC(=O)NC1C(Oc2c3cc4cc2Oc2ccc(cc2Cl)C(OC2OC(CO)C(O)C(O)C2NC(C)=O)C2NC(=O)C(NC(=O)C4NC(=O)C4NC(=O)C(NC(=O)C(N)c5ccc(O)c(c5)Oc5cc4cc(O)c5C)C(O)c4ccc(c(Cl)c4)O3)c3ccc(O)c(c3)-c3c(OC4OC(CO)C(O)C(O)C4O)cc(O)cc3C(C(=O)OC)NC2=O)OC(CO)C(O)C1O",
+      "selected_input_smiles": "CCCCCC=CCCC(=O)NC1C(Oc2c3cc4cc2Oc2ccc(cc2Cl)C(OC2OC(CO)C(O)C(O)C2NC(C)=O)C2NC(=O)C(NC(=O)C4NC(=O)C4NC(=O)C(NC(=O)C(N)c5ccc(O)c(c5)Oc5cc4cc(O)c5C)C(O)c4ccc(c(Cl)c4)O3)c3ccc(O)c(c3)-c3c(OC4OC(CO)C(O)C(O)C4O)cc(O)cc3C(C(=O)OC)NC2=O)OC(CO)C(O)C1O"
+    },
+    {
+      "record_id": "row_48433",
+      "TAID": "TOX-51293",
+      "raw_row_index": "48433",
+      "num_atoms": "136",
+      "raw_smiles_upper": "CNC(C(=O)NC1C(=O)NC(c2ccc(O)c(Cl)c2)C(=O)NC2C(=O)NC3C(=O)NC(Cc4cc(Cl)c(cc4OC4CC(N)C(O)C(C)O4)Oc4cc2cc(c4OC2OC(CO)C(O)C(O)C2OC2CC(N)C(O)C(C)O2)Oc2ccc(cc2)C1OC1OC(CO)C(O)C(O)C1O)C(=O)NC(C(=O)O)c1cc(O)cc(O)c1-c1cc3ccc1O)c1ccc(OC2OC(C)C(O)C(O)C2O)cc1",
+      "selected_input_smiles": "CNC(C(=O)NC1C(=O)NC(c2ccc(O)c(Cl)c2)C(=O)NC2C(=O)NC3C(=O)NC(Cc4cc(Cl)c(cc4OC4CC(N)C(O)C(C)O4)Oc4cc2cc(c4OC2OC(CO)C(O)C(O)C2OC2CC(N)C(O)C(C)O2)Oc2ccc(cc2)C1OC1OC(CO)C(O)C(O)C1O)C(=O)NC(C(=O)O)c1cc(O)cc(O)c1-c1cc3ccc1O)c1ccc(OC2OC(C)C(O)C(O)C2O)cc1"
+    },
+    {
+      "record_id": "row_64802",
+      "TAID": "TOX-67666",
+      "raw_row_index": "64802",
+      "num_atoms": "137",
+      "raw_smiles_upper": "CNC(C(=O)NC1C(=O)NC(c2ccc(O)c(Cl)c2)C(=O)NC2C(=O)NC3C(=O)NC(C(=O)NC(C(=O)O)c4cc(O)cc(O)c4-c4cc3ccc4O)C(OC3CC(N)C(O)C(C)O3)c3ccc(c(Cl)c3)Oc3cc2cc(c3OC2OC(CO)C(O)C(O)C2OC2CC(N)C(O)C(C)O2)Oc2ccc(cc2)C1OC1OC(CO)C(O)C(O)C1O)c1ccc(OC2OC(C)C(O)C(O)C2OC)cc1",
+      "selected_input_smiles": "CNC(C(=O)NC1C(=O)NC(c2ccc(O)c(Cl)c2)C(=O)NC2C(=O)NC3C(=O)NC(C(=O)NC(C(=O)O)c4cc(O)cc(O)c4-c4cc3ccc4O)C(OC3CC(N)C(O)C(C)O3)c3ccc(c(Cl)c3)Oc3cc2cc(c3OC2OC(CO)C(O)C(O)C2OC2CC(N)C(O)C(C)O2)Oc2ccc(cc2)C1OC1OC(CO)C(O)C(O)C1O)c1ccc(OC2OC(C)C(O)C(O)C2OC)cc1"
+    },
+    {
+      "record_id": "row_75436",
+      "TAID": "TOX-78300",
+      "raw_row_index": "75436",
+      "num_atoms": "132",
+      "raw_smiles_upper": "CC(=O)NC1C(OC2c3ccc(c(Cl)c3)Oc3cc4cc(c3OC3OC(CO)C(O)C(O)C3NC(=O)CCCCCCC(C)C)Oc3ccc(cc3Cl)CC3NC(=O)C(N)c5ccc(O)c(c5)Oc5cc(O)cc(c5)C(NC3=O)C(=O)NC4C(=O)NC3C(=O)NC2C(=O)NC(C(=O)O)c2cc(O)cc(OC4OC(CO)C(O)C(O)C4O)c2-c2cc3ccc2O)OC(CO)C(O)C1O",
+      "selected_input_smiles": "CC(=O)NC1C(OC2c3ccc(c(Cl)c3)Oc3cc4cc(c3OC3OC(CO)C(O)C(O)C3NC(=O)CCCCCCC(C)C)Oc3ccc(cc3Cl)CC3NC(=O)C(N)c5ccc(O)c(c5)Oc5cc(O)cc(c5)C(NC3=O)C(=O)NC4C(=O)NC3C(=O)NC2C(=O)NC(C(=O)O)c2cc(O)cc(OC4OC(CO)C(O)C(O)C4O)c2-c2cc3ccc2O)OC(CO)C(O)C1O"
+    },
+    {
+      "record_id": "row_75437",
+      "TAID": "TOX-78301",
+      "raw_row_index": "75437",
+      "num_atoms": "132",
+      "raw_smiles_upper": "CCCCCC=CCCC(=O)NC1C(Oc2c3cc4cc2Oc2ccc(cc2Cl)C(OC2OC(CO)C(O)C(O)C2NC(C)=O)C2NC(=O)C(NC(=O)C4NC(=O)C4NC(=O)C(Cc5ccc(c(Cl)c5)O3)NC(=O)C(N)c3ccc(O)c(c3)Oc3cc(O)cc4c3)c3ccc(O)c(c3)-c3c(OC4OC(CO)C(O)C(O)C4O)cc(O)cc3C(C(=O)O)NC2=O)OC(CO)C(O)C1O",
+      "selected_input_smiles": "CCCCCC=CCCC(=O)NC1C(Oc2c3cc4cc2Oc2ccc(cc2Cl)C(OC2OC(CO)C(O)C(O)C2NC(C)=O)C2NC(=O)C(NC(=O)C4NC(=O)C4NC(=O)C(Cc5ccc(c(Cl)c5)O3)NC(=O)C(N)c3ccc(O)c(c3)Oc3cc(O)cc4c3)c3ccc(O)c(c3)-c3c(OC4OC(CO)C(O)C(O)C4O)cc(O)cc3C(C(=O)O)NC2=O)OC(CO)C(O)C1O"
+    },
+    {
+      "record_id": "row_75438",
+      "TAID": "TOX-78302",
+      "raw_row_index": "75438",
+      "num_atoms": "132",
+      "raw_smiles_upper": "CCCCCCCCCC(=O)NC1C(Oc2c3cc4cc2Oc2ccc(cc2Cl)C(OC2OC(CO)C(O)C(O)C2NC(C)=O)C2NC(=O)C(NC(=O)C4NC(=O)C4NC(=O)C(Cc5ccc(c(Cl)c5)O3)NC(=O)C(N)c3ccc(O)c(c3)Oc3cc(O)cc4c3)c3ccc(O)c(c3)-c3c(OC4OC(CO)C(O)C(O)C4O)cc(O)cc3C(C(=O)O)NC2=O)OC(CO)C(O)C1O",
+      "selected_input_smiles": "CCCCCCCCCC(=O)NC1C(Oc2c3cc4cc2Oc2ccc(cc2Cl)C(OC2OC(CO)C(O)C(O)C2NC(C)=O)C2NC(=O)C(NC(=O)C4NC(=O)C4NC(=O)C(Cc5ccc(c(Cl)c5)O3)NC(=O)C(N)c3ccc(O)c(c3)Oc3cc(O)cc4c3)c3ccc(O)c(c3)-c3c(OC4OC(CO)C(O)C(O)C4O)cc(O)cc3C(C(=O)O)NC2=O)OC(CO)C(O)C1O"
+    },
+    {
+      "record_id": "row_75439",
+      "TAID": "TOX-78303",
+      "raw_row_index": "75439",
+      "num_atoms": "133",
+      "raw_smiles_upper": "CCC(C)CCCCCCC(=O)NC1C(Oc2c3cc4cc2Oc2ccc(cc2Cl)C(OC2OC(CO)C(O)C(O)C2NC(C)=O)C2NC(=O)C(NC(=O)C4NC(=O)C4NC(=O)C(Cc5ccc(c(Cl)c5)O3)NC(=O)C(N)c3ccc(O)c(c3)Oc3cc(O)cc4c3)c3ccc(O)c(c3)-c3c(OC4OC(CO)C(O)C(O)C4O)cc(O)cc3C(C(=O)O)NC2=O)OC(CO)C(O)C1O",
+      "selected_input_smiles": "CCC(C)CCCCCCC(=O)NC1C(Oc2c3cc4cc2Oc2ccc(cc2Cl)C(OC2OC(CO)C(O)C(O)C2NC(C)=O)C2NC(=O)C(NC(=O)C4NC(=O)C4NC(=O)C(Cc5ccc(c(Cl)c5)O3)NC(=O)C(N)c3ccc(O)c(c3)Oc3cc(O)cc4c3)c3ccc(O)c(c3)-c3c(OC4OC(CO)C(O)C(O)C4O)cc(O)cc3C(C(=O)O)NC2=O)OC(CO)C(O)C1O"
+    },
+    {
+      "record_id": "row_75440",
+      "TAID": "TOX-78304",
+      "raw_row_index": "75440",
+      "num_atoms": "133",
+      "raw_smiles_upper": "CC(=O)NC1C(OC2c3ccc(c(Cl)c3)Oc3cc4cc(c3OC3OC(CO)C(O)C(O)C3NC(=O)CCCCCCCC(C)C)Oc3ccc(cc3Cl)CC3NC(=O)C(N)c5ccc(O)c(c5)Oc5cc(O)cc(c5)C(NC3=O)C(=O)NC4C(=O)NC3C(=O)NC2C(=O)NC(C(=O)O)c2cc(O)cc(OC4OC(CO)C(O)C(O)C4O)c2-c2cc3ccc2O)OC(CO)C(O)C1O",
+      "selected_input_smiles": "CC(=O)NC1C(OC2c3ccc(c(Cl)c3)Oc3cc4cc(c3OC3OC(CO)C(O)C(O)C3NC(=O)CCCCCCCC(C)C)Oc3ccc(cc3Cl)CC3NC(=O)C(N)c5ccc(O)c(c5)Oc5cc(O)cc(c5)C(NC3=O)C(=O)NC4C(=O)NC3C(=O)NC2C(=O)NC(C(=O)O)c2cc(O)cc(OC4OC(CO)C(O)C(O)C4O)c2-c2cc3ccc2O)OC(CO)C(O)C1O"
+    },
+    {
+      "record_id": "row_78690",
+      "TAID": "TOX-110595",
+      "raw_row_index": "78690",
+      "num_atoms": "134",
+      "raw_smiles_upper": "CC(C)CC1NC(=O)C(C)NC(=O)C(C(C)O)NC(=O)C(CCC(=O)O)NC(=O)C2CCCN2C(=O)C(C)NC(=O)C(CCCCN)NC(=O)C2CSSCC(C(=O)NC(CCC(N)=O)C(=O)NC(CCC(N)=O)C(=O)NC(Cc3cnc[nH]3)C(N)=O)NC(=O)C(CCCCN)NC(=O)C(CCCCN)NC(=O)C(C)NC(=O)C(CSSCC(N)C(=O)NC(CC(N)=O)C(=O)N2)NC1=O",
+      "selected_input_smiles": "CC(C)CC1NC(=O)C(C)NC(=O)C(C(C)O)NC(=O)C(CCC(=O)O)NC(=O)C2CCCN2C(=O)C(C)NC(=O)C(CCCCN)NC(=O)C2CSSCC(C(=O)NC(CCC(N)=O)C(=O)NC(CCC(N)=O)C(=O)NC(Cc3cnc[nH]3)C(N)=O)NC(=O)C(CCCCN)NC(=O)C(CCCCN)NC(=O)C(C)NC(=O)C(CSSCC(N)C(=O)NC(CC(N)=O)C(=O)N2)NC1=O"
+    },
+    {
+      "record_id": "row_79609",
+      "TAID": "TOX-111514",
+      "raw_row_index": "79609",
+      "num_atoms": "136",
+      "raw_smiles_upper": "CC(C)CC1NC(=O)C(C)NC(=O)C(C(C)O)NC(=O)C(CCC(=O)O)NC(=O)C2CCCN2C(=O)C(C)NC(=O)C(CCCCN)NC(=O)C2CSSCC(C(=O)NC(CCC(N)=O)C(=O)NC(CCC(N)=O)C(=O)NC(Cc3cnc[nH]3)C(N)=O)NC(=O)C(CCCCN)NC(=O)C(CCCNC(=N)N)NC(=O)C(C)NC(=O)C(CSSCC(N)C(=O)NC(CC(N)=O)C(=O)N2)NC1=O",
+      "selected_input_smiles": "CC(C)CC1NC(=O)C(C)NC(=O)C(C(C)O)NC(=O)C(CCC(=O)O)NC(=O)C2CCCN2C(=O)C(C)NC(=O)C(CCCCN)NC(=O)C2CSSCC(C(=O)NC(CCC(N)=O)C(=O)NC(CCC(N)=O)C(=O)NC(Cc3cnc[nH]3)C(N)=O)NC(=O)C(CCCCN)NC(=O)C(CCCNC(=N)N)NC(=O)C(C)NC(=O)C(CSSCC(N)C(=O)NC(CC(N)=O)C(=O)N2)NC1=O"
+    },
+    {
+      "record_id": "row_79610",
+      "TAID": "TOX-111515",
+      "raw_row_index": "79610",
+      "num_atoms": "136",
+      "raw_smiles_upper": "CC(C)CC1NC(=O)C(C)NC(=O)C(C(C)O)NC(=O)C(CCC(=O)O)NC(=O)C2CCCN2C(=O)C(C)NC(=O)C(CCCCN)NC(=O)C2CSSCC(C(=O)NC(CCC(N)=O)C(=O)NC(CCC(N)=O)C(=O)NC(Cc3cnc[nH]3)C(N)=O)NC(=O)C(CCCNC(=N)N)NC(=O)C(CCCCN)NC(=O)C(C)NC(=O)C(CSSCC(N)C(=O)NC(CC(N)=O)C(=O)N2)NC1=O",
+      "selected_input_smiles": "CC(C)CC1NC(=O)C(C)NC(=O)C(C(C)O)NC(=O)C(CCC(=O)O)NC(=O)C2CCCN2C(=O)C(C)NC(=O)C(CCCCN)NC(=O)C2CSSCC(C(=O)NC(CCC(N)=O)C(=O)NC(CCC(N)=O)C(=O)NC(Cc3cnc[nH]3)C(N)=O)NC(=O)C(CCCNC(=N)N)NC(=O)C(CCCCN)NC(=O)C(C)NC(=O)C(CSSCC(N)C(=O)NC(CC(N)=O)C(=O)N2)NC1=O"
+    },
+    {
+      "record_id": "row_79622",
+      "TAID": "TOX-111527",
+      "raw_row_index": "79622",
+      "num_atoms": "139",
+      "raw_smiles_upper": "COC(=O)C1NC(=O)C2NC(=O)C(NC(=O)C3NC(=O)C4NC(=O)C(Cc5ccc(cc5)Oc5cc3cc(c5OC3OC(CO)C(O)C(O)C3OC3OC(CO)C(O)C(O)C3O)Oc3ccc(cc3Cl)C2OC2CC(N)C(O)C(C)O2)NC(=O)C(N)c2ccc(O)c(c2)Oc2cc4cc(OC3OC(CO)C(O)C(O)C3O)c2C)c2ccc(O)c(c2)-c2c(OC3OC(CO)C(O)C(O)C3O)cc(O)cc21",
+      "selected_input_smiles": "COC(=O)C1NC(=O)C2NC(=O)C(NC(=O)C3NC(=O)C4NC(=O)C(Cc5ccc(cc5)Oc5cc3cc(c5OC3OC(CO)C(O)C(O)C3OC3OC(CO)C(O)C(O)C3O)Oc3ccc(cc3Cl)C2OC2CC(N)C(O)C(C)O2)NC(=O)C(N)c2ccc(O)c(c2)Oc2cc4cc(OC3OC(CO)C(O)C(O)C3O)c2C)c2ccc(O)c(c2)-c2c(OC3OC(CO)C(O)C(O)C3O)cc(O)cc21"
+    }
+  ]
+}
