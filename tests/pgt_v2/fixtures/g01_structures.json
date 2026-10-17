@@ -1,0 +1,381 @@
+{
+  "source_sha256": "47b406217dfbe916b0644a11ca071783791dd8a73f2f93685876560b0ab97eae",
+  "provenance": "37 unexpected chemistry failures in PGTV2_G01_20261017T083319Z; structure-only regression fixture, no labels",
+  "cases": [
+    {
+      "record_id": "row_1728",
+      "TAID": "TOX-4587",
+      "raw_smiles_upper": "OC(OCC(COC(O)C(Cl)(Cl)Cl)(COC(O)C(Cl)(Cl)Cl)COC(O)C(Cl)(Cl)Cl)C(Cl)(Cl)Cl",
+      "selected_input_smiles": "OC(OCC(COC(O)C(Cl)(Cl)Cl)(COC(O)C(Cl)(Cl)Cl)COC(O)C(Cl)(Cl)Cl)C(Cl)(Cl)Cl",
+      "num_atoms": 33,
+      "old_error": "Exact chemical canonicalization exceeded 50000 search nodes",
+      "potential_coordination": []
+    },
+    {
+      "record_id": "row_3367",
+      "TAID": "TOX-6226",
+      "raw_smiles_upper": "O=C1O[IH2](O)c2ccccc21",
+      "selected_input_smiles": "O=C1O[IH2](O)c2ccccc21",
+      "num_atoms": 11,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_TrigonalBipyramidal"
+      ]
+    },
+    {
+      "record_id": "row_3788",
+      "TAID": "TOX-6647",
+      "raw_smiles_upper": "FC(F)(F)C(F)(F)C(F)(F)C(F)(F)N(C(F)(F)C(F)(F)C(F)(F)C(F)(F)F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)F",
+      "selected_input_smiles": "FC(F)(F)C(F)(F)C(F)(F)C(F)(F)N(C(F)(F)C(F)(F)C(F)(F)C(F)(F)F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)F",
+      "num_atoms": 40,
+      "old_error": "Exact chemical canonicalization exceeded 50000 search nodes",
+      "potential_coordination": []
+    },
+    {
+      "record_id": "row_4879",
+      "TAID": "TOX-7738",
+      "raw_smiles_upper": "c1ccc([Si]2(c3ccccc3)O[Si](c3ccccc3)(c3ccccc3)O[Si](c3ccccc3)(c3ccccc3)O[Si](c3ccccc3)(c3ccccc3)O2)cc1",
+      "selected_input_smiles": "c1ccc([Si]2(c3ccccc3)O[Si](c3ccccc3)(c3ccccc3)O[Si](c3ccccc3)(c3ccccc3)O[Si](c3ccccc3)(c3ccccc3)O2)cc1",
+      "num_atoms": 56,
+      "old_error": "Exact chemical canonicalization exceeded 50000 search nodes",
+      "potential_coordination": []
+    },
+    {
+      "record_id": "row_5167",
+      "TAID": "TOX-8026",
+      "raw_smiles_upper": "Cl[Sb](Cl)(c1ccccc1)(c1ccccc1)c1ccccc1",
+      "selected_input_smiles": "Cl[Sb](Cl)(c1ccccc1)(c1ccccc1)c1ccccc1",
+      "num_atoms": 21,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_TrigonalBipyramidal"
+      ]
+    },
+    {
+      "record_id": "row_7606",
+      "TAID": "TOX-10465",
+      "raw_smiles_upper": "Cc1c(Cc2cc(C(C)(C)C)c(O)c(C(C)(C)C)c2)c(C)c(Cc2cc(C(C)(C)C)c(O)c(C(C)(C)C)c2)c(C)c1Cc1cc(C(C)(C)C)c(O)c(C(C)(C)C)c1",
+      "selected_input_smiles": "Cc1c(Cc2cc(C(C)(C)C)c(O)c(C(C)(C)C)c2)c(C)c(Cc2cc(C(C)(C)C)c(O)c(C(C)(C)C)c2)c(C)c1Cc1cc(C(C)(C)C)c(O)c(C(C)(C)C)c1",
+      "num_atoms": 57,
+      "old_error": "Exact chemical canonicalization exceeded 50000 search nodes",
+      "potential_coordination": []
+    },
+    {
+      "record_id": "row_13076",
+      "TAID": "TOX-15935",
+      "raw_smiles_upper": "IP(I)(c1ccccc1)(c1ccccc1)c1ccccc1",
+      "selected_input_smiles": "IP(I)(c1ccccc1)(c1ccccc1)c1ccccc1",
+      "num_atoms": 21,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_TrigonalBipyramidal"
+      ]
+    },
+    {
+      "record_id": "row_13355",
+      "TAID": "TOX-16214",
+      "raw_smiles_upper": "CC(C)(C)c1cc(CCC(=O)OCC(COC(=O)CCc2cc(C(C)(C)C)c(O)c(C(C)(C)C)c2)(COC(=O)CCc2cc(C(C)(C)C)c(O)c(C(C)(C)C)c2)COC(=O)CCc2cc(C(C)(C)C)c(O)c(C(C)(C)C)c2)cc(C(C)(C)C)c1O",
+      "selected_input_smiles": "CC(C)(C)c1cc(CCC(=O)OCC(COC(=O)CCc2cc(C(C)(C)C)c(O)c(C(C)(C)C)c2)(COC(=O)CCc2cc(C(C)(C)C)c(O)c(C(C)(C)C)c2)COC(=O)CCc2cc(C(C)(C)C)c(O)c(C(C)(C)C)c2)cc(C(C)(C)C)c1O",
+      "num_atoms": 85,
+      "old_error": "Exact chemical canonicalization exceeded 50000 search nodes",
+      "potential_coordination": []
+    },
+    {
+      "record_id": "row_14248",
+      "TAID": "TOX-17107",
+      "raw_smiles_upper": "c1ccc(OP(OCC(COP(Oc2ccccc2)Oc2ccccc2)(COP(Oc2ccccc2)Oc2ccccc2)COP(Oc2ccccc2)Oc2ccccc2)Oc2ccccc2)cc1",
+      "selected_input_smiles": "c1ccc(OP(OCC(COP(Oc2ccccc2)Oc2ccccc2)(COP(Oc2ccccc2)Oc2ccccc2)COP(Oc2ccccc2)Oc2ccccc2)Oc2ccccc2)cc1",
+      "num_atoms": 69,
+      "old_error": "Exact chemical canonicalization exceeded 50000 search nodes",
+      "potential_coordination": []
+    },
+    {
+      "record_id": "row_14951",
+      "TAID": "TOX-17810",
+      "raw_smiles_upper": "CC1=[O+][Rh]234([O+]=C(C)C1)C1=C2CCC3=C4CC1",
+      "selected_input_smiles": "CC1=[O+][Rh]234([O+]=C(C)C1)C1=C2CCC3=C4CC1",
+      "num_atoms": 16,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_Octahedral"
+      ]
+    },
+    {
+      "record_id": "row_15346",
+      "TAID": "TOX-18205",
+      "raw_smiles_upper": "CC(C)(C[Sn](CC(C)(C)c1ccccc1)(CC(C)(C)c1ccccc1)O[Sn](CC(C)(C)c1ccccc1)(CC(C)(C)c1ccccc1)CC(C)(C)c1ccccc1)c1ccccc1",
+      "selected_input_smiles": "CC(C)(C[Sn](CC(C)(C)c1ccccc1)(CC(C)(C)c1ccccc1)O[Sn](CC(C)(C)c1ccccc1)(CC(C)(C)c1ccccc1)CC(C)(C)c1ccccc1)c1ccccc1",
+      "num_atoms": 63,
+      "old_error": "Exact chemical canonicalization exceeded 50000 search nodes",
+      "potential_coordination": []
+    },
+    {
+      "record_id": "row_15789",
+      "TAID": "TOX-18648",
+      "raw_smiles_upper": "N#C[Fe](C#N)(C#N)(C#N)(C#N)C#N",
+      "selected_input_smiles": "N#C[Fe](C#N)(C#N)(C#N)(C#N)C#N",
+      "num_atoms": 13,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_Octahedral"
+      ]
+    },
+    {
+      "record_id": "row_15838",
+      "TAID": "TOX-18697",
+      "raw_smiles_upper": "N#C[Mn](C#N)(C#N)(C#N)(C#N)C#N",
+      "selected_input_smiles": "N#C[Mn](C#N)(C#N)(C#N)(C#N)C#N",
+      "num_atoms": 13,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_Octahedral"
+      ]
+    },
+    {
+      "record_id": "row_16225",
+      "TAID": "TOX-19084",
+      "raw_smiles_upper": "CC(C)(Oc1ccc(Cl)cc1)C(=O)OC1C(OC(=O)C(C)(C)Oc2ccc(Cl)cc2)C(OC(=O)C(C)(C)Oc2ccc(Cl)cc2)C(OC(=O)C(C)(C)Oc2ccc(Cl)cc2)C(OC(=O)C(C)(C)Oc2ccc(Cl)cc2)C1OC(=O)C(C)(C)Oc1ccc(Cl)cc1",
+      "selected_input_smiles": "CC(C)(Oc1ccc(Cl)cc1)C(=O)OC1C(OC(=O)C(C)(C)Oc2ccc(Cl)cc2)C(OC(=O)C(C)(C)Oc2ccc(Cl)cc2)C(OC(=O)C(C)(C)Oc2ccc(Cl)cc2)C(OC(=O)C(C)(C)Oc2ccc(Cl)cc2)C1OC(=O)C(C)(C)Oc1ccc(Cl)cc1",
+      "num_atoms": 90,
+      "old_error": "Exact chemical canonicalization exceeded 50000 search nodes",
+      "potential_coordination": []
+    },
+    {
+      "record_id": "row_16389",
+      "TAID": "TOX-19248",
+      "raw_smiles_upper": "N#C[Fe](C#N)(C#N)(C#N)(C#N)N=O",
+      "selected_input_smiles": "N#C[Fe](C#N)(C#N)(C#N)(C#N)N=O",
+      "num_atoms": 13,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_Octahedral"
+      ]
+    },
+    {
+      "record_id": "row_16426",
+      "TAID": "TOX-19285",
+      "raw_smiles_upper": "O=C[Fe](C=O)(C=O)([PH](c1ccccc1)(c1ccccc1)c1ccccc1)[PH](c1ccccc1)(c1ccccc1)c1ccccc1",
+      "selected_input_smiles": "O=C[Fe](C=O)(C=O)([PH](c1ccccc1)(c1ccccc1)c1ccccc1)[PH](c1ccccc1)(c1ccccc1)c1ccccc1",
+      "num_atoms": 45,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_TrigonalBipyramidal"
+      ]
+    },
+    {
+      "record_id": "row_22721",
+      "TAID": "TOX-25580",
+      "raw_smiles_upper": "O=C(Nc1ccc(NC(=O)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)F)cc1)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)F",
+      "selected_input_smiles": "O=C(Nc1ccc(NC(=O)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)F)cc1)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)F",
+      "num_atoms": 56,
+      "old_error": "Exact chemical canonicalization exceeded 50000 search nodes",
+      "potential_coordination": []
+    },
+    {
+      "record_id": "row_23373",
+      "TAID": "TOX-26232",
+      "raw_smiles_upper": "CSP(I)(N(C)C)(N(C)C)N(C)C",
+      "selected_input_smiles": "CSP(I)(N(C)C)(N(C)C)N(C)C",
+      "num_atoms": 13,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_TrigonalBipyramidal"
+      ]
+    },
+    {
+      "record_id": "row_29433",
+      "TAID": "TOX-32292",
+      "raw_smiles_upper": "CC(C)(C)c1ccc(OP(Oc2ccc(C(C)(C)C)cc2C(C)(C)C)c2ccc(-c3ccc(P(Oc4ccc(C(C)(C)C)cc4C(C)(C)C)Oc4ccc(C(C)(C)C)cc4C(C)(C)C)cc3)cc2)c(C(C)(C)C)c1",
+      "selected_input_smiles": "CC(C)(C)c1ccc(OP(Oc2ccc(C(C)(C)C)cc2C(C)(C)C)c2ccc(-c3ccc(P(Oc4ccc(C(C)(C)C)cc4C(C)(C)C)Oc4ccc(C(C)(C)C)cc4C(C)(C)C)cc3)cc2)c(C(C)(C)C)c1",
+      "num_atoms": 74,
+      "old_error": "Exact chemical canonicalization exceeded 50000 search nodes",
+      "potential_coordination": []
+    },
+    {
+      "record_id": "row_32558",
+      "TAID": "TOX-35418",
+      "raw_smiles_upper": "O=C1NP(N2CC2)(N2CC2)(N2CC2)NC(=O)c2cccc(c2)C(=O)NP(N2CC2)(N2CC2)(N2CC2)NC(=O)c2cccc1c2",
+      "selected_input_smiles": "O=C1NP(N2CC2)(N2CC2)(N2CC2)NC(=O)c2cccc(c2)C(=O)NP(N2CC2)(N2CC2)(N2CC2)NC(=O)c2cccc1c2",
+      "num_atoms": 44,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_TrigonalBipyramidal"
+      ]
+    },
+    {
+      "record_id": "row_33587",
+      "TAID": "TOX-36447",
+      "raw_smiles_upper": "O=S(=O)(OCC1OC(OC2(COS(=O)(=O)O[Al](O)O)OC(COS(=O)(=O)O[Al](O)O)C(OS(=O)(=O)O[Al](O)O)C2OS(=O)(=O)O[Al](O)O)C(OS(=O)(=O)O[Al](O)O)C(OS(=O)(=O)O[Al](O)O)C1OS(=O)(=O)O[Al](O)O)O[Al](O)O",
+      "selected_input_smiles": "O=S(=O)(OCC1OC(OC2(COS(=O)(=O)O[Al](O)O)OC(COS(=O)(=O)O[Al](O)O)C(OS(=O)(=O)O[Al](O)O)C2OS(=O)(=O)O[Al](O)O)C(OS(=O)(=O)O[Al](O)O)C(OS(=O)(=O)O[Al](O)O)C1OS(=O)(=O)O[Al](O)O)O[Al](O)O",
+      "num_atoms": 79,
+      "old_error": "Exact chemical canonicalization exceeded 50000 search nodes",
+      "potential_coordination": []
+    },
+    {
+      "record_id": "row_41373",
+      "TAID": "TOX-44233",
+      "raw_smiles_upper": "c1ccc(C(c2ccccc2)(c2ccccc2)[PH]23OCCN(CCO2)CCO3)cc1",
+      "selected_input_smiles": "c1ccc(C(c2ccccc2)(c2ccccc2)[PH]23OCCN(CCO2)CCO3)cc1",
+      "num_atoms": 30,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_TrigonalBipyramidal"
+      ]
+    },
+    {
+      "record_id": "row_43984",
+      "TAID": "TOX-46844",
+      "raw_smiles_upper": "Cc1cc(OP(Oc2cc(C)c(C(C)(C)C)cc2C(C)(C)C)Oc2cc(C)c(C(C)(C)C)cc2C(C)(C)C)c(C(C)(C)C)cc1C(C)(C)C",
+      "selected_input_smiles": "Cc1cc(OP(Oc2cc(C)c(C(C)(C)C)cc2C(C)(C)C)Oc2cc(C)c(C(C)(C)C)cc2C(C)(C)C)c(C(C)(C)C)cc1C(C)(C)C",
+      "num_atoms": 49,
+      "old_error": "Exact chemical canonicalization exceeded 50000 search nodes",
+      "potential_coordination": []
+    },
+    {
+      "record_id": "row_58269",
+      "TAID": "TOX-61130",
+      "raw_smiles_upper": "OC(CC(=NN=C(CC(O)(C(F)(F)F)C(F)(F)F)c1ccccc1)c1ccccc1)(C(F)(F)F)C(F)(F)F",
+      "selected_input_smiles": "OC(CC(=NN=C(CC(O)(C(F)(F)F)C(F)(F)F)c1ccccc1)c1ccccc1)(C(F)(F)F)C(F)(F)F",
+      "num_atoms": 38,
+      "old_error": "Exact chemical canonicalization exceeded 50000 search nodes",
+      "potential_coordination": []
+    },
+    {
+      "record_id": "row_59055",
+      "TAID": "TOX-61916",
+      "raw_smiles_upper": "OC(CC(CC(O)(C(F)(F)F)C(F)(F)F)=NN=C(CC(O)(C(F)(F)F)C(F)(F)F)CC(O)(C(F)(F)F)C(F)(F)F)(C(F)(F)F)C(F)(F)F",
+      "selected_input_smiles": "OC(CC(CC(O)(C(F)(F)F)C(F)(F)F)=NN=C(CC(O)(C(F)(F)F)C(F)(F)F)CC(O)(C(F)(F)F)C(F)(F)F)(C(F)(F)F)C(F)(F)F",
+      "num_atoms": 48,
+      "old_error": "Exact chemical canonicalization exceeded 50000 search nodes",
+      "potential_coordination": []
+    },
+    {
+      "record_id": "row_59617",
+      "TAID": "TOX-62478",
+      "raw_smiles_upper": "OCC(c1cc(C(CO)(C(F)(F)F)C(F)(F)F)nc(C(CO)(C(F)(F)F)C(F)(F)F)c1)(C(F)(F)F)C(F)(F)F",
+      "selected_input_smiles": "OCC(c1cc(C(CO)(C(F)(F)F)C(F)(F)F)nc(C(CO)(C(F)(F)F)C(F)(F)F)c1)(C(F)(F)F)C(F)(F)F",
+      "num_atoms": 39,
+      "old_error": "Exact chemical canonicalization exceeded 50000 search nodes",
+      "potential_coordination": []
+    },
+    {
+      "record_id": "row_61688",
+      "TAID": "TOX-64549",
+      "raw_smiles_upper": "Cl[TeH]1(Cl)(Cl)OCCO1",
+      "selected_input_smiles": "Cl[TeH]1(Cl)(Cl)OCCO1",
+      "num_atoms": 8,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_Octahedral"
+      ]
+    },
+    {
+      "record_id": "row_67804",
+      "TAID": "TOX-70668",
+      "raw_smiles_upper": "CN(C)P(F)(F)(N(C)C)N1CCOCCOCCN(P(F)(F)(N(C)C)N(C)C)CCOCCOCC1",
+      "selected_input_smiles": "CN(C)P(F)(F)(N(C)C)N1CCOCCOCCN(P(F)(F)(N(C)C)N(C)C)CCOCCOCC1",
+      "num_atoms": 36,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_TrigonalBipyramidal"
+      ]
+    },
+    {
+      "record_id": "row_70044",
+      "TAID": "TOX-72908",
+      "raw_smiles_upper": "CC(=O)O[IH2](OC(C)=O)c1ccccc1",
+      "selected_input_smiles": "CC(=O)O[IH2](OC(C)=O)c1ccccc1",
+      "num_atoms": 15,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_TrigonalBipyramidal"
+      ]
+    },
+    {
+      "record_id": "row_72289",
+      "TAID": "TOX-75153",
+      "raw_smiles_upper": "O=C(NP(=O)(N1CC1)N1CC1)OC(COC(=O)c1ccccc1)C(OC(=O)NP(=O)(N1CC1)N1CC1)C(OC(=O)NP(=O)(N1CC1)N1CC1)C(COC(=O)c1ccccc1)OC(=O)NP(=O)(N1CC1)N1CC1",
+      "selected_input_smiles": "O=C(NP(=O)(N1CC1)N1CC1)OC(COC(=O)c1ccccc1)C(OC(=O)NP(=O)(N1CC1)N1CC1)C(OC(=O)NP(=O)(N1CC1)N1CC1)C(COC(=O)c1ccccc1)OC(=O)NP(=O)(N1CC1)N1CC1",
+      "num_atoms": 72,
+      "old_error": "Exact chemical canonicalization exceeded 50000 search nodes",
+      "potential_coordination": []
+    },
+    {
+      "record_id": "row_78172",
+      "TAID": "TOX-110075",
+      "raw_smiles_upper": "C[PbH2+](C)C",
+      "selected_input_smiles": "C[PbH2+](C)C",
+      "num_atoms": 4,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_TrigonalBipyramidal"
+      ]
+    },
+    {
+      "record_id": "row_78261",
+      "TAID": "TOX-110164",
+      "raw_smiles_upper": "CC[PbH4+2]CC",
+      "selected_input_smiles": "CC[PbH4+2]CC",
+      "num_atoms": 5,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_Octahedral"
+      ]
+    },
+    {
+      "record_id": "row_78298",
+      "TAID": "TOX-110201",
+      "raw_smiles_upper": "CN(C)C1=[S][Fe+3]23([S]=C(N(C)C)[S-]2)([S]=C(N(C)C)[S-]3)[S-]1",
+      "selected_input_smiles": "CN(C)C1=[S][Fe+3]23([S]=C(N(C)C)[S-]2)([S]=C(N(C)C)[S-]3)[S-]1",
+      "num_atoms": 19,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_Octahedral"
+      ]
+    },
+    {
+      "record_id": "row_78317",
+      "TAID": "TOX-110220",
+      "raw_smiles_upper": "CC(=O)O[IH2](OC(C)=O)c1cccc(C)c1",
+      "selected_input_smiles": "CC(=O)O[IH2](OC(C)=O)c1cccc(C)c1",
+      "num_atoms": 16,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_TrigonalBipyramidal"
+      ]
+    },
+    {
+      "record_id": "row_78345",
+      "TAID": "TOX-110248",
+      "raw_smiles_upper": "CN(C)C1=[S][Bi+3]23([S]=C(N(C)C)[S-]2)([S]=C(N(C)C)[S-]3)[S-]1",
+      "selected_input_smiles": "CN(C)C1=[S][Bi+3]23([S]=C(N(C)C)[S-]2)([S]=C(N(C)C)[S-]3)[S-]1",
+      "num_atoms": 19,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_Octahedral"
+      ]
+    },
+    {
+      "record_id": "row_78740",
+      "TAID": "TOX-110645",
+      "raw_smiles_upper": "COc1ccccc1[IH2](OC(C)=O)OC(C)=O",
+      "selected_input_smiles": "COc1ccccc1[IH2](OC(C)=O)OC(C)=O",
+      "num_atoms": 17,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_TrigonalBipyramidal"
+      ]
+    },
+    {
+      "record_id": "row_78891",
+      "TAID": "TOX-110796",
+      "raw_smiles_upper": "CC1CN[Fe+2]23(NCC(C)N2)(NCC(C)N3)N1",
+      "selected_input_smiles": "CC1CN[Fe+2]23(NCC(C)N2)(NCC(C)N3)N1",
+      "num_atoms": 16,
+      "old_error": "Unsupported assigned/potential stereochemistry; do not drop it or encode it as NONE",
+      "potential_coordination": [
+        "Atom_Octahedral"
+      ]
+    }
+  ]
+}

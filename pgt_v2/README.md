@@ -20,6 +20,7 @@
 
 ```text
 python -B -m pgt_v2 environment --output ENVIRONMENT.json
+python -B -m pgt_v2 reference --toxacol-root TOXACOL_ROOT --output AUTHOR_PARITY.json
 python -B -m pgt_v2 inventory --source SOURCE.csv --output INVENTORY.json
 python -B -m pgt_v2 prepare --source SOURCE.csv --output NEW_PREPARATION_DIRECTORY
 python -B -m pgt_v2 smoke --view VIEW_DIRECTORY --cache CACHE_DIRECTORY --chemprop-root CHEMPROP_ROOT --toxacol-root TOXACOL_ROOT --device cpu --output FORWARD.json
@@ -59,3 +60,5 @@ python -B -m pytest tests/pgt_v2 tests/test_features.py tests/test_graphormer_bi
 ```
 
 测试只用合成标签和已登记的结构 fixture，不读取真实毒性表或历史缓存。每个进程必须使用不同的新临时目录，避免仓库默认 pytest 目录冲突。资产、真实缓存、覆盖率、服务器 GPU 以及正式效果均需另行验证；测试通过不代表科学结论成立。
+
+G01 修复（2026-10-17）：FeatureSpec 升级为 `atom_v4_cip_coord_unknown_bond_v2_direct_v1`，为 RDKit 识别的未指定配位立体类型分别保留显式状态；已指定但尚不支持的非四面体构型仍停止。RDKit 的非四面体感知开关必须开启。精确图规范化只利用完整带标签邻接相等证明的自同构剪枝，保留原规范身份算法和 50,000 搜索节点上限。源码身份只允许 CRLF→LF 换行归一化，原始字节 SHA 单独登记；不放宽内容检查，不改变 Cython 源或编译库。`reference` 在 CPU 上执行作者 ToxACoL 数学路径对照，0 真实拟合，可在数据准备前发现依赖问题。旧 schema 的缓存、视图和权重不得混用。

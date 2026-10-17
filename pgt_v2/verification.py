@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import platform
 import subprocess
 import sys
@@ -22,17 +23,31 @@ from .models import build_model, parameter_counts
 from .training import ModelInputs, endpoint_loss, seed_everything
 
 
+def text_source_identity(path, expected_lf_sha256):
+    """Accept Git LF and Windows CRLF, never arbitrary whitespace/content edits."""
+    raw = Path(path).read_bytes()
+    raw_sha = hashlib.sha256(raw).hexdigest()
+    lf_sha = hashlib.sha256(raw.replace(b'\r\n', b'\n')).hexdigest()
+    if lf_sha != expected_lf_sha256:
+        raise ValueError('Text source checksum mismatch: ' + str(path))
+    return dict(raw_sha256=raw_sha, lf_sha256=lf_sha, bytes=len(raw),
+                normalization='CRLF-to-LF only')
+
+
 def environment():
     import algos
     library=Path(algos.__file__)
     if library.suffix not in ('.pyd','.so'):
         raise RuntimeError('Expected a compiled Cython runtime, not an unverified replacement')
     PGT_FEATURE_SPEC.validate_runtime()
+    source_identity = text_source_identity(CONFIG_ROOT.parents[1]/'algos/algos.pyx',
+        read_json(CONFIG_ROOT/'dependency_lock.json')['cython_source_lf_sha256'])
     return dict(python=sys.version,executable=sys.executable,platform=platform.platform(),
         torch=str(torch.__version__),numpy=np.__version__,rdkit=rdBase.rdkitVersion,
         cuda_available=torch.cuda.is_available(),code_commit=git_identity(),torch_threads=torch.get_num_threads(),
         cython_library_name=library.name,cython_library_sha256=file_sha256(library),
-        cython_source_sha256=file_sha256(CONFIG_ROOT.parents[1]/'algos/algos.pyx'),feature_spec_sha256=PGT_FEATURE_SPEC.sha256)
+        cython_source_sha256=source_identity['raw_sha256'],cython_source_identity=source_identity,
+        feature_spec_sha256=PGT_FEATURE_SPEC.sha256)
 
 
 def native_toxacol_parity(source_root):
@@ -44,9 +59,8 @@ def native_toxacol_parity(source_root):
     if changed.strip():
         raise ValueError('Tracked author source changed')
     path=source_root/'models/CorrelationNet.py'
-    expected=read_json(CONFIG_ROOT/'dependency_lock.json')['toxacol_model_sha256']
-    if file_sha256(path)!=expected:
-        raise ValueError('Author CorrelationNet file checksum mismatch')
+    expected=read_json(CONFIG_ROOT/'dependency_lock.json')['toxacol_model_lf_sha256']
+    source_identity=text_source_identity(path,expected)
     spec=importlib.util.spec_from_file_location('pgt_toxacol_reference',path)
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
     features,_=endpoint_feature_matrix(TOXACUTE_TASKS)
@@ -72,7 +86,7 @@ def native_toxacol_parity(source_root):
     forward=float((a-b).abs().max().detach());backward=float((grad_a-grad_b).abs().max())
     torch.testing.assert_close(a,b,atol=1e-10,rtol=1e-10)
     torch.testing.assert_close(grad_a,grad_b,atol=1e-10,rtol=1e-10)
-    return dict(commit=head,model_sha256=file_sha256(path),forward_max_error=forward,
+    return dict(commit=head,model_sha256=file_sha256(path),source_identity=source_identity,forward_max_error=forward,
                 input_gradient_max_error=backward,task_channels=59,endpoint_features=26)
 
 

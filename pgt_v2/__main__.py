@@ -12,6 +12,7 @@ def main(argv=None):
     for name in ('inventory','prepare'):
         p=sub.add_parser(name);p.add_argument('--source',required=True);p.add_argument('--output',required=True)
     p=sub.add_parser('environment');p.add_argument('--output',required=True)
+    p=sub.add_parser('reference');p.add_argument('--toxacol-root',required=True);p.add_argument('--output',required=True)
     p=sub.add_parser('smoke')
     p.add_argument('--view',required=True);p.add_argument('--cache',required=True);p.add_argument('--output',required=True)
     p.add_argument('--device',default='cpu');p.add_argument('--chemprop-root',required=True);p.add_argument('--toxacol-root',required=True)
@@ -45,6 +46,9 @@ def main(argv=None):
     elif args.command=='environment':
         from .verification import environment
         result=environment();write_json(args.output,result)
+    elif args.command=='reference':
+        from .verification import native_toxacol_parity
+        result=native_toxacol_parity(args.toxacol_root);write_json(args.output,result)
     elif args.command=='smoke':
         from .verification import forward_checks
         result=forward_checks(args.view,args.cache,args.output,device=args.device,chemprop_root=args.chemprop_root,toxacol_root=args.toxacol_root)

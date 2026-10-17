@@ -62,10 +62,21 @@ def stereo_states(mol):
     rdCIPLabeler.AssignCIPLabels(mol, maxRecursiveIterations=1250000)
     atoms = ["NONE"] * mol.GetNumAtoms()
     bonds = ["NONE"] * mol.GetNumBonds()
+    unassigned_coordination = {
+        'Atom_SquarePlanar': 'UNASSIGNED_SQUARE_PLANAR',
+        'Atom_TrigonalBipyramidal': 'UNASSIGNED_TRIGONAL_BIPYRAMIDAL',
+        'Atom_Octahedral': 'UNASSIGNED_OCTAHEDRAL',
+    }
     for info in potential:
         kind = str(info.type)
         target = atoms if kind.startswith('Atom_') else bonds
-        if kind not in {'Atom_Tetrahedral', 'Bond_Double'}:
+        if (kind in unassigned_coordination
+                and info.specified == Chem.StereoSpecified.Unspecified
+                and mol.GetAtomWithIdx(info.centeredOn).GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED):
+            # A potential coordination geometry is not an assigned configuration.
+            # Preserve its type and uncertainty; never infer a permutation/CIP tag.
+            target[info.centeredOn] = unassigned_coordination[kind]
+        elif kind not in {'Atom_Tetrahedral', 'Bond_Double'}:
             target[info.centeredOn] = 'UNSUPPORTED'
         else:
             target[info.centeredOn] = 'UNASSIGNED'
@@ -126,8 +137,10 @@ def _graph_labels(mol, atom_stereo, bond_stereo, *, include_stereo=True):
 def _canonical_component(nodes, edges, members, budget):
     """Individualization/refinement; enumerate unresolved cells, no hash-only proof.
 
-    The minimum complete labeled adjacency is canonical. Equal minima give
-    automorphism orbits. A search-limit failure never returns an approximate ID.
+    The minimum complete labeled adjacency is canonical. Equal leaves prove
+    automorphisms. Only generators preserving the current coloring can prune
+    equivalent branches; WL/color equality alone never justifies pruning.
+    A search-limit failure never returns an approximate ID.
     """
     labels = [nodes[i] for i in members]
     local = {v:i for i,v in enumerate(members)}
@@ -146,9 +159,20 @@ def _canonical_component(nodes, edges, members, budget):
     best = None
     best_order = None
     orbit = _Union(len(members))
+    generators = []
     visited = 0
+
+    def equivalent_to_done(vertex, done, colors):
+        # These permutations came from identical COMPLETE labeled adjacencies.
+        # Their color-preserving subgroup maps whole subtrees bijectively.
+        stabilizer_orbits = _Union(len(members))
+        for permutation in generators:
+            if all(colors[i] == colors[j] for i,j in enumerate(permutation)):
+                for i,j in enumerate(permutation): stabilizer_orbits.join(i,j)
+        return any(stabilizer_orbits.find(vertex) == stabilizer_orbits.find(v) for v in done)
+
     def visit(colors):
-        nonlocal best, best_order, orbit, visited
+        nonlocal best, best_order, visited
         visited += 1
         if visited > budget:
             raise UnsupportedChemistry(f'Exact chemical canonicalization exceeded {budget} search nodes')
@@ -158,18 +182,26 @@ def _canonical_component(nodes, edges, members, budget):
         unresolved = [(len(v),c,v) for c,v in cells.items() if len(v)>1]
         if unresolved:
             _,_,cell = min(unresolved)
+            done = []
             for vertex in cell:
+                if done and generators and equivalent_to_done(vertex, done, colors):
+                    continue
                 child = list(colors); child[vertex] = max(colors)+1
                 visit(tuple(child))
+                done.append(vertex)
             return
         order = sorted(range(len(members)), key=colors.__getitem__)
         inverse = {v:i for i,v in enumerate(order)}
         code = (tuple(labels[i] for i in order),
                 tuple(sorted((inverse[i],inverse[j],label) for i in range(len(members)) for j,label in adj[i])))
         if best is None or code < best:
-            best,best_order,orbit = code,order,_Union(len(members))
+            best,best_order = code,order
         elif code == best:
-            for a,b in zip(best_order,order): orbit.join(a,b)
+            permutation = list(range(len(members)))
+            for a,b in zip(best_order,order):
+                permutation[a] = b
+                orbit.join(a,b)
+            generators.append(tuple(permutation))
     visit(colors_for(labels))
     assert best is not None and best_order is not None
     return best, [members[i] for i in best_order], [orbit.find(i) for i in best_order], visited

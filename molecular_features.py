@@ -229,6 +229,8 @@ class FeatureSpec:
     def validate_runtime(self):
         if Chem.rdBase.rdkitVersion != self.rdkit_version:
             raise ValueError(f"RDKit mismatch: spec={self.rdkit_version}, runtime={Chem.rdBase.rdkitVersion}")
+        if not Chem.GetAllowNontetrahedralChirality():
+            raise ValueError("FeatureSpec requires RDKit non-tetrahedral stereo perception enabled")
 
     def encode(self, kind, values):
         fields = self.atom_fields if kind == "atom" else self.bond_fields if kind == "bond" else None
@@ -248,11 +250,12 @@ def _tokens(values):
 # Legacy constants/functions above retain their original values and behaviour.
 # New callers must opt in, carry this hash in batches, and initialize new weights.
 PGT_FEATURE_SPEC = FeatureSpec(
-    version="atom_v3_cip_iso_bond_v2_direct_v1",
+    version="atom_v4_cip_coord_unknown_bond_v2_direct_v1",
     rdkit_version="2025.09.6",
     atom_fields=(
         ("atomic_number", _tokens(range(1, 119))),
-        ("absolute_stereochemistry", ("NONE", "R", "S", "r", "s", "UNASSIGNED", "UNSUPPORTED")),
+        ("absolute_stereochemistry", ("NONE", "R", "S", "r", "s", "UNASSIGNED", "UNSUPPORTED",
+            "UNASSIGNED_SQUARE_PLANAR", "UNASSIGNED_TRIGONAL_BIPYRAMIDAL", "UNASSIGNED_OCTAHEDRAL")),
         ("isotope", _tokens(range(0, 301))),
         ("total_degree", _tokens(range(0, 13))),
         ("formal_charge", _tokens(range(-5, 6))),

@@ -1,5 +1,5 @@
 {
-  "feature_schema_version": "atom_v3_cip_iso_bond_v2_direct_v1",
+  "feature_schema_version": "atom_v4_cip_coord_unknown_bond_v2_direct_v1",
   "rdkit_version": "2025.09.6",
   "identity_algorithm": "colored_graph_ir_v1",
   "atom_feature_names": [
@@ -23,7 +23,7 @@
   ],
   "atom_cardinalities": [
     119,
-    8,
+    11,
     302,
     14,
     12,
@@ -172,7 +172,10 @@
       "r": 5,
       "s": 6,
       "UNASSIGNED": 7,
-      "UNSUPPORTED": 8
+      "UNSUPPORTED": 8,
+      "UNASSIGNED_SQUARE_PLANAR": 9,
+      "UNASSIGNED_TRIGONAL_BIPYRAMIDAL": 10,
+      "UNASSIGNED_OCTAHEDRAL": 11
     },
     "isotope": {
       "PAD": 0,
@@ -604,5 +607,5 @@
   },
   "edge_bias_mode": "direct",
   "unknown_stereo_policy": "explicit unassigned; unsupported assigned stereo raises",
-  "feature_spec_sha256": "5d1122dfb7cca279a455857e900303494d5eaf17a97aaab62e9fd26f4584ccad"
+  "feature_spec_sha256": "31faf80cb7d877b08ae52217e8fb9f7a52b08c3118aa8633151f1337bb48d047"
 }
