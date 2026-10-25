@@ -8,7 +8,7 @@ from pgt_v2.chemistry import graph_from_input, prepare_molecule
 from pgt_v2.config import candidate
 from pgt_v2.evaluation import load_model_checkpoint
 from pgt_v2.minipilot import SOURCES, TARGETS, select_pilot_arrays
-from pgt_v2.models import build_model, task_metadata
+from pgt_v2.models import build_model, parameter_counts, task_metadata
 from pgt_v2.redesign_models import task_smoother
 from pgt_v2.training import ModelInputs, endpoint_loss, seed_everything, train_model, read_checkpoint
 
@@ -121,5 +121,62 @@ def test_fused_model_two_epoch_training_and_checkpoint_reload(tmp_path):
         identity=dict(task_names=list(TASKS), method_id='N4', config=cfg), output=tmp_path/'fit', method='N4')
     restored, checkpoint = load_model_checkpoint(tmp_path/'fit/best.pt')
     model.load_state_dict(checkpoint['model']); model.eval()
+    torch.testing.assert_close(restored(inputs.batch([0, 1, 2])), model(inputs.batch([0, 1, 2])))
+    assert summary['optimizer_steps'] == 2 and summary['terminal'] == 'COMPLETE'
+
+
+@pytest.mark.parametrize('seed', [42, 43])
+def test_shared_prompt_matches_full_n1_initialization_and_rng(seed):
+    tasks = SOURCES + TARGETS
+    seed_everything(seed)
+    original = build_model('N1', tasks, candidate('N1', 'C2'))
+    original_rng = torch.get_rng_state().clone()
+    seed_everything(seed)
+    shared = build_model('N1S', tasks, candidate('N1S', 'C2'))
+    assert torch.equal(original_rng, torch.get_rng_state())
+    for name, value in original.state_dict().items():
+        expected = value[:1] if name == 'prompt_ids' else value
+        assert torch.equal(shared.state_dict()[name], expected), name
+    assert shared.prompt_ids.shape == (1, 96)
+    assert shared.prompts().shape == (12, 96)
+    assert parameter_counts(original)['trainable'] == 476672
+    assert parameter_counts(shared)['trainable'] == 475616
+
+
+def test_shared_prompt_gradient_accumulates_across_all_task_slots():
+    seed_everything(42)
+    independent = build_model('N1', TASKS, tiny_config('N1')).eval()
+    seed_everything(42)
+    shared = build_model('N1S', TASKS, tiny_config('N1S')).eval()
+    with torch.no_grad():
+        independent.prompt_ids.copy_(shared.prompts())
+    inputs = tiny_inputs('N1S').batch([0, 1, 2])
+    expected = independent(inputs)
+    prediction = shared(inputs)
+    torch.testing.assert_close(prediction, expected, rtol=1e-6, atol=1e-7)
+    assert not torch.allclose(prediction[:, 0], prediction[:, 1])
+    labels = torch.tensor([[1., -.5, .2], [.3, 2., -.2], [1.2, -.1, .4]])
+    endpoint_loss(expected, labels, [3, 3, 3], 3).backward()
+    endpoint_loss(prediction, labels, [3, 3, 3], 3).backward()
+    assert shared.prompt_ids.grad.norm() > 0
+    torch.testing.assert_close(shared.prompt_ids.grad, independent.prompt_ids.grad.sum(0, keepdim=True),
+                               rtol=1e-5, atol=1e-7)
+
+
+def test_shared_prompt_training_and_checkpoint_reload(tmp_path):
+    seed_everything(43)
+    cfg = tiny_config('N1S')
+    inputs = tiny_inputs('N1S')
+    labels = np.array([[1., -.5, .2], [.3, 2., -.2], [1.2, -.1, .4]])
+    stats = dict(mean=np.zeros(3), scale=np.ones(3), count=np.array([3, 3, 3]), adjacency=np.eye(3))
+    model = build_model('N1S', TASKS, cfg, counts=stats['count'])
+    initial_prompt = model.prompt_ids.detach().clone()
+    summary = train_model(model, inputs, labels, inputs, labels, stats, config=cfg,
+        identity=dict(task_names=list(TASKS), method_id='N1S', config=cfg), output=tmp_path/'fit', method='N1S')
+    assert not torch.equal(initial_prompt, model.prompt_ids)
+    restored, checkpoint = load_model_checkpoint(tmp_path/'fit/best.pt')
+    model.load_state_dict(checkpoint['model']); model.eval()
+    assert restored.prompt_ids.shape == (1, 16)
+    assert torch.equal(restored.prompts()[0], restored.prompts()[2])
     torch.testing.assert_close(restored(inputs.batch([0, 1, 2])), model(inputs.batch([0, 1, 2])))
     assert summary['optimizer_steps'] == 2 and summary['terminal'] == 'COMPLETE'

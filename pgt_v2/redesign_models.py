@@ -11,7 +11,7 @@ from torch import nn
 from architecture.prediction_heads import TaskPredictionHead
 from .data import make_backbone
 
-REDESIGN_METHODS = ('N0', 'N1', 'N2', 'N3', 'N4')
+REDESIGN_METHODS = ('N0', 'N1', 'N1S', 'N2', 'N3', 'N4')
 FINGERPRINT_METHODS = ('N0', 'N4')
 
 
@@ -64,7 +64,7 @@ class SemanticPrompts(nn.Module):
 
 
 class DeepPromptModel(nn.Module):
-    """N0 late fusion control; N1 deep IDs; N2 semantics; N3 smoothing; N4 fusion."""
+    """N0 late fusion; N1 deep IDs; N1S shared ID; N2 semantics; N3 prior; N4 fusion."""
     def __init__(self, method, tasks, config, metadata, counts=None):
         super().__init__()
         self.method, self.tasks = method, tuple(tasks)
@@ -73,7 +73,7 @@ class DeepPromptModel(nn.Module):
         dim = config['hidden_dim']
         self.backbone = make_backbone(hidden_dim=dim, ffn_dim=config['ffn_dim'],
             num_heads=config['heads'], num_layers=config['layers'], dropout=config['dropout'])
-        if method == 'N1':
+        if method in ('N1', 'N1S'):
             self.prompt_ids = nn.Parameter(torch.randn(len(tasks), dim) * 0.02)
             self.prompt_bank = None
         else:
@@ -83,7 +83,7 @@ class DeepPromptModel(nn.Module):
         if self.deep:
             self.layer_gates = nn.Parameter(torch.full((config['layers'],), 0.1))
         self.readout_norm = nn.LayerNorm(dim)
-        if method == 'N1':
+        if method in ('N1', 'N1S'):
             self.heads = nn.ModuleList([TaskPredictionHead(dim, mode='point', head_hidden_dim=dim,
                 dropout=config['dropout']) for _ in tasks])
         else:
@@ -97,8 +97,14 @@ class DeepPromptModel(nn.Module):
             self.fusion_gate = nn.Linear(2 * dim, 1)
             nn.init.zeros_(self.fusion_gate.weight)
             nn.init.zeros_(self.fusion_gate.bias)
+        if method == 'N1S':
+            # Finish the full N1 initialization before tying prompts, preserving
+            # all common initial weights and the RNG state for paired seeds.
+            self.prompt_ids = nn.Parameter(self.prompt_ids[:1].detach().clone())
 
     def prompts(self):
+        if self.method == 'N1S':
+            return self.prompt_ids.expand(len(self.tasks), -1)
         return self.prompt_ids if self.prompt_bank is None else self.prompt_bank()
 
     def regularization_loss(self):
@@ -123,7 +129,7 @@ class DeepPromptModel(nn.Module):
             return_attention=return_aux and self.deep)
         representation = self.readout_norm(tokens.graph_token[:, None, :] +
             (tokens.prompt_tokens if self.deep else prompt[None]))
-        if self.method == 'N1':
+        if self.method in ('N1', 'N1S'):
             prediction = torch.cat([head(representation[:, i]) for i, head in enumerate(self.heads)], dim=-1)
         else:
             prediction = self.shared_head(representation.reshape(-1, representation.shape[-1])).reshape(representation.shape[:2])

@@ -219,7 +219,7 @@ def build_model(method, tasks, config, *, adjacency=None, counts=None, chemprop_
         features, _ = endpoint_feature_matrix(tasks)
         result = ToxACoLNet(adjacency, features, dropout=config['dropout'])
         result.tasks = tuple(tasks)
-    elif method in ('N0', 'N1', 'N2', 'N3', 'N4'):
+    elif method in ('N0', 'N1', 'N1S', 'N2', 'N3', 'N4'):
         from .redesign_models import DeepPromptModel
         result = DeepPromptModel(method, tasks, config, task_metadata(tasks), counts=counts)
     else:

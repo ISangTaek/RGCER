@@ -6,11 +6,11 @@ from .chemistry import digest
 from molecular_features import PGT_FEATURE_SPEC
 
 CONFIG_ROOT = Path(__file__).resolve().parents[1] / 'configs' / 'pgt_v2'
-METHODS = ('M0', 'M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'A1', 'A2', 'A3', 'N0', 'N1', 'N2', 'N3', 'N4')
+METHODS = ('M0', 'M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'A1', 'A2', 'A3', 'N0', 'N1', 'N1S', 'N2', 'N3', 'N4')
 
 
 def candidate(method, config_id):
-    if method in ('N0', 'N1', 'N2', 'N3', 'N4'):
+    if method in ('N0', 'N1', 'N1S', 'N2', 'N3', 'N4'):
         if config_id != 'C2':
             raise ValueError('G02R prompt candidates have one fixed C2 configuration')
         return {**candidate('M6', 'C2'), 'prompt_rank': 8}
