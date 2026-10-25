@@ -25,14 +25,15 @@ def select_config(run_directories, destination, *, required_configs=('C0','C1','
         checkpoint = read_checkpoint(directory/'best.pt')
         if checkpoint['identity'] != identity or checkpoint['best_epoch'] != row['best_epoch']:
             raise ValueError('Candidate checkpoint/report identity mismatch')
-        score = row['validation']['macro_rmse']
+        score = row.get('selection_score', row['validation']['macro_rmse'])
         if not np.isfinite(score) or abs(score - checkpoint['best']) > 1e-12:
             raise ValueError('Invalid candidate validation score')
         rows.append((score, identity['config_id'], directory, row))
     if {x[1] for x in rows} != set(required_configs) or len(rows) != len(required_configs):
         raise ValueError('Exactly the frozen candidate configurations are required')
     signatures = {(x[3]['identity']['method_id'], str(x[3]['identity']['fold']), x[3]['identity']['view_sha256'],
-                   x[3]['identity']['code_commit'], tuple(x[3]['identity']['task_names'])) for x in rows}
+                   x[3]['identity']['code_commit'], tuple(x[3]['identity']['task_names']),
+                   tuple(x[3]['identity']['config'].get('selection_tasks') or ())) for x in rows}
     if len(signatures) != 1:
         raise ValueError('Candidate method/fold/view/code/task registry differs')
     minimum = min(x[0] for x in rows)
@@ -41,8 +42,10 @@ def select_config(run_directories, destination, *, required_configs=('C0','C1','
         config=winner['identity']['config'], view_sha256=winner['identity']['view_sha256'],
         code_commit=winner['identity']['code_commit'], seed42_checkpoint=str((directory/'best.pt').resolve()),
         seed42_checkpoint_sha256=winner['best_sha256'], seed42_reused=True, refit_train_plus_validation=False,
-        validation_macro_rmse=score, best_epoch=winner['best_epoch'],
-        candidates=[dict(config_id=x[1], validation_macro_rmse=x[0], checkpoint_sha256=x[3]['best_sha256']) for x in rows])
+        validation_macro_rmse=winner['validation']['macro_rmse'], selection_score=score,
+        selection_tasks=winner['identity']['config'].get('selection_tasks'), best_epoch=winner['best_epoch'],
+        candidates=[dict(config_id=x[1], validation_macro_rmse=x[3]['validation']['macro_rmse'],
+                         selection_score=x[0], checkpoint_sha256=x[3]['best_sha256']) for x in rows])
     result['selection_sha256'] = digest(result)
     write_json(destination, result)
     return result
@@ -58,7 +61,7 @@ def load_model_checkpoint(checkpoint_path, *, device='cpu', chemprop_root=None):
         model = checkpoint['forest']
     else:
         model = build_model(method, identity['task_names'], identity['config'],
-            adjacency=checkpoint['stats']['adjacency'], chemprop_root=chemprop_root, device=device)
+            adjacency=checkpoint['stats']['adjacency'], counts=checkpoint['stats']['count'], chemprop_root=chemprop_root, device=device)
         model.load_state_dict(checkpoint['model'])
         model.eval()
     return model, checkpoint

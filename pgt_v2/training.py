@@ -82,7 +82,10 @@ class ModelInputs:
         if self.method in ('M0', 'M3'):
             values = molecular_features(mols, 'morgan' if self.method == 'M0' else 'avalon')
             return values if self.method == 'M0' else torch.tensor(values, device=self.device)
-        return self.collate(graphs).to(self.device)
+        batch = self.collate(graphs).to(self.device)
+        if self.method in ('N0', 'N4'):
+            return batch, torch.tensor(molecular_features(mols, 'avalon'), device=self.device)
+        return batch
 
 
 def metrics(truth, prediction, tasks, groups=None):
@@ -108,6 +111,16 @@ def metrics(truth, prediction, tasks, groups=None):
             measurements[kind] = dict(tasks=len(subset), macro_rmse=float(np.mean([r['rmse'] for r in subset])),
                                       macro_mae=float(np.mean([r['mae'] for r in subset])))
     return dict(macro_rmse=float(np.mean(rmse)), micro_mae=float(np.mean(errors)), endpoints=task_rows,measurements=measurements)
+
+
+def selection_score(report, selection_tasks=None):
+    """Predeclared target selection; absent means the legacy all-task criterion."""
+    if selection_tasks is None:
+        return report['macro_rmse']
+    rows = {row['task']: row['rmse'] for row in report['endpoints']}
+    if not selection_tasks or len(set(selection_tasks)) != len(selection_tasks) or set(selection_tasks) - set(rows):
+        raise ValueError('Selection tasks must be a unique nonempty subset of reported tasks')
+    return float(np.mean([rows[name] for name in selection_tasks]))
 
 
 @torch.no_grad()
@@ -196,12 +209,17 @@ def train_model(model, train_inputs, train_labels, val_inputs, val_labels, stats
         model.train()
         order = [active[i] for i in torch.randperm(len(active)).tolist()]
         weighted_loss = 0.0
+        weighted_regularization = 0.0
         for effective in partition_batches(order, cfg['effective_batch'], batch_norm=method == 'M3'):
             optimizer.zero_grad(set_to_none=True)
             for micro in partition_batches(effective, cfg['micro_batch'], batch_norm=method == 'M3'):
                 prediction = model(train_inputs.batch(micro))
                 target = torch.as_tensor(standardized[micro], dtype=prediction.dtype, device=device)
                 loss = endpoint_loss(prediction, target, stats['count'], len(active))
+                if hasattr(model, 'regularization_loss'):
+                    regularization = model.regularization_loss()
+                    loss = loss + regularization
+                    weighted_regularization += float(regularization.detach()) * len(micro)
                 if not torch.isfinite(loss):
                     raise FloatingPointError('Nonfinite loss; no checkpoint promoted')
                 (loss * (len(micro) / len(effective))).backward()
@@ -210,15 +228,17 @@ def train_model(model, train_inputs, train_labels, val_inputs, val_labels, stats
             optimizer.step(); updates += 1
         pred = predict_array(model, val_inputs, stats, method, cfg['micro_batch'])
         report = metrics(val_labels, pred, identity['task_names'], val_inputs.records['group_id'])
-        improved = report['macro_rmse'] < best
+        score = selection_score(report, cfg.get('selection_tasks'))
+        improved = score < best
         if improved:
-            best, stale, best_epoch = report['macro_rmse'], 0, epoch+1
+            best, stale, best_epoch = score, 0, epoch+1
         else:
             stale += 1
         row = dict(epoch=epoch+1, train_loss=weighted_loss/len(active), validation=report, updates=updates,
             visible_counts=stats['count'].tolist(), active_rows=len(active), elapsed_seconds=time.perf_counter()-started,
             peak_cuda_bytes=torch.cuda.max_memory_allocated(device) if device.type == 'cuda' else 0,
-            best_epoch=best_epoch, stale=stale)
+            best_epoch=best_epoch, stale=stale, selection_score=score,
+            regularization_loss=weighted_regularization/len(active))
         history.append(row)
         checkpoint = dict(format='PGTV2_CHECKPOINT_1', identity=identity, model=copy.deepcopy(model.state_dict()),
             optimizer=optimizer.state_dict(), stats=stats, rng=_rng(device), epoch=epoch+1, best=best, stale=stale,
@@ -233,6 +253,7 @@ def train_model(model, train_inputs, train_labels, val_inputs, val_labels, stats
     completed = history[-1]['epoch'] >= cfg['max_epochs'] or (history[-1]['epoch'] >= cfg['min_epochs'] and stale >= cfg['patience'])
     summary = dict(identity=identity, method=method, terminal='COMPLETE' if completed else 'INTERRUPTED_AT_EPOCH',
         best_epoch=best_epoch, validation=history[best_epoch-1]['validation'], optimizer_steps=updates,
+        selection_score=best, selection_tasks=cfg.get('selection_tasks'),
         best_sha256=file_sha256(output/'best.pt'), parameters=parameter_counts(model))
     write_json(output/'summary.json', summary)
     return summary
@@ -267,7 +288,7 @@ def run_training(run_file, view_root, cache_root, output, *, device='cpu', chemp
         raise ValueError('Wrong graph cache')
     seed_everything(int(run['init_seed']))
     method = run['method_id']
-    model = build_model(method, manifest['task_names'], run['config'], adjacency=stats['adjacency'],
+    model = build_model(method, manifest['task_names'], run['config'], adjacency=stats['adjacency'], counts=stats['count'],
                         chemprop_root=chemprop_root, device=device, seed=int(run['init_seed']))
     identity = {**run, 'view_manifest':manifest, 'runtime_device':str(device), 'torch_version':str(torch.__version__),
                 'numpy_version':np.__version__, 'torch_threads':torch.get_num_threads(),

@@ -206,7 +206,7 @@ class EndpointForest:
         return np.column_stack([m.predict(features) for m in self.models])
 
 
-def build_model(method, tasks, config, *, adjacency=None, chemprop_root=None, device='cpu', seed=42):
+def build_model(method, tasks, config, *, adjacency=None, counts=None, chemprop_root=None, device='cpu', seed=42):
     if not tasks or len(set(tasks)) != len(tasks):
         raise ValueError('Unique nonempty task registry required')
     if method == 'M0':
@@ -219,6 +219,9 @@ def build_model(method, tasks, config, *, adjacency=None, chemprop_root=None, de
         features, _ = endpoint_feature_matrix(tasks)
         result = ToxACoLNet(adjacency, features, dropout=config['dropout'])
         result.tasks = tuple(tasks)
+    elif method in ('N0', 'N1', 'N2', 'N3', 'N4'):
+        from .redesign_models import DeepPromptModel
+        result = DeepPromptModel(method, tasks, config, task_metadata(tasks), counts=counts)
     else:
         result = GraphPointModel(method, tasks, config)
     return result.to(device)
@@ -229,4 +232,5 @@ def parameter_counts(model):
         return {'trainable': None, 'total': None, 'kind': 'per_endpoint_forest'}
     return {'trainable': sum(p.numel() for p in model.parameters() if p.requires_grad),
             'total': sum(p.numel() for p in model.parameters()),
-            'prediction_heads': sum(p.numel() for p in getattr(model, 'heads', nn.ModuleList()).parameters())}
+            'prediction_heads': sum(p.numel() for name in ('heads', 'shared_head', 'fingerprint_head')
+                for p in getattr(model, name, nn.ModuleList()).parameters())}

@@ -15,6 +15,7 @@ class BackboneTokens:
     atom_tokens: torch.Tensor
     atom_mask: torch.Tensor
     attentions: tuple[torch.Tensor, ...] = ()
+    prompt_tokens: torch.Tensor | None = None
 
 
 class MultiHeadAttention(nn.Module):
@@ -188,7 +189,8 @@ class MolecularGraphormerBackbone(nn.Module):
             raise RuntimeError("PGT FeatureSpec weights cannot be loaded into a legacy backbone")
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
-    def encode_tokens(self, batch, *, return_attention=False, atom_embeddings=None):
+    def encode_tokens(self, batch, *, return_attention=False, atom_embeddings=None,
+                      prompt_embeddings=None, layer_prompt_offsets=None):
         required = ("x", "in_degree", "out_degree", "spatial_pos", "attn_bias", "attn_edge_type")
         if self.edge_bias_mode != "direct":
             required += ("edge_input",)
@@ -219,17 +221,39 @@ class MolecularGraphormerBackbone(nn.Module):
             [torch.zeros((batch_size, 1), dtype=torch.bool, device=x.device), node_padding_mask], dim=1
         )
         attn_bias = self._encode_attention_bias(batch, n_nodes)
+        prompt_count = 0
+        if prompt_embeddings is not None:
+            if prompt_embeddings.ndim == 2:
+                prompt_embeddings = prompt_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
+            if prompt_embeddings.shape[0] != batch_size or prompt_embeddings.shape[-1] != self.hidden_dim:
+                raise ValueError('Prompt embeddings must be [tasks,dim] or [batch,tasks,dim]')
+            prompt_count = prompt_embeddings.shape[1]
+            sequence = torch.cat([sequence, prompt_embeddings], dim=1)
+            prompt_padding = torch.zeros((batch_size, prompt_count), dtype=torch.bool, device=x.device)
+            key_padding_mask = torch.cat([key_padding_mask, prompt_padding], dim=1)
+            block_padding_mask = torch.cat([node_padding_mask, prompt_padding], dim=1)
+            # Virtual task tokens have no chemical bond/distance identity. The
+            # original molecule bias remains intact; new interactions start at 0.
+            attn_bias = torch.nn.functional.pad(attn_bias, (0, prompt_count, 0, prompt_count))
+        else:
+            block_padding_mask = node_padding_mask
+        if layer_prompt_offsets is not None and layer_prompt_offsets.shape != (len(self.layers), prompt_count, self.hidden_dim):
+            raise ValueError('Layer prompt offsets must match layers, task tokens and hidden dimension')
         attentions = []
-        for layer in self.layers:
-            result = layer(sequence, attn_bias, key_padding_mask, node_padding_mask, return_attention=return_attention)
+        for layer_index, layer in enumerate(self.layers):
+            if layer_prompt_offsets is not None:
+                sequence = torch.cat([sequence[:, :n_nodes+1],
+                    sequence[:, n_nodes+1:] + layer_prompt_offsets[layer_index].unsqueeze(0)], dim=1)
+            result = layer(sequence, attn_bias, key_padding_mask, block_padding_mask, return_attention=return_attention)
             if return_attention:
                 sequence, attention = result
                 attentions.append(attention)
             else:
                 sequence = result
         sequence = self.final_norm(sequence)
-        atoms = sequence[:, 1:, :].masked_fill(node_padding_mask.unsqueeze(-1), 0.0)
-        return BackboneTokens(sequence[:, 0, :], atoms, ~node_padding_mask, tuple(attentions))
+        atoms = sequence[:, 1:n_nodes+1, :].masked_fill(node_padding_mask.unsqueeze(-1), 0.0)
+        prompts = sequence[:, n_nodes+1:, :] if prompt_count else None
+        return BackboneTokens(sequence[:, 0, :], atoms, ~node_padding_mask, tuple(attentions), prompts)
 
     def forward(self, batch):
         """Preserve the graph-only interface and legacy checkpoint key layout."""

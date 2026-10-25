@@ -6,10 +6,14 @@ from .chemistry import digest
 from molecular_features import PGT_FEATURE_SPEC
 
 CONFIG_ROOT = Path(__file__).resolve().parents[1] / 'configs' / 'pgt_v2'
-METHODS = ('M0', 'M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'A1', 'A2', 'A3')
+METHODS = ('M0', 'M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'A1', 'A2', 'A3', 'N0', 'N1', 'N2', 'N3', 'N4')
 
 
 def candidate(method, config_id):
+    if method in ('N0', 'N1', 'N2', 'N3', 'N4'):
+        if config_id != 'C2':
+            raise ValueError('G02R prompt candidates have one fixed C2 configuration')
+        return {**candidate('M6', 'C2'), 'prompt_rank': 8}
     if method not in METHODS or config_id not in ('C0', 'C1', 'C2', 'C3'):
         raise ValueError('A concrete registered method/config ID is required')
     return json.loads((CONFIG_ROOT / (config_id + '.json')).read_text(encoding='utf-8'))[method]
