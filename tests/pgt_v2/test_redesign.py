@@ -9,7 +9,7 @@ from pgt_v2.config import candidate
 from pgt_v2.evaluation import load_model_checkpoint
 from pgt_v2.minipilot import SOURCES, TARGETS, select_pilot_arrays
 from pgt_v2.models import build_model, parameter_counts, task_metadata
-from pgt_v2.redesign_models import task_smoother
+from pgt_v2.redesign_models import relation_prior, task_smoother
 from pgt_v2.training import ModelInputs, endpoint_loss, seed_everything, train_model, read_checkpoint
 
 TASKS = ('mouse_oral_LD50', 'rat_oral_LD50', 'human_oral_TDLo')
@@ -179,4 +179,86 @@ def test_shared_prompt_training_and_checkpoint_reload(tmp_path):
     assert restored.prompt_ids.shape == (1, 16)
     assert torch.equal(restored.prompts()[0], restored.prompts()[2])
     torch.testing.assert_close(restored(inputs.batch([0, 1, 2])), model(inputs.batch([0, 1, 2])))
+    assert summary['optimizer_steps'] == 2 and summary['terminal'] == 'COMPLETE'
+
+
+@pytest.mark.parametrize('seed', [42, 43, 44])
+def test_hierarchical_prompts_match_shared_initialization_and_predictions(seed):
+    tasks = SOURCES + TARGETS
+    adjacency = np.eye(len(tasks))
+    seed_everything(seed)
+    shared = build_model('N1S', tasks, candidate('N1S', 'C2')).eval()
+    expected_rng = torch.get_rng_state().clone()
+    x = tiny_inputs('N1S').batch([0, 1, 2])
+    with torch.no_grad():
+        expected = shared(x)
+    for method in ('N1H', 'N1R', 'N1RP'):
+        seed_everything(seed)
+        numpy_rng = np.random.get_state()
+        model = build_model(method, tasks, candidate(method, 'C2'), adjacency=adjacency).eval()
+        assert torch.equal(expected_rng, torch.get_rng_state())
+        actual_numpy_rng = np.random.get_state()
+        assert numpy_rng[0] == actual_numpy_rng[0] and numpy_rng[2:] == actual_numpy_rng[2:]
+        np.testing.assert_array_equal(numpy_rng[1], actual_numpy_rng[1])
+        for name, value in shared.state_dict().items():
+            assert torch.equal(model.state_dict()[name], value), name
+        assert parameter_counts(model)['trainable'] == 476768
+        assert torch.count_nonzero(model.prompt_delta) == 0
+        assert model.regularization_loss().item() == 0
+        with torch.no_grad():
+            torch.testing.assert_close(model(x), expected, rtol=0, atol=0)
+
+
+def test_relation_prior_weights_permutation_and_regularization_gradient():
+    tasks = SOURCES + TARGETS
+    metadata = task_metadata(tasks)
+    adjacency = np.eye(len(tasks))
+    adjacency[1, 3] = adjacency[3, 1] = 0.4
+    adjacency[2, 3] = adjacency[3, 2] = 0.3
+    weights = relation_prior([metadata[t] for t in tasks], adjacency)
+    assert torch.count_nonzero(torch.triu(weights, 1)) == 11
+    assert torch.triu(weights, 1).sum() == 3.5
+    assert weights[1, 3] == weights[2, 3] == 1
+    assert weights[6, 7] == 0.25 and weights[0, 6] == 0
+    assert weights[5, 10] == weights[5, 11] == 0.125
+    permutation = [11, 4, 1, 5, 8, 7, 0, 6, 2, 3, 10, 9]
+    for method in ('N1H', 'N1R', 'N1RP'):
+        model = build_model(method, tasks, candidate(method, 'C2'), adjacency=adjacency)
+        expected = (torch.zeros_like(weights) if method == 'N1H' else
+                    weights[permutation][:, permutation] if method == 'N1RP' else weights)
+        torch.testing.assert_close(model.relation_weights, expected)
+        if method == 'N1RP':
+            assert model.relation_permutation.tolist() == permutation
+        z = torch.arange(12 * 96, dtype=torch.float32).reshape(12, 96) / (12 * 96)
+        with torch.no_grad():
+            model.prompt_delta.copy_(0.02 * z)
+        laplacian = torch.diag(expected.sum(1)) - expected
+        mass = torch.triu(expected, 1).sum()
+        energy = ((z * (laplacian @ z)).sum() / (96 * mass)) if mass > 0 else 0
+        loss = model.regularization_loss()
+        torch.testing.assert_close(loss, 0.01 * (z.square().mean() + energy))
+        loss.backward()
+        gradient = 2 * 0.01 * z / z.numel()
+        if mass > 0:
+            gradient += 2 * 0.01 * (laplacian @ z) / (96 * mass)
+        torch.testing.assert_close(model.prompt_delta.grad, gradient / 0.02, atol=1e-8, rtol=1e-5)
+        assert model.prompt_ids.grad is None  # The prior constrains differences, not the shared base.
+
+
+@pytest.mark.parametrize('method', ['N1H', 'N1R', 'N1RP'])
+def test_hierarchical_training_and_checkpoint_reload(method, tmp_path):
+    seed_everything(43)
+    cfg = tiny_config(method)
+    inputs = tiny_inputs(method)
+    labels = np.array([[1., -.5, .2], [.3, 2., -.2], [1.2, -.1, .4]])
+    stats = dict(mean=np.zeros(3), scale=np.ones(3), count=np.array([3, 3, 3]), adjacency=np.eye(3))
+    model = build_model(method, TASKS, cfg, adjacency=stats['adjacency'], counts=stats['count'])
+    summary = train_model(model, inputs, labels, inputs, labels, stats, config=cfg,
+        identity=dict(task_names=list(TASKS), method_id=method, config=cfg), output=tmp_path/'fit', method=method)
+    assert model.prompt_delta.norm() > 0 and model.regularization_loss() > 0
+    restored, checkpoint = load_model_checkpoint(tmp_path/'fit/best.pt')
+    model.load_state_dict(checkpoint['model']); model.eval()
+    torch.testing.assert_close(restored(inputs.batch([0, 1, 2])), model(inputs.batch([0, 1, 2])))
+    torch.testing.assert_close(restored.relation_weights, model.relation_weights)
+    torch.testing.assert_close(restored.regularization_loss(), model.regularization_loss())
     assert summary['optimizer_steps'] == 2 and summary['terminal'] == 'COMPLETE'

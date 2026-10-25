@@ -5,14 +5,34 @@ attention is diagnostic; it is not labelled a causal or complete explanation.
 """
 from __future__ import annotations
 
+import numpy as np
 import torch
 from torch import nn
 
 from architecture.prediction_heads import TaskPredictionHead
 from .data import make_backbone
 
-REDESIGN_METHODS = ('N0', 'N1', 'N1S', 'N2', 'N3', 'N4')
+HIERARCHICAL_METHODS = ('N1H', 'N1R', 'N1RP')
+ID_PROMPT_METHODS = ('N1', 'N1S') + HIERARCHICAL_METHODS
+REDESIGN_METHODS = ('N0', 'N1', 'N1S', 'N2', 'N3', 'N4') + HIERARCHICAL_METHODS
 FINGERPRINT_METHODS = ('N0', 'N4')
+
+
+def relation_prior(metadata, adjacency, semantic_weight=0.25):
+    """Fixed hybrid graph: visible-train ToxACoL support plus weak metadata edges."""
+    n = len(metadata)
+    if adjacency is None or np.asarray(adjacency).shape != (n, n):
+        raise ValueError('Relation prompts require the visible training-view adjacency')
+    data = torch.as_tensor(np.asarray(adjacency) > 0, dtype=torch.float32)
+    semantic = torch.zeros(n, n)
+    for i, left in enumerate(metadata):
+        for j, right in enumerate(metadata):
+            if left['measurement'] == right['measurement']:
+                semantic[i, j] = (0.5 * (left['organism'] == right['organism']) +
+                                  0.5 * (left['route'] == right['route']))
+    weights = torch.maximum(data, semantic_weight * semantic)
+    weights.fill_diagonal_(0)
+    return weights
 
 
 def task_smoother(metadata, counts, strength=1.0, *, return_laplacian=False):
@@ -64,8 +84,8 @@ class SemanticPrompts(nn.Module):
 
 
 class DeepPromptModel(nn.Module):
-    """N0 late fusion; N1 deep IDs; N1S shared ID; N2 semantics; N3 prior; N4 fusion."""
-    def __init__(self, method, tasks, config, metadata, counts=None):
+    """Deep task prompts, including shared-plus-residual and relation controls."""
+    def __init__(self, method, tasks, config, metadata, counts=None, adjacency=None):
         super().__init__()
         self.method, self.tasks = method, tuple(tasks)
         self.deep = method != 'N0'
@@ -73,7 +93,7 @@ class DeepPromptModel(nn.Module):
         dim = config['hidden_dim']
         self.backbone = make_backbone(hidden_dim=dim, ffn_dim=config['ffn_dim'],
             num_heads=config['heads'], num_layers=config['layers'], dropout=config['dropout'])
-        if method in ('N1', 'N1S'):
+        if method in ID_PROMPT_METHODS:
             self.prompt_ids = nn.Parameter(torch.randn(len(tasks), dim) * 0.02)
             self.prompt_bank = None
         else:
@@ -83,7 +103,7 @@ class DeepPromptModel(nn.Module):
         if self.deep:
             self.layer_gates = nn.Parameter(torch.full((config['layers'],), 0.1))
         self.readout_norm = nn.LayerNorm(dim)
-        if method in ('N1', 'N1S'):
+        if method in ID_PROMPT_METHODS:
             self.heads = nn.ModuleList([TaskPredictionHead(dim, mode='point', head_hidden_dim=dim,
                 dropout=config['dropout']) for _ in tasks])
         else:
@@ -97,17 +117,42 @@ class DeepPromptModel(nn.Module):
             self.fusion_gate = nn.Linear(2 * dim, 1)
             nn.init.zeros_(self.fusion_gate.weight)
             nn.init.zeros_(self.fusion_gate.bias)
-        if method == 'N1S':
+        if method == 'N1S' or method in HIERARCHICAL_METHODS:
             # Finish the full N1 initialization before tying prompts, preserving
             # all common initial weights and the RNG state for paired seeds.
             self.prompt_ids = nn.Parameter(self.prompt_ids[:1].detach().clone())
+        if method in HIERARCHICAL_METHODS:
+            self.prompt_delta = nn.Parameter(torch.zeros(len(tasks), dim))
+            self.residual_scale = config['prompt_residual_scale']
+            self.shrinkage = config['prompt_shrinkage']
+            self.relation_strength = config['prompt_relation_strength']
+            weights = torch.zeros(len(tasks), len(tasks))
+            permutation = np.arange(len(tasks))
+            if method in ('N1R', 'N1RP'):
+                weights = relation_prior([metadata[name] for name in tasks], adjacency,
+                                         config['prompt_semantic_weight'])
+            if method == 'N1RP':
+                # A private generator preserves paired training RNG streams.
+                permutation = np.random.default_rng(config['prompt_permutation_seed']).permutation(len(tasks))
+                weights = weights[permutation][:, permutation]
+            self.register_buffer('relation_weights', weights)
+            self.register_buffer('relation_permutation', torch.tensor(permutation, dtype=torch.long))
 
     def prompts(self):
+        if self.method in HIERARCHICAL_METHODS:
+            return self.prompt_ids + self.prompt_delta
         if self.method == 'N1S':
             return self.prompt_ids.expand(len(self.tasks), -1)
         return self.prompt_ids if self.prompt_bank is None else self.prompt_bank()
 
     def regularization_loss(self):
+        if self.method in HIERARCHICAL_METHODS:
+            z = self.prompt_delta / self.residual_scale
+            weights = torch.triu(self.relation_weights, diagonal=1)
+            differences = z[:, None, :] - z[None, :, :]
+            relation = (weights * differences.square().sum(-1)).sum()
+            relation = relation / (z.shape[1] * weights.sum().clamp_min(1e-12))
+            return self.shrinkage * z.square().mean() + self.relation_strength * relation
         prompt = self.prompts()
         if self.method != 'N3':
             return prompt.new_zeros(())
@@ -129,7 +174,7 @@ class DeepPromptModel(nn.Module):
             return_attention=return_aux and self.deep)
         representation = self.readout_norm(tokens.graph_token[:, None, :] +
             (tokens.prompt_tokens if self.deep else prompt[None]))
-        if self.method in ('N1', 'N1S'):
+        if self.method in ID_PROMPT_METHODS:
             prediction = torch.cat([head(representation[:, i]) for i, head in enumerate(self.heads)], dim=-1)
         else:
             prediction = self.shared_head(representation.reshape(-1, representation.shape[-1])).reshape(representation.shape[:2])
