@@ -67,7 +67,8 @@ def load_model_checkpoint(checkpoint_path, *, device='cpu', chemprop_root=None):
     return model, checkpoint
 
 
-def sealed_predict(checkpoint_path, view_root, cache_root, output, *, role='test', device='cpu', chemprop_root=None):
+def sealed_predict(checkpoint_path, view_root, cache_root, output, *, role='test', device='cpu', chemprop_root=None,
+                   verify_database=True):
     if role not in ('train', 'validation', 'test'):
         raise ValueError('Unknown prediction role')
     manifest = load_manifest(view_root)
@@ -78,7 +79,7 @@ def sealed_predict(checkpoint_path, view_root, cache_root, output, *, role='test
     records = load_arrays(view_root, role + '_inputs.npz', manifest)
     if 'labels' in records:
         raise ValueError('Predict accepts input-only partitions')
-    cache = GraphCache(cache_root, source_sha256=manifest['source_sha256'])
+    cache = GraphCache(cache_root, source_sha256=manifest['source_sha256'], verify_database=verify_database)
     if cache.manifest['cache_id'] != manifest['cache_id']:
         raise ValueError('Prediction cache identity mismatch')
     predictions = predict_array(model, ModelInputs(cache, records, identity['method_id'], device),

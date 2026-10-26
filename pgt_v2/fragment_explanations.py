@@ -216,6 +216,30 @@ def compare_ranking(ranking_scores, responses, fragments):
     return result
 
 
+def matched_pairs(fragments):
+    """Model-independent eligible pairs; zero responses and tied scores stay in."""
+    eligible = [i for i, f in enumerate(fragments) if f['a_count'] > 0 and f['b_count'] > 0]
+    return [(i, j) for pos, i in enumerate(eligible) for j in eligible[pos+1:]
+            if (fragments[i]['size_bin'], fragments[i]['aromatic']) ==
+               (fragments[j]['size_bin'], fragments[j]['aromatic'])]
+
+
+def pair_concordance(ranking_scores, responses, pairs):
+    """Mean sign(score difference) * sign(independent response difference).
+
+    Missing predictions invalidate this observation, instead of silently changing
+    its fixed pair set. No eligible pair is structurally non-evaluable (None).
+    """
+    if not pairs:
+        return None
+    scores, effects = np.asarray(ranking_scores, dtype=float), np.asarray(responses, dtype=float)
+    indices = np.asarray(pairs)
+    if not np.isfinite(scores[indices]).all() or not np.isfinite(effects[indices]).all():
+        return None
+    return float(np.mean(np.sign(scores[indices[:, 0]]-scores[indices[:, 1]]) *
+                         np.sign(effects[indices[:, 0]]-effects[indices[:, 1]])))
+
+
 def evaluate_fragments(panel, predictions, *, task, scale, atom_explanations=None):
     """predictions[0] is original; remaining rows follow panel candidates."""
     delta = predictions[1:, task]-predictions[0, task]
@@ -230,6 +254,9 @@ def evaluate_fragments(panel, predictions, *, task, scale, atom_explanations=Non
     for name, values in (atom_explanations or {}).items():
         rankings[name] = attribution_scores(values, panel['fragments'])
     result = {name:compare_ranking(values, responses, panel['fragments']) for name, values in rankings.items()}
+    pairs = matched_pairs(panel['fragments'])
+    for name, values in rankings.items():
+        result[name].update(pair_concordance=pair_concordance(values, responses, pairs), fixed_pair_count=len(pairs))
     clean = lambda values: [float(v) if np.isfinite(v) else None for v in values]
     return dict(metrics=result, a_mean_absolute_response=clean(scores),
         b_mean_absolute_response=clean(responses), a_signed_removal_response=clean(signed),

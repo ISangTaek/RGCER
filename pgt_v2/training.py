@@ -189,6 +189,8 @@ def train_model(model, train_inputs, train_labels, val_inputs, val_labels, stats
     device = next(model.parameters()).device
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
     start, best, stale, history, updates, best_epoch = 0, float('inf'), 0, [], 0, None
+    auxiliary_tasks = cfg.get('auxiliary_selection_tasks')
+    auxiliary = None
     if resume:
         checkpoint = read_checkpoint(output/'last.pt')
         if checkpoint['identity'] != identity or checkpoint['kind'] != 'last':
@@ -199,6 +201,9 @@ def train_model(model, train_inputs, train_labels, val_inputs, val_labels, stats
             raise ValueError('Resume training statistics mismatch')
         model.load_state_dict(checkpoint['model']); optimizer.load_state_dict(checkpoint['optimizer'])
         start, best, stale, history, updates, best_epoch = [checkpoint[k] for k in ('epoch','best','stale','history','updates','best_epoch')]
+        auxiliary = checkpoint.get('auxiliary_selection')
+        if auxiliary is not None and file_sha256(output/'best_s21.pt') != auxiliary['checkpoint_sha256']:
+            raise ValueError('Resume auxiliary checkpoint changed since the saved epoch')
         _restore_rng(checkpoint['rng'])
     for epoch in range(start, cfg['max_epochs']):
         if epoch >= cfg['min_epochs'] and stale >= cfg['patience']:
@@ -245,6 +250,16 @@ def train_model(model, train_inputs, train_labels, val_inputs, val_labels, stats
             best_epoch=best_epoch, history=history, updates=updates)
         if improved:
             save_checkpoint(output/'best.pt', {**checkpoint, 'kind':'best'})
+        if auxiliary_tasks:
+            auxiliary_score = selection_score(report, auxiliary_tasks)
+            row['auxiliary_s21_score'] = auxiliary_score
+            if auxiliary is None or auxiliary_score < auxiliary['score']:
+                save_checkpoint(output/'best_s21.pt', {**checkpoint, 'kind':'best',
+                    'best':auxiliary_score, 'best_epoch':epoch+1, 'selection_role':'AUXILIARY_S21',
+                    'selection_tasks':auxiliary_tasks})
+                auxiliary = dict(score=auxiliary_score, epoch=epoch+1, tasks=auxiliary_tasks,
+                    checkpoint_sha256=file_sha256(output/'best_s21.pt'))
+            checkpoint['auxiliary_selection'] = auxiliary
         checkpoint['best_checkpoint_sha256'] = file_sha256(output/'best.pt')
         save_checkpoint(output/'last.pt', {**checkpoint, 'kind':'last'})
         write_json(output/'history.json', history)
@@ -255,11 +270,14 @@ def train_model(model, train_inputs, train_labels, val_inputs, val_labels, stats
         best_epoch=best_epoch, validation=history[best_epoch-1]['validation'], optimizer_steps=updates,
         selection_score=best, selection_tasks=cfg.get('selection_tasks'),
         best_sha256=file_sha256(output/'best.pt'), parameters=parameter_counts(model))
+    if auxiliary is not None:
+        summary['auxiliary_selection'] = auxiliary
     write_json(output/'summary.json', summary)
     return summary
 
 
-def run_training(run_file, view_root, cache_root, output, *, device='cpu', chemprop_root=None, resume=False):
+def run_training(run_file, view_root, cache_root, output, *, device='cpu', chemprop_root=None, resume=False,
+                 verify_database=True):
     run = read_json(run_file)
     if run.get('state') != 'READY' or run.get('phase') not in ('SYNTHETIC', 'P2', 'P3', 'P4', 'P5'):
         raise ValueError('Training requires a concrete released run; G01 has no fitting units')
@@ -283,7 +301,7 @@ def run_training(run_file, view_root, cache_root, output, *, device='cpu', chemp
     train = load_arrays(view_root, 'train.npz', manifest)
     val = load_arrays(view_root, 'validation.npz', manifest)
     stats = load_arrays(view_root, 'statistics.npz', manifest)
-    cache = GraphCache(cache_root, source_sha256=manifest['source_sha256'])
+    cache = GraphCache(cache_root, source_sha256=manifest['source_sha256'], verify_database=verify_database)
     if cache.manifest['cache_id'] != manifest['cache_id']:
         raise ValueError('Wrong graph cache')
     seed_everything(int(run['init_seed']))
