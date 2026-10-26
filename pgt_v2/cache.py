@@ -103,7 +103,7 @@ def build_cache(entries, destination, *, source_sha256, spec=PGT_FEATURE_SPEC):
 
 
 class GraphCache:
-    def __init__(self, root, *, source_sha256, spec=PGT_FEATURE_SPEC):
+    def __init__(self, root, *, source_sha256, spec=PGT_FEATURE_SPEC, verify_database=True):
         self.root = Path(root).resolve()
         self.spec = spec
         spec.validate_runtime()
@@ -119,7 +119,9 @@ class GraphCache:
                     "feature_spec_sha256": spec.sha256, "records": meta["records"]}
         if meta["cache_id"] != "cache_" + digest(identity) or len(meta["records"]) != meta["record_count"]:
             raise ValueError("Cache record registry mismatch")
-        if file_sha256(self.root / "graphs.sqlite3") != meta["database_sha256"]:
+        # Bounded read-only reuse can rely on the accepted registry and the
+        # checksum of each consumed payload, without rescanning the whole DB.
+        if verify_database and file_sha256(self.root / "graphs.sqlite3") != meta["database_sha256"]:
             raise ValueError("Cache database checksum mismatch")
 
     def __len__(self):

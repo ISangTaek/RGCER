@@ -59,7 +59,11 @@ def endpoint_difference(accounting, left, right):
 
 
 def integrated_gradients(model, batch, *, task, mean, scale, baseline=None, other_task=None, points=64):
-    """64 Gauss-Legendre gradient points; topology/graph token stay fixed along path."""
+    """64 Gauss-Legendre gradient points; topology/graph token stay fixed.
+
+    N1/N1S use alpha=u^2 to resolve the high curvature near the baseline.
+    Completeness failures are reported, never hidden by extra integration runs.
+    """
     if points != 64:
         raise ValueError('Registered IG uses exactly 64 gradient evaluation points')
     model.eval()
@@ -80,8 +84,15 @@ def integrated_gradients(model, batch, *, task, mean, scale, baseline=None, othe
             result = result - mean[other_task] - scale[other_task]*raw[:, other_task]
         return result
     nodes, weights = np.polynomial.legendre.leggauss(points)
+    alphas, weights = (nodes+1)/2, weights/2
+    # Deep prompts + LayerNorm can vary rapidly near an all-zero baseline.
+    # alpha=u^2 is an exact change of variable, still using only 64 points.
+    path_power = 2 if getattr(model, 'method', None) in ('N1', 'N1S') else 1
+    if path_power == 2:
+        weights = weights * 2 * alphas
+        alphas = alphas ** 2
     integral = torch.zeros_like(inputs)
-    for alpha, weight in zip((nodes+1)/2, weights/2):
+    for alpha, weight in zip(alphas, weights):
         interpolated = (base + float(alpha)*(inputs-base)).requires_grad_(True)
         gradient, = torch.autograd.grad(scalar(interpolated).sum(), interpolated)
         integral += float(weight)*gradient.detach()
@@ -92,6 +103,7 @@ def integrated_gradients(model, batch, *, task, mean, scale, baseline=None, othe
         normalized = residual.abs() / (prediction-baseline_prediction).abs().clamp_min(1e-8)
     return dict(attributions=attribution, prediction=prediction, baseline_prediction=baseline_prediction,
         completeness_residual=residual, normalized_residual=normalized, unreliable=normalized > 1e-3,
+        path_power=path_power,
         definition='fixed-topology full-model embedding attribution; not a causal deletion effect')
 
 
@@ -131,7 +143,7 @@ def explain_record(checkpoint_path, view_root, cache_root, reference_path, recor
     manifest=load_manifest(view_root)
     model,checkpoint=load_model_checkpoint(checkpoint_path,device=device)
     identity=checkpoint['identity'];method=identity['method_id']
-    if method not in ('M2','M5','M6','A1','A2','A3') or identity['view_sha256']!=manifest['manifest_sha256']:
+    if method not in ('M2','M5','M6','A1','A2','A3','N1','N1S') or identity['view_sha256']!=manifest['manifest_sha256']:
         raise ValueError('Explanation method/checkpoint/view mismatch')
     tasks=manifest['task_names']
     left=tasks.index(task);right=tasks.index(other_task) if other_task is not None else None
@@ -189,7 +201,7 @@ def explain_record(checkpoint_path, view_root, cache_root, reference_path, recor
                 arrays[name+'_embedding_baseline']=baseline.detach().cpu().numpy()
             result=integrated_gradients(model,batch,task=left,other_task=right,mean=stats['mean'],scale=stats['scale'],baseline=baseline)
             arrays.update({name+'_'+k:v.detach().cpu().numpy() for k,v in result.items() if isinstance(v,torch.Tensor)})
-            diagnostics[name]=dict(normalized_residual=result['normalized_residual'].cpu().tolist(),
+            diagnostics[name]=dict(path_power=result['path_power'], normalized_residual=result['normalized_residual'].cpu().tolist(),
                                    unreliable=result['unreliable'].cpu().tolist())
         provenance.update(ig_gradient_points=64,diagnostics=diagnostics,
                           interpretation='full-model fixed-topology embedding attribution; flagged failures remain in denominator')
