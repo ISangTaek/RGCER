@@ -16,6 +16,23 @@ from .chemistry import digest
 from .config import git_identity
 from .data import PGTCollator
 from .models import build_model, molecular_features, parameter_counts
+from baselines.models.toxacol import toxacol_learning_rate
+
+
+def observed_loss(prediction, target):
+    mask = torch.isfinite(target)
+    return (prediction[mask] - target[mask]).square().mean()
+
+
+def author_lr(epoch):
+    return toxacol_learning_rate(epoch, [20, 40, 50, 60, 70, 80, 100],
+        [.001, .0006, .00012, .000024, .000012, .000001, .0000001, .00000001])
+
+
+def training_statistics(stats, method):
+    if method == 'TOX_AUTHOR':
+        return {**stats, 'mean': np.zeros_like(stats['mean']), 'scale': np.ones_like(stats['scale'])}
+    return stats
 
 
 def seed_everything(seed):
@@ -79,7 +96,7 @@ class ModelInputs:
             mols.append(mol)
         if self.method == 'M1':
             return mols
-        if self.method in ('M0', 'M3'):
+        if self.method in ('M0', 'M3', 'TOX_AUTHOR'):
             values = molecular_features(mols, 'morgan' if self.method == 'M0' else 'avalon')
             return values if self.method == 'M0' else torch.tensor(values, device=self.device)
         batch = self.collate(graphs).to(self.device)
@@ -182,14 +199,21 @@ def train_model(model, train_inputs, train_labels, val_inputs, val_labels, stats
             validation=report, best_sha256=file_sha256(output/'best.pt'), terminal='COMPLETE', optimizer_steps=0))
         return report
     cfg = config
+    stats = training_statistics(stats, method)
     active = np.where(np.isfinite(train_labels).any(1))[0].tolist()
     if not active or not np.array_equal(np.isfinite(train_labels).sum(0), stats['count']):
         raise ValueError('Training label mask/count mismatch')
     standardized = (train_labels - stats['mean']) / stats['scale']
     device = next(model.parameters()).device
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
+    author = method == 'TOX_AUTHOR'
+    if author and (cfg['effective_batch'] != 32 or cfg['micro_batch'] != 32):
+        raise ValueError('Author BatchNorm and observed-label loss require physical batch32')
+    optimizer = (torch.optim.SGD(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'],
+        momentum=cfg['momentum'], nesterov=True) if author else
+        torch.optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay']))
     start, best, stale, history, updates, best_epoch = 0, float('inf'), 0, [], 0, None
     auxiliary_tasks = cfg.get('auxiliary_selection_tasks')
+    auxiliary_name = cfg.get('auxiliary_checkpoint', 'best_s21.pt')
     auxiliary = None
     if resume:
         checkpoint = read_checkpoint(output/'last.pt')
@@ -202,7 +226,7 @@ def train_model(model, train_inputs, train_labels, val_inputs, val_labels, stats
         model.load_state_dict(checkpoint['model']); optimizer.load_state_dict(checkpoint['optimizer'])
         start, best, stale, history, updates, best_epoch = [checkpoint[k] for k in ('epoch','best','stale','history','updates','best_epoch')]
         auxiliary = checkpoint.get('auxiliary_selection')
-        if auxiliary is not None and file_sha256(output/'best_s21.pt') != auxiliary['checkpoint_sha256']:
+        if auxiliary is not None and file_sha256(output/auxiliary_name) != auxiliary['checkpoint_sha256']:
             raise ValueError('Resume auxiliary checkpoint changed since the saved epoch')
         _restore_rng(checkpoint['rng'])
     for epoch in range(start, cfg['max_epochs']):
@@ -212,15 +236,18 @@ def train_model(model, train_inputs, train_labels, val_inputs, val_labels, stats
         if device.type == 'cuda':
             torch.cuda.reset_peak_memory_stats(device)
         model.train()
+        if author:
+            for group in optimizer.param_groups:
+                group['lr'] = author_lr(epoch)
         order = [active[i] for i in torch.randperm(len(active)).tolist()]
         weighted_loss = 0.0
         weighted_regularization = 0.0
-        for effective in partition_batches(order, cfg['effective_batch'], batch_norm=method == 'M3'):
+        for effective in partition_batches(order, cfg['effective_batch'], batch_norm=method in ('M3', 'TOX_AUTHOR')):
             optimizer.zero_grad(set_to_none=True)
-            for micro in partition_batches(effective, cfg['micro_batch'], batch_norm=method == 'M3'):
+            for micro in partition_batches(effective, cfg['micro_batch'], batch_norm=method in ('M3', 'TOX_AUTHOR')):
                 prediction = model(train_inputs.batch(micro))
                 target = torch.as_tensor(standardized[micro], dtype=prediction.dtype, device=device)
-                loss = endpoint_loss(prediction, target, stats['count'], len(active))
+                loss = observed_loss(prediction, target) if author else endpoint_loss(prediction, target, stats['count'], len(active))
                 if hasattr(model, 'regularization_loss'):
                     regularization = model.regularization_loss()
                     loss = loss + regularization
@@ -229,7 +256,8 @@ def train_model(model, train_inputs, train_labels, val_inputs, val_labels, stats
                     raise FloatingPointError('Nonfinite loss; no checkpoint promoted')
                 (loss * (len(micro) / len(effective))).backward()
                 weighted_loss += float(loss.detach()) * len(micro)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['grad_clip'], error_if_nonfinite=True)
+            if cfg['grad_clip'] is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['grad_clip'], error_if_nonfinite=True)
             optimizer.step(); updates += 1
         pred = predict_array(model, val_inputs, stats, method, cfg['micro_batch'])
         report = metrics(val_labels, pred, identity['task_names'], val_inputs.records['group_id'])
@@ -243,7 +271,8 @@ def train_model(model, train_inputs, train_labels, val_inputs, val_labels, stats
             visible_counts=stats['count'].tolist(), active_rows=len(active), elapsed_seconds=time.perf_counter()-started,
             peak_cuda_bytes=torch.cuda.max_memory_allocated(device) if device.type == 'cuda' else 0,
             best_epoch=best_epoch, stale=stale, selection_score=score,
-            regularization_loss=weighted_regularization/len(active))
+            regularization_loss=weighted_regularization/len(active), learning_rate=optimizer.param_groups[0]['lr'],
+            loss_denominator='batch_visible_labels' if author else 'full_view_endpoint_counts')
         history.append(row)
         checkpoint = dict(format='PGTV2_CHECKPOINT_1', identity=identity, model=copy.deepcopy(model.state_dict()),
             optimizer=optimizer.state_dict(), stats=stats, rng=_rng(device), epoch=epoch+1, best=best, stale=stale,
@@ -252,13 +281,16 @@ def train_model(model, train_inputs, train_labels, val_inputs, val_labels, stats
             save_checkpoint(output/'best.pt', {**checkpoint, 'kind':'best'})
         if auxiliary_tasks:
             auxiliary_score = selection_score(report, auxiliary_tasks)
-            row['auxiliary_s21_score'] = auxiliary_score
+            row['auxiliary_score'] = auxiliary_score
+            row['auxiliary_role'] = cfg.get('auxiliary_role', 'S21')
+            if row['auxiliary_role'] in ('S21', 'AUXILIARY_S21'):
+                row['auxiliary_s21_score'] = auxiliary_score
             if auxiliary is None or auxiliary_score < auxiliary['score']:
-                save_checkpoint(output/'best_s21.pt', {**checkpoint, 'kind':'best',
-                    'best':auxiliary_score, 'best_epoch':epoch+1, 'selection_role':'AUXILIARY_S21',
+                save_checkpoint(output/auxiliary_name, {**checkpoint, 'kind':'best',
+                    'best':auxiliary_score, 'best_epoch':epoch+1, 'selection_role':cfg.get('auxiliary_role', 'AUXILIARY_S21'),
                     'selection_tasks':auxiliary_tasks})
                 auxiliary = dict(score=auxiliary_score, epoch=epoch+1, tasks=auxiliary_tasks,
-                    checkpoint_sha256=file_sha256(output/'best_s21.pt'))
+                    checkpoint_sha256=file_sha256(output/auxiliary_name), filename=auxiliary_name)
             checkpoint['auxiliary_selection'] = auxiliary
         checkpoint['best_checkpoint_sha256'] = file_sha256(output/'best.pt')
         save_checkpoint(output/'last.pt', {**checkpoint, 'kind':'last'})

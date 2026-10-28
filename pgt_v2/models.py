@@ -20,6 +20,7 @@ from baselines.constants import CHEMPROP_COMMIT
 from baselines.models.dmpnn import activate_chemprop, dmpnn_args
 from baselines.models.toxacol import ToxACoLNet, endpoint_feature_matrix
 from .data import make_backbone
+from .prior_prompts import PRIOR_METHODS
 
 
 def molecular_features(mols, kind):
@@ -213,13 +214,13 @@ def build_model(method, tasks, config, *, adjacency=None, counts=None, chemprop_
         return EndpointForest(tasks, config, seed)
     if method == 'M1':
         result = DMPNN(tasks, config, chemprop_root, device)
-    elif method == 'M3':
+    elif method in ('M3', 'TOX_AUTHOR'):
         if adjacency is None or np.asarray(adjacency).shape != (len(tasks), len(tasks)):
             raise ValueError('M3 requires this exact visible training-view adjacency')
         features, _ = endpoint_feature_matrix(tasks)
         result = ToxACoLNet(adjacency, features, dropout=config['dropout'])
         result.tasks = tuple(tasks)
-    elif method in ('N0', 'N1', 'N1S', 'N2', 'N3', 'N4', 'N1H', 'N1R', 'N1RP'):
+    elif method in ('N0', 'N1', 'N1S', 'N2', 'N3', 'N4', 'N1H', 'N1R', 'N1RP') + PRIOR_METHODS:
         from .redesign_models import DeepPromptModel
         result = DeepPromptModel(method, tasks, config, task_metadata(tasks), counts=counts, adjacency=adjacency)
     else:

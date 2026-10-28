@@ -1,0 +1,2 @@
+# Needed for H01 only. T01 author baseline does not import Optuna.
+optuna==4.5.0

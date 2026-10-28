@@ -22,6 +22,7 @@ def main(argv=None):
     p.add_argument('--resume',action='store_true')
     p=sub.add_parser('resolve')
     p.add_argument('--row',required=True);p.add_argument('--view',required=True);p.add_argument('--selection');p.add_argument('--output',required=True)
+    p.add_argument('--config-file',help='Explicit effective architecture/training configuration')
     p=sub.add_parser('select');p.add_argument('--runs',nargs='+',required=True);p.add_argument('--output',required=True)
     p=sub.add_parser('predict')
     p.add_argument('--checkpoint',required=True);p.add_argument('--view',required=True);p.add_argument('--cache',required=True)
@@ -58,7 +59,8 @@ def main(argv=None):
     elif args.command=='resolve':
         from .artifacts import load_manifest
         from .config import resolve_run
-        result=resolve_run(read_json(args.row),view_manifest=load_manifest(args.view),selection=read_json(args.selection) if args.selection else None)
+        result=resolve_run(read_json(args.row),view_manifest=load_manifest(args.view),selection=read_json(args.selection) if args.selection else None,
+            explicit_config=read_json(args.config_file) if args.config_file else None)
         write_json(args.output,result)
     elif args.command=='select':
         from .evaluation import select_config

@@ -11,10 +11,11 @@ from torch import nn
 
 from architecture.prediction_heads import TaskPredictionHead
 from .data import make_backbone
+from .prior_prompts import PRIOR_METHODS, PriorPrompts
 
 HIERARCHICAL_METHODS = ('N1H', 'N1R', 'N1RP')
 ID_PROMPT_METHODS = ('N1', 'N1S') + HIERARCHICAL_METHODS
-REDESIGN_METHODS = ('N0', 'N1', 'N1S', 'N2', 'N3', 'N4') + HIERARCHICAL_METHODS
+REDESIGN_METHODS = ('N0', 'N1', 'N1S', 'N2', 'N3', 'N4') + HIERARCHICAL_METHODS + PRIOR_METHODS
 FINGERPRINT_METHODS = ('N0', 'N4')
 
 
@@ -96,6 +97,9 @@ class DeepPromptModel(nn.Module):
         if method in ID_PROMPT_METHODS:
             self.prompt_ids = nn.Parameter(torch.randn(len(tasks), dim) * 0.02)
             self.prompt_bank = None
+        elif method in PRIOR_METHODS:
+            self.register_parameter('prompt_ids', None)
+            self.prompt_bank = PriorPrompts(method, [metadata[name] for name in tasks], adjacency, dim)
         else:
             self.register_parameter('prompt_ids', None)
             self.prompt_bank = SemanticPrompts([metadata[name] for name in tasks], dim,
@@ -103,7 +107,7 @@ class DeepPromptModel(nn.Module):
         if self.deep:
             self.layer_gates = nn.Parameter(torch.full((config['layers'],), 0.1))
         self.readout_norm = nn.LayerNorm(dim)
-        if method in ID_PROMPT_METHODS:
+        if method in ID_PROMPT_METHODS + PRIOR_METHODS:
             self.heads = nn.ModuleList([TaskPredictionHead(dim, mode='point', head_hidden_dim=dim,
                 dropout=config['dropout']) for _ in tasks])
         else:
@@ -174,7 +178,7 @@ class DeepPromptModel(nn.Module):
             return_attention=return_aux and self.deep)
         representation = self.readout_norm(tokens.graph_token[:, None, :] +
             (tokens.prompt_tokens if self.deep else prompt[None]))
-        if self.method in ID_PROMPT_METHODS:
+        if self.method in ID_PROMPT_METHODS + PRIOR_METHODS:
             prediction = torch.cat([head(representation[:, i]) for i, head in enumerate(self.heads)], dim=-1)
         else:
             prediction = self.shared_head(representation.reshape(-1, representation.shape[-1])).reshape(representation.shape[:2])
