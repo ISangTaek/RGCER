@@ -33,13 +33,15 @@ def export_trials(study, output):
     write_json(Path(output)/'top2_validation.json', complete[:2])
 
 
-def run_search(method, view, groups, cache, output, *, device='cuda:0', resume=False):
+def run_search(method, view, groups, cache, output, *, device='cuda:0', resume=False, trials=24):
     import optuna
     from optuna.trial import TrialState
     if optuna.__version__ != OPTUNA_VERSION:
         raise ValueError('Use optuna==' + OPTUNA_VERSION)
     if method not in ('N1', 'N1S'):
         raise ValueError('H01 searches only N1 and N1S')
+    if trials not in (12, 24):
+        raise ValueError('Use the released 12- or 24-trial budget')
     manifest = load_manifest(view)
     targets = read_json(groups)['S21']
     if manifest['fold'] != 'S0' or not set(targets) <= set(manifest['task_names']):
@@ -53,7 +55,7 @@ def run_search(method, view, groups, cache, output, *, device='cuda:0', resume=F
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=resume)
     binding = dict(method=method, view=manifest['manifest_sha256'], tasks=targets,
-                   commit=git_identity(), optuna=OPTUNA_VERSION, budget=24, seed=42, sampler_seed=20261028)
+                   commit=git_identity(), optuna=OPTUNA_VERSION, budget=trials, seed=42, sampler_seed=20261028)
     binding_file = output/'study_config.json'
     if binding_file.exists() and read_json(binding_file) != binding:
         raise ValueError('Study method/data/code/selection configuration changed')
@@ -75,7 +77,7 @@ def run_search(method, view, groups, cache, output, *, device='cuda:0', resume=F
             trial = optuna.trial.Trial(study, running[0]._trial_id)
         else:
             attempted = [t for t in study.trials if t.state != TrialState.WAITING]
-            if len(attempted) >= 24:
+            if len(attempted) >= trials:
                 break
             trial = study.ask()
         trial_dir = output/f'trial_{trial.number:03d}'

@@ -111,7 +111,7 @@ def test_hpo_budget_and_interrupted_trial_reuse(tmp_path, monkeypatch):
     monkeypatch.setattr(hpo,'run_training',interrupted)
     args=('N1',tmp_path/'view',tmp_path/'groups.json',tmp_path/'cache',tmp_path/'search')
     with pytest.raises(KeyboardInterrupt):
-        hpo.run_search(*args,device='cpu')
+        hpo.run_search(*args,device='cpu',trials=12)
     def simulated(run_file,*args,**kwargs):
         run=read_json(run_file)
         calls.append(run['config'])
@@ -119,7 +119,7 @@ def test_hpo_budget_and_interrupted_trial_reuse(tmp_path, monkeypatch):
         return dict(terminal='COMPLETE', selection_score=float(run['config']['layers']),
             validation={'synthetic_only':True}, best_epoch=1, parameters={'total':1})
     monkeypatch.setattr(hpo,'run_training',simulated)
-    result=hpo.run_search(*args,device='cpu',resume=True)
-    assert result['attempted']==24 and result['test_evaluations']==0
-    assert len(calls)==25 and calls[0]==calls[1]
-    assert len(read_json(tmp_path/'search/trials.json'))==24
+    result=hpo.run_search(*args,device='cpu',resume=True,trials=12)
+    assert result['attempted']==12 and result['test_evaluations']==0
+    assert len(calls)==13 and calls[0]==calls[1]
+    assert len(read_json(tmp_path/'search/trials.json'))==12

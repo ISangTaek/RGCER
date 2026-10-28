@@ -142,6 +142,7 @@ def main():
     for arg in ('method', 'view', 'groups', 'cache', 'output'):
         p.add_argument('--'+arg, required=True)
     p.add_argument('--device', default='cuda:0'); p.add_argument('--resume', action='store_true')
+    p.add_argument('--trials', type=int, choices=(12,24), default=12)
     args = vars(parser.parse_args())
     command = args.pop('command')
     torch.set_num_threads(1)
