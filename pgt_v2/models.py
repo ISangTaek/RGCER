@@ -21,6 +21,7 @@ from baselines.models.dmpnn import activate_chemprop, dmpnn_args
 from baselines.models.toxacol import ToxACoLNet, endpoint_feature_matrix
 from .data import make_backbone
 from .prior_prompts import PRIOR_METHODS
+from .endpoint_contrast import METHODS as CONTRAST_METHODS, MatchedEndpointContrast
 
 
 def molecular_features(mols, kind):
@@ -106,7 +107,7 @@ class AtomReadout(nn.Module):
 
 
 class GraphPointModel(nn.Module):
-    def __init__(self, method, tasks, config):
+    def __init__(self, method, tasks, config, *, counts=None):
         super().__init__()
         self.method, self.tasks = method, tuple(tasks)
         d = config['hidden_dim']
@@ -122,13 +123,21 @@ class GraphPointModel(nn.Module):
                 router_temperature=1.0, exclude_target_from_sources=True, adapter_ratio=0.25, gate_init=-2.0)
         elif method == 'A3':
             self.linear = nn.Linear(d, len(tasks))
-        elif method != 'M2':
+        elif method not in ('M2',) + CONTRAST_METHODS:
             raise ValueError(method)
         if method not in ('A2', 'A3'):
             self.heads = nn.ModuleList([TaskPredictionHead(d, mode='point', head_hidden_dim=d,
                                                          dropout=config['dropout']) for _ in tasks])
 
-    def forward(self, batch, *, return_aux=False, atom_embeddings=None, query_override=None):
+        if method in CONTRAST_METHODS:
+            metadata = task_metadata(tasks)
+            # Common backbone, heads and subsequent dropout start with M2's RNG state.
+            with torch.random.fork_rng(devices=[]):
+                self.endpoint_contrast = MatchedEndpointContrast(
+                    d, [metadata[t] for t in tasks], counts, shuffle=method == 'N5-Shuffle')
+
+    def forward(self, batch, *, return_aux=False, atom_embeddings=None, query_override=None,
+                prompt_enabled=True):
         tokens = self.backbone.encode_tokens(batch, atom_embeddings=atom_embeddings)
         aux = dict(atom_mask=tokens.atom_mask)
         if self.method in ('M5', 'M6', 'A1', 'A2'):
@@ -151,6 +160,11 @@ class GraphPointModel(nn.Module):
         else:
             representation = tokens.graph_token[:, None, :].expand(-1, len(self.tasks), -1)
         prediction = torch.cat([head(representation[:, i]) for i, head in enumerate(self.heads)], dim=-1)
+        if self.method in CONTRAST_METHODS and prompt_enabled:
+            delta, details = self.endpoint_contrast(tokens.atom_tokens, tokens.atom_mask, return_aux=return_aux)
+            if return_aux:
+                aux.update(base_prediction=prediction, prompt_delta=delta, **details)
+            prediction = prediction + delta
         return (prediction, aux) if return_aux else prediction
 
 
@@ -224,7 +238,7 @@ def build_model(method, tasks, config, *, adjacency=None, counts=None, chemprop_
         from .redesign_models import DeepPromptModel
         result = DeepPromptModel(method, tasks, config, task_metadata(tasks), counts=counts, adjacency=adjacency)
     else:
-        result = GraphPointModel(method, tasks, config)
+        result = GraphPointModel(method, tasks, config, counts=counts)
     return result.to(device)
 
 

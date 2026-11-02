@@ -143,7 +143,7 @@ def explain_record(checkpoint_path, view_root, cache_root, reference_path, recor
     manifest=load_manifest(view_root)
     model,checkpoint=load_model_checkpoint(checkpoint_path,device=device)
     identity=checkpoint['identity'];method=identity['method_id']
-    if method not in ('M2','M5','M6','A1','A2','A3','N1','N1S') or identity['view_sha256']!=manifest['manifest_sha256']:
+    if method not in ('M2','M5','M6','A1','A2','A3','N1','N1S','N5','N5-Shuffle') or identity['view_sha256']!=manifest['manifest_sha256']:
         raise ValueError('Explanation method/checkpoint/view mismatch')
     tasks=manifest['task_names']
     left=tasks.index(task);right=tasks.index(other_task) if other_task is not None else None
@@ -205,6 +205,21 @@ def explain_record(checkpoint_path, view_root, cache_root, reference_path, recor
                                    unreliable=result['unreliable'].cpu().tolist())
         provenance.update(ig_gradient_points=64,diagnostics=diagnostics,
                           interpretation='full-model fixed-topology embedding attribution; flagged failures remain in denominator')
+        if method in ('N5', 'N5-Shuffle'):
+            with torch.no_grad():
+                _, aux = model(batch, return_aux=True)
+            def parts(i):
+                base = aux['base_prediction'][:, i] * stats['scale'][i] + stats['mean'][i]
+                atoms = aux['prompt_atom_contribution'][:, i] * stats['scale'][i]
+                return base, atoms
+            base, contributions = parts(left)
+            if right is not None:
+                other_base, other_contributions = parts(right)
+                base = base - other_base
+                contributions = contributions - other_contributions
+            arrays['base_prediction_source_scale'] = base.cpu().numpy()
+            arrays['prompt_atom_contribution_source_scale'] = contributions.cpu().numpy()
+            provenance['prompt_accounting'] = 'Base output plus signed atom terms reconstructs the learned model output.'
     output=Path(output);output.mkdir(parents=True,exist_ok=False)
     np.savez_compressed(output/'attributions.npz',**arrays)
     write_json(output/'provenance.json',provenance)

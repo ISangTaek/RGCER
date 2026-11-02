@@ -5,13 +5,16 @@ from pathlib import Path
 from .chemistry import digest
 from molecular_features import PGT_FEATURE_SPEC
 from .prior_prompts import PRIOR_METHODS
+from .endpoint_contrast import METHODS as CONTRAST_METHODS
 
 CONFIG_ROOT = Path(__file__).resolve().parents[1] / 'configs' / 'pgt_v2'
 METHODS = ('M0', 'M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'A1', 'A2', 'A3', 'N0', 'N1', 'N1S', 'N2', 'N3', 'N4',
-           'N1H', 'N1R', 'N1RP', 'TOX_AUTHOR') + PRIOR_METHODS
+           'N1H', 'N1R', 'N1RP', 'TOX_AUTHOR') + PRIOR_METHODS + CONTRAST_METHODS
 
 
 def candidate(method, config_id):
+    if method in CONTRAST_METHODS:
+        return candidate('M2', config_id)
     if method == 'TOX_AUTHOR' and config_id == 'AUTHOR':
         return dict(dropout=.1, lr=.001, weight_decay=5e-4, momentum=.9,
             optimizer='sgd_nesterov', label_scale='source', loss='observed_mse',
@@ -49,7 +52,7 @@ def resolve_run(row, *, view_manifest, selection=None, explicit_config=None):
         config_id = selection['config_id']
     result = dict(row)
     config = dict(explicit_config) if explicit_config is not None else candidate(row['method_id'], config_id)
-    if row['method_id'] in ('N1', 'N1S', 'M2') + PRIOR_METHODS:
+    if row['method_id'] in ('N1', 'N1S', 'M2') + PRIOR_METHODS + CONTRAST_METHODS:
         if config['hidden_dim'] % config['heads'] or min(config['layers'], config['ffn_dim']) < 1:
             raise ValueError('Invalid Graphormer dimensions')
     result.update(config_id=config_id, config=config,
