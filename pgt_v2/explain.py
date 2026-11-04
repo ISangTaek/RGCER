@@ -58,14 +58,20 @@ def endpoint_difference(accounting, left, right):
                 max_reconstruction_error=float((bias + contribution.sum(-1) - prediction).abs().max().detach()))
 
 
-def integrated_gradients(model, batch, *, task, mean, scale, baseline=None, other_task=None, points=64):
+def integrated_gradients(model, batch, *, task, mean, scale, baseline=None, other_task=None, points=64,
+                         path_power=None):
     """64 Gauss-Legendre gradient points; topology/graph token stay fixed.
 
-    N1/N1S use alpha=u^2 to resolve the high curvature near the baseline.
+    N1/N1S default to alpha=u^2. A matched comparison can specify the same
+    integration grid for every model, leaving the embedding path unchanged.
     Completeness failures are reported, never hidden by extra integration runs.
     """
     if points != 64:
         raise ValueError('Registered IG uses exactly 64 gradient evaluation points')
+    if path_power is None:
+        path_power = 2 if getattr(model, 'method', None) in ('N1', 'N1S') else 1
+    if path_power not in (1, 2):
+        raise ValueError('Expected a linear or quadratic integration grid')
     model.eval()
     inputs = model.backbone._encode_atoms(batch.x.long(), batch.in_degree.long(), batch.out_degree.long()).detach()
     mask = ~batch.padding_mask
@@ -87,7 +93,6 @@ def integrated_gradients(model, batch, *, task, mean, scale, baseline=None, othe
     alphas, weights = (nodes+1)/2, weights/2
     # Deep prompts + LayerNorm can vary rapidly near an all-zero baseline.
     # alpha=u^2 is an exact change of variable, still using only 64 points.
-    path_power = 2 if getattr(model, 'method', None) in ('N1', 'N1S') else 1
     if path_power == 2:
         weights = weights * 2 * alphas
         alphas = alphas ** 2
