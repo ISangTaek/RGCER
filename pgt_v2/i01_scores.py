@@ -22,12 +22,15 @@ def top_overlap(left, right):
     return len(x&y)/len(x|y)
 
 
-def task_macro(rows, kind, value):
+def task_macro(rows, kind, value, *, overall_panel="all40", task_groups=None):
     """Average observations within task, then give each task equal weight."""
     groups = defaultdict(list)
     for row in rows:
         groups[row["method"],row["explanation"],row["panel"]].append(row)
-        groups[row["method"],row["explanation"],"all40"].append(row)
+        groups[row["method"],row["explanation"],overall_panel].append(row)
+        for name, tasks in (task_groups or {}).items():
+            if row["task"] in tasks:
+                groups[row["method"],row["explanation"],name].append(row)
     results = []
     for (method,explanation,panel),members in sorted(groups.items()):
         by_task = defaultdict(list)
@@ -47,14 +50,15 @@ def task_macro(rows, kind, value):
     return results
 
 
-def summarize(reg, root):
+def summarize(reg, root, *, record_loader=None):
     observations,rank_rows,stability_rows,species = [],[],[],[]
     analogue_rows = defaultdict(dict)
     flags = Counter()
     candidates = 0
     sample_count = 0
     for p in reg["panel"]:
-        saved = read_json(root/"records"/(p["record_id"]+".json"))
+        saved = (record_loader(p) if record_loader is not None else
+                 read_json(root/"records"/(p["record_id"]+".json")))
         structure,runs = saved["structure"],saved["runs"]
         fragments = structure["fragments"]
         candidates += len(structure["candidates"])
@@ -132,9 +136,64 @@ def summarize(reg, root):
     write_json(root/"paired_scores.json",rank_rows)
     write_json(root/"stability.json",stability_rows)
     write_json(root/"cases.json",dict(species=species,analogue_definition=pair,analogue=analogues))
+    options = dict(overall_panel=reg.get("overall_panel", "all40"),
+                   task_groups=reg.get("explanation_task_groups"))
+    paired = {(r["record_id"],r["task"]) for r in observations if r["matched_pairs"]}
+    same_scores = [r for r in rank_rows if (r["record_id"],r["task"]) in paired]
+    same_stability = [r for r in stability_rows if (r["record_id"],r["task"]) in paired]
+    write_json(root/"same_coverage_summary.json",
+        task_macro(same_scores,"faithfulness","score",**options)+
+        task_macro(same_stability,"stability","spearman",**options)+
+        task_macro(same_stability,"stability","top20_jaccard",**options))
     return dict(observations=sample_count,unique_molecules=len(reg["panel"]),coverage=observations,
         replacement_molecules_across_parents=candidates,ig_flags={"|".join(k):v for k,v in flags.items()},
-        metrics=task_macro(rank_rows,"faithfulness","score")+
+        metrics=task_macro(rank_rows,"faithfulness","score",**options)+
                 task_macro([r for r in rank_rows if r["explanation"].startswith("ig_")],
-                           "faithfulness_common_unflagged","qualified_score")+
-                task_macro(stability_rows,"stability","spearman")+task_macro(stability_rows,"stability","top20_jaccard"))
+                           "faithfulness_common_unflagged","qualified_score",**options)+
+                task_macro(stability_rows,"stability","spearman",**options)+
+                task_macro(stability_rows,"stability","top20_jaccard",**options))
+
+
+def organic_sensitivity(reg, root, *, record_loader=None):
+    """Re-score existing responses after the registered chemistry filter; no inference."""
+    from rdkit import Chem
+    from pgt_v2.fragment_explanations import evaluate_fragments, matched_pairs
+
+    allowed = set("H B C N O F Si P S Cl Se Br I".split())
+    excluded = []
+
+    def filtered(point):
+        saved = (record_loader(point) if record_loader is not None else
+                 read_json(root/"records"/(point["record_id"]+".json")))
+        structure = saved["structure"]
+        keep = []
+        for i, candidate in enumerate(structure["candidates"]):
+            mol = Chem.MolFromSmiles(candidate["smiles"])
+            uncommon = sorted({a.GetSymbol() for a in mol.GetAtoms()}-allowed)
+            radicals = sum(a.GetNumRadicalElectrons() for a in mol.GetAtoms())
+            if uncommon or radicals:
+                excluded.append(dict(record_id=point["record_id"],candidate_id=candidate["candidate_id"],
+                    smiles=candidate["smiles"],uncommon_elements=uncommon,radical_electrons=radicals))
+            else:
+                keep.append(i)
+        structure["candidates"] = [structure["candidates"][i] for i in keep]
+        counts = Counter((c["fragment_id"],c["set"]) for c in structure["candidates"])
+        for fragment in structure["fragments"]:
+            fragment["a_count"] = counts[fragment["fragment_id"],"A"]
+            fragment["b_count"] = counts[fragment["fragment_id"],"B"]
+        structure["matched_pairs"] = matched_pairs(structure["fragments"])
+        for run in saved["runs"]:
+            for obs in run["observations"]:
+                obs["perturbation_predictions"] = [obs["perturbation_predictions"][i] for i in keep]
+                predictions = np.asarray([obs["prediction"]]+obs["perturbation_predictions"])[:,None]
+                obs["fragment_evaluation"] = evaluate_fragments(structure,predictions,task=0,
+                    scale=reg["training_scales"][obs["task_index"]],
+                    atom_explanations={"ig_"+k:v["attributions"] for k,v in obs["ig"].items()})
+        return saved
+
+    destination = root/"organic_sensitivity"
+    summary = summarize(reg,destination,record_loader=filtered)
+    write_json(destination/"summary.json",summary)
+    write_json(destination/"exclusions.json",dict(policy="organic_closed_shell",allowed_elements=sorted(allowed),
+        excluded=excluded,extra_model_inference=0))
+    return summary

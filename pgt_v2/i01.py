@@ -1,4 +1,4 @@
-"""Inference only. I01 compares six existing weights on the registered S0 panel."""
+"""Inference only: compare six fixed weights on a registered scaffold panel."""
 import argparse
 from collections import Counter
 from pathlib import Path
@@ -30,7 +30,9 @@ def check_registry(reg):
     if sorted(cells) != sorted((m,s) for m in METHODS for s in SEEDS):
         raise ValueError("Expected the six registered model/seed pairs")
     counts = Counter(o["panel"] for p in reg["panel"] for o in p["observations"])
-    if len(reg["panel"]) != 29 or counts != {"general_explanation":18, "species_explanation":20, "analogue_pairs":2}:
+    expected = reg.get("expected_panel", dict(records=29,
+        observations={"general_explanation":18, "species_explanation":20, "analogue_pairs":2}))
+    if len(reg["panel"]) != expected["records"] or counts != expected["observations"]:
         raise ValueError("Wrong fixed explanation panel")
     return counts
 
@@ -106,7 +108,7 @@ def make_perturbations(point, graph, mol, library, seed, analogue):
         symmetry_classes=graph.symmetry_classes, fragments=panel["fragments"], candidates=candidates,
         rejected=panel["rejected"], coverage_reason=panel["coverage_reason"], matched_pairs=matched_pairs(panel["fragments"]))
     for side in ("a","b"):
-        if graph.sample_id == analogue["record_"+side]:
+        if analogue and graph.sample_id == analogue["record_"+side]:
             meta["analogue_variable_atom_sets"] = variable_atom_sets(mol,analogue["constant_smiles"],analogue["variable_"+side])
     return panel, graphs, mols, meta
 
@@ -141,14 +143,14 @@ def evaluate_run(point, run, mean_embedding, prepared, device):
 def execute(args, reg):
     view = load_manifest(args.view)
     if view["manifest_sha256"] != reg["view_sha256"]:
-        raise ValueError("I01 requires the S0/S21_P10 training view")
+        raise ValueError("Explanation requires the registered training view")
     train = load_arrays(args.view,"train_inputs.npz",view)
     test = load_arrays(args.view,"test_inputs.npz",view)
     offsets = {str(r):i for i,r in enumerate(test["record_id"])}
     for point in reg["panel"]:
         i = offsets[point["record_id"]]
         if any(test[key][i] != point[key] for key in ("cache_offset","raw_row_index","chemical_id","group_id")):
-            raise ValueError("S0 test record has changed")
+            raise ValueError("Registered test record has changed")
     cache = GraphCache(args.cache,source_sha256=reg["source_sha256"],verify_database=False)
     if cache.manifest["cache_id"] != reg["cache_id"]:
         raise ValueError("Unexpected graph cache")
@@ -167,7 +169,7 @@ def execute(args, reg):
         replay[spec["unit"]] = check_reference_predictions(y,spec["original_predictions"][g.sample_id])
     write_json(root/"server_preflight.json",dict(host=platform.node(),device=str(args.device),record=g.sample_id,
                                                original_prediction_max_abs=replay))
-    print("S0 inputs and all six original checkpoint predictions verified",flush=True)
+    print(f"{reg['fold']} inputs and all six original checkpoint predictions verified",flush=True)
     refs = set(reg["reference_record_ids"])
     reference_graphs = {}
     def donors():
@@ -198,6 +200,9 @@ def execute(args, reg):
     from .i01_scores import summarize
     summary = summarize(reg,root)
     write_json(root/"summary.json",summary)
+    if reg.get("replacement_sensitivity") == "organic_closed_shell":
+        from .i01_scores import organic_sensitivity
+        organic_sensitivity(reg, root)
     write_json(root/"execution.json",dict(status="COMPLETE",new_fits=0,host=platform.node(),
         fixed_checkpoint_count=len(runs),records=len(reg["panel"]),task_model_observations=summary["observations"],
         evaluated_role=reg["role"],scientific_review="PENDING"))
