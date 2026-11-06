@@ -22,8 +22,12 @@ METHODS = ("M2", "N1S")
 SEEDS = (42, 43, 44)
 
 
-def unit(method, seed):
-    return f"S2_{method}_S{seed}"
+def unit(method, seed, fold="S2"):
+    return f"{fold}_{method}_S{seed}"
+
+
+def run_name(a, method, seed):
+    return unit(method, seed, load_manifest(a.release/"view")["fold"])
 
 
 def csv_write(path, rows, fields):
@@ -40,11 +44,12 @@ def release_check(release):
         raise ValueError("Use the full commit in release/COMMIT")
     panel = read_json(release/"explanation_panel.json")
     view = load_manifest(release/"view")
-    if (info["new_fits"], view["fold"], len(panel["panel"]), len(view["task_names"])) != (6,"S2",22,59):
-        raise ValueError("Unexpected S2 matrix or panel")
+    if (info["new_fits"] != 6 or view["fold"] not in ("S1","S2","S3","S4") or
+            len(panel["panel"]) != panel["expected_panel"]["records"] or len(view["task_names"]) != 59):
+        raise ValueError("Unexpected scaffold matrix or panel")
     if view["manifest_sha256"] != info["view_sha256"] or panel["view_sha256"] != info["view_sha256"]:
         raise ValueError("Release and panel use different views")
-    expected = [unit(m,s) for s in SEEDS for m in METHODS]
+    expected = [unit(m,s,view["fold"]) for s in SEEDS for m in METHODS]
     if info["run_ids"] != expected:
         raise ValueError("Expected two models and three seeds")
     for name in expected:
@@ -57,7 +62,7 @@ def release_check(release):
 
 
 def completed(a, method, seed):
-    name = unit(method,seed)
+    name = run_name(a,method,seed)
     result = read_json(a.work/"results"/name/"training/summary.json")
     expected = read_json(a.release/"runs"/(name+".json"))
     if result["terminal"] != "COMPLETE" or result["identity"]["run_sha256"] != expected["run_sha256"]:
@@ -76,8 +81,10 @@ def preflight(a, info):
     if not np.array_equal(counts,stats["count"]):
         raise ValueError("S2 training supervision and statistics differ")
     selection = [view["task_names"].index(t) for t in info["config"]["selection_tasks"]]
-    if (len(train["record_id"]),int(counts.sum()),int(counts[selection].sum())) != (54210,75855,172):
-        raise ValueError("Unexpected S2 training population")
+    registered = next(r for r in info["counts"] if r["role"] == "train")
+    if (len(train["record_id"]),int(counts.sum()),int(counts[selection].sum())) != (
+            registered["records"],registered["labels"],registered["S21_labels"]):
+        raise ValueError("Unexpected training population")
     graph,_ = cache.read(int(train["cache_offset"][0]))
     if graph.sample_id != train["record_id"][0]:
         raise ValueError("Cache record differs from the frozen view")
@@ -90,7 +97,7 @@ def preflight(a, info):
 
 
 def fit(a, info):
-    name = unit(a.method,a.seed)
+    name = run_name(a,a.method,a.seed)
     out = a.work/"results"/name/"training"
     if (out/"summary.json").exists() and read_json(out/"summary.json")["terminal"] == "COMPLETE":
         result = completed(a,a.method,a.seed)
@@ -103,7 +110,7 @@ def fit(a, info):
 
 def evaluate(a, info):
     result = completed(a,a.method,a.seed)
-    name = unit(a.method,a.seed)
+    name = run_name(a,a.method,a.seed)
     out = a.work/"results"/name
     for role in ("validation","test"):
         predictions, report = out/role, out/(role+"_metrics.json")
@@ -124,12 +131,12 @@ def evaluate(a, info):
 def explain(a, info):
     from .i01 import check_registry, execute
 
-    reg = read_json(a.release/"explanation_panel.json")
+    reg = read_json(a.panel or a.release/"explanation_panel.json")
     records = {point["record_id"] for point in reg["panel"]}
     reg["runs"] = []
     for seed in SEEDS:
         for method in METHODS:
-            name = unit(method,seed)
+            name = run_name(a,method,seed)
             result = completed(a,method,seed)
             root = a.work/"results"/name
             if read_json(root/"complete.json")["checkpoint_sha256"] != result["best_sha256"]:
@@ -143,13 +150,14 @@ def explain(a, info):
                 run_sha256=result["identity"]["run_sha256"],training_commit=info["code_commit"],
                 checkpoint_sha256=result["best_sha256"],original_predictions=original))
     check_registry(reg)
-    write_json(a.work/"explanation_registry.json",reg)
+    registry_name = "explanation_registry.json" if a.explanation_name == "explanation" else a.explanation_name+"_registry.json"
+    write_json(a.work/registry_name,reg)
     args = SimpleNamespace(view=a.release/"view",cache=a.cache,a00=a.work,h02=a.work,
-                           out=a.work/"explanation",device=a.device)
+                           out=a.work/a.explanation_name,device=a.device)
     execute(args,reg)
     result = read_json(args.out/"execution.json")
-    if result["task_model_observations"] != 132:
-        raise ValueError("Expected all 22 observations under six weights")
+    if result["task_model_observations"] != 6*sum(len(p["observations"]) for p in reg["panel"]):
+        raise ValueError("Expected all registered observations under six weights")
     return result
 
 
@@ -159,7 +167,7 @@ def collect(a, info):
     rows, endpoint_rows, fits, predictions = [], [], [], []
     for seed in SEEDS:
         for method in METHODS:
-            name = unit(method,seed)
+            name = run_name(a,method,seed)
             root = a.work/"results"/name
             if (root/"training/summary.json").exists() and read_json(root/"training/summary.json")["terminal"] == "COMPLETE":
                 completed(a,method,seed)
@@ -196,19 +204,22 @@ def collect(a, info):
         averages.append(row)
     csv_write(a.work/"group_seed_summary.csv",averages,["method","role","group","completed_seeds",
         "rmse_mean","rmse_sd","mae_mean","mae_sd","r2_mean","r2_sd"])
-    explanation = a.work/"explanation/execution.json"
-    explanation_done = explanation.exists() and read_json(explanation)["status"] == "COMPLETE"
-    receipt = dict(experiment="S2",code_commit=info["code_commit"],new_fits=len(fits),
+    explanation_names = info.get("required_explanations",["explanation"])
+    explanation_done = all((a.work/n/"execution.json").exists() and
+        read_json(a.work/n/"execution.json")["status"] == "COMPLETE" for n in explanation_names)
+    fold = load_manifest(a.release/"view")["fold"]
+    receipt = dict(experiment=fold,code_commit=info["code_commit"],new_fits=len(fits),
         completed_fits=fits,evaluated_runs=predictions,explanation_complete=explanation_done,
         status="COMPLETE" if len(predictions)==6 and explanation_done else "PARTIAL",scientific_review="PENDING")
     write_json(a.work/"return_receipt.json",receipt)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    archive = a.work/f"PGTV2_S2_RESULTS_{stamp}.zip"
+    archive = a.work/f"PGTV2_{fold}_RESULTS_{stamp}.zip"
     with zipfile.ZipFile(archive,"x",zipfile.ZIP_DEFLATED,compresslevel=6) as package:
-        for name in ("return_receipt.json","group_metrics.csv","endpoint_metrics.csv","group_seed_summary.csv","explanation_registry.json"):
+        for name in ("return_receipt.json","group_metrics.csv","endpoint_metrics.csv","group_seed_summary.csv","explanation_registry.json")+tuple(
+                n+"_registry.json" for n in explanation_names if n != "explanation"):
             if (a.work/name).exists():
                 package.write(a.work/name,name)
-        for name,folder in [("release",a.release)]+[(n,a.work/n) for n in ("results","explanation","operations")]:
+        for name,folder in [("release",a.release)]+[(n,a.work/n) for n in ["results","operations"]+explanation_names]:
             for path in sorted(folder.rglob("*")):
                 if path.is_file() and not path.name.startswith("last.pt") and "__pycache__" not in path.parts:
                     package.write(path,(Path(name)/path.relative_to(folder)).as_posix())
@@ -227,11 +238,13 @@ def main():
     parser.add_argument("--method",choices=METHODS)
     parser.add_argument("--seed",type=int,choices=SEEDS)
     parser.add_argument("--device",default="cuda:0")
+    parser.add_argument("--panel",type=Path)
+    parser.add_argument("--explanation-name",default="explanation")
     a = parser.parse_args()
     torch.set_num_threads(1)
     info = release_check(a.release)
     if a.action == "check":
-        print(dict(status="RELEASE_CHECK_PASS",new_fits=6,explanation_observations=22,optimizer_steps=0),flush=True)
+        print(dict(status="RELEASE_CHECK_PASS",new_fits=6,explanation_observations=info["explanation_observations"],optimizer_steps=0),flush=True)
         return
     if a.work is None:
         parser.error("--work is required for execution")
