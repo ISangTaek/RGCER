@@ -10,7 +10,12 @@ Self-contained, teacher-free multi-endpoint acute toxicity modeling with:
 
 from .features import DESCRIPTOR_NAMES, MVDataStore, build_mv_cache, load_mv_cache
 from .models import MVBioPGT, build_mv_model, count_parameters
-from .training import compute_group_metrics, tempered_mse_loss, train_and_evaluate
+from .training import (
+    compute_group_metrics,
+    tempered_huber_loss,
+    tempered_mse_loss,
+    train_and_evaluate,
+)
 
 __all__ = [
     "DESCRIPTOR_NAMES",
@@ -21,6 +26,7 @@ __all__ = [
     "compute_group_metrics",
     "count_parameters",
     "load_mv_cache",
+    "tempered_huber_loss",
     "tempered_mse_loss",
     "train_and_evaluate",
 ]

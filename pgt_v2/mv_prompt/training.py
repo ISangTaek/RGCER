@@ -91,6 +91,26 @@ def tempered_mse_loss(
     return weighted.masked_fill(~mask, 0.0).sum() / weight_sum
 
 
+def tempered_huber_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    endpoint_weights: torch.Tensor,
+    *,
+    beta: float = 1.0,
+) -> torch.Tensor:
+    """Tempered SmoothL1/Huber loss scaled by 2*beta so |err|<=beta equals exact MSE."""
+    mask = torch.isfinite(target)
+    if not bool(mask.any()):
+        return prediction.sum() * 0.0
+    safe_target = torch.where(mask, target, torch.zeros_like(target))
+    elem = 2.0 * float(beta) * torch.nn.functional.smooth_l1_loss(
+        prediction, safe_target, reduction="none", beta=float(beta)
+    )
+    weighted = elem * endpoint_weights[None, :]
+    weight_sum = (mask.to(prediction.dtype) * endpoint_weights[None, :]).sum().clamp_min(1e-8)
+    return weighted.masked_fill(~mask, 0.0).sum() / weight_sum
+
+
 def compute_group_metrics(
     truth: np.ndarray,
     prediction: np.ndarray,
@@ -319,12 +339,22 @@ def train_and_evaluate(
         test_desc = transform_descriptors(store.desc_raw, store.desc_missing, test_off, desc_scaler)
 
     author = method == "TOX_AUTHOR"
-    if author:
+    is_v2 = method.startswith("MV_BIOPGT_V2")
+    label_scaling = str(
+        config.get("label_scaling", "raw" if author else ("global_center" if is_v2 else "per_task"))
+    )
+    if label_scaling == "raw":
         mean = np.zeros_like(stats_arr["mean"], dtype=np.float64)
         scale = np.ones_like(stats_arr["scale"], dtype=np.float64)
-    else:
+    elif label_scaling == "global_center":
+        global_mean = float(np.nanmean(train_y))
+        mean = np.full_like(stats_arr["mean"], global_mean, dtype=np.float64)
+        scale = np.ones_like(stats_arr["scale"], dtype=np.float64)
+    elif label_scaling == "per_task":
         mean = stats_arr["mean"].astype(np.float64)
         scale = stats_arr["scale"].astype(np.float64)
+    else:
+        raise ValueError(f"Unknown label_scaling: {label_scaling}")
     std_train_y = ((train_y - mean[None, :]) / scale[None, :]).astype(np.float32)
 
     dev = torch.device(device)
@@ -346,6 +376,9 @@ def train_and_evaluate(
         eval_batch = int(config.get("eval_batch", 512))
         grad_clip = None
         gamma = 0.0
+        loss_type = "mse"
+        huber_beta = 1.0
+        aux_graph_weight = 0.0
         optimizer = torch.optim.SGD(
             model.parameters(),
             lr=float(config.get("lr", 0.001)),
@@ -354,22 +387,46 @@ def train_and_evaluate(
             nesterov=True,
         )
     else:
-        max_epochs = int(config.get("max_epochs", 100))
+        max_epochs = int(config.get("max_epochs", 90 if is_v2 else 100))
         min_epochs = int(config.get("min_epochs", 25))
-        patience = int(config.get("patience", 20))
+        patience = int(config.get("patience", 18 if is_v2 else 20))
         default_bs = 64 if needs["graph_mode"] == "graphormer" else (128 if needs["graph_mode"] == "gine" else 256)
         batch_size = int(config.get("batch_size", default_bs))
         eval_batch = int(config.get("eval_batch", default_bs * 2))
         grad_clip = float(config.get("grad_clip", 5.0))
-        gamma = float(config.get("gamma", 0.25))
+        gamma = float(config.get("gamma", 0.50 if is_v2 else 0.25))
+        loss_type = str(config.get("loss_type", "huber" if is_v2 else "mse"))
+        huber_beta = float(config.get("huber_beta", 1.0))
+        default_aux_w = 0.25 if method in ("MV_BIOPGT_V2", "MV_BIOPGT_V2_NOPROMPT") else 0.0
+        aux_graph_weight = float(config.get("aux_graph_weight", default_aux_w))
         base_lr = float(
             config.get("lr", 5e-4 if needs["graph_mode"] == "graphormer" else 1e-3)
         )
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=base_lr,
-            weight_decay=float(config.get("weight_decay", 1e-3)),
-        )
+        base_wd = float(config.get("weight_decay", 1e-3))
+        chem_wd = float(config.get("chem_weight_decay", 3e-3 if is_v2 else base_wd))
+        if abs(chem_wd - base_wd) > 1e-12 and getattr(model, "chem_encoder", None) is not None:
+            chem_ids = {id(p) for p in model.chem_encoder.parameters()}
+            param_groups = [
+                {
+                    "params": [
+                        p for p in model.parameters() if p.requires_grad and id(p) not in chem_ids
+                    ],
+                    "weight_decay": base_wd,
+                },
+                {
+                    "params": [
+                        p for p in model.parameters() if p.requires_grad and id(p) in chem_ids
+                    ],
+                    "weight_decay": chem_wd,
+                },
+            ]
+            optimizer = torch.optim.AdamW(param_groups, lr=base_lr)
+        else:
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=base_lr,
+                weight_decay=base_wd,
+            )
 
     ep_weights = torch.from_numpy(endpoint_weights_for_gamma(counts, gamma)).to(dev)
 
@@ -420,9 +477,24 @@ def train_and_evaluate(
                 graph_mode=needs["graph_mode"],
                 device=dev,
             )
-            pred = model(payload)
+            if aux_graph_weight > 0.0:
+                pred, train_aux = model(payload, return_train_aux=True)
+            else:
+                pred = model(payload)
+                train_aux = {}
             target = torch.from_numpy(std_train_y[idx_batch]).to(dev, non_blocking=True)
-            loss = tempered_mse_loss(pred, target, ep_weights)
+            if loss_type == "huber":
+                loss = tempered_huber_loss(pred, target, ep_weights, beta=huber_beta)
+                if aux_graph_weight > 0.0 and "graph_pred" in train_aux:
+                    loss = loss + aux_graph_weight * tempered_huber_loss(
+                        train_aux["graph_pred"], target, ep_weights, beta=huber_beta
+                    )
+            else:
+                loss = tempered_mse_loss(pred, target, ep_weights)
+                if aux_graph_weight > 0.0 and "graph_pred" in train_aux:
+                    loss = loss + aux_graph_weight * tempered_mse_loss(
+                        train_aux["graph_pred"], target, ep_weights
+                    )
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Nonfinite training loss at epoch {epoch + 1}")
             loss.backward()
@@ -536,6 +608,12 @@ def train_and_evaluate(
         )
         ckpt_sha = file_sha256(ckpt_path)
 
+    ordinal_ladder = None
+    if getattr(model, "ordinal_dose", False):
+        ordinal_ladder = [
+            round(float(x), 5) for x in model.ordinal_threshold_ladder().detach().cpu().tolist()
+        ]
+
     summary = {
         "status": "COMPLETE",
         "method": method,
@@ -545,6 +623,10 @@ def train_and_evaluate(
         "view_sha256": manifest["manifest_sha256"],
         "config": config,
         "gamma": gamma,
+        "label_scaling": label_scaling,
+        "loss_type": loss_type,
+        "aux_graph_weight": aux_graph_weight,
+        "ordinal_ladder": ordinal_ladder,
         "parameters": params,
         "best_epoch": best_epoch,
         "epochs_run": len(history),

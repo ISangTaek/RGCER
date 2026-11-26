@@ -21,6 +21,7 @@ from pgt_v2.mv_prompt.features import (
 from pgt_v2.mv_prompt.models import build_mv_model, method_input_needs
 from pgt_v2.mv_prompt.training import (
     endpoint_weights_for_gamma,
+    tempered_huber_loss,
     tempered_mse_loss,
     train_and_evaluate,
 )
@@ -355,6 +356,130 @@ def test_gate_summarize_and_collect(tmp_path):
     assert (work / "gate_report.md").is_file()
     assert (work / "gate_summary.csv").is_file()
     archive = collect_gate(work)
+    assert archive.is_file()
+    assert archive.with_suffix(archive.suffix + ".sha256").is_file()
+
+
+def test_tempered_huber_matches_mse_near_zero_and_bounds_outliers():
+    ep_w = torch.tensor([1.0, 2.0, 4.0])
+    pred_small = torch.tensor([[2.1, 3.0, 4.2], [1.9, 2.5, 3.8]], requires_grad=True)
+    target = torch.tensor([[2.0, float("nan"), 4.0], [2.2, 2.0, float("nan")]])
+    l_mse = tempered_mse_loss(pred_small, target, ep_w)
+    l_hub = tempered_huber_loss(pred_small, target, ep_w, beta=1.0)
+    assert torch.allclose(l_mse, l_hub, atol=1e-6)
+
+    pred_out = torch.tensor([[20.0, 3.0, 4.0]], requires_grad=True)
+    pred_out_mse = torch.tensor([[20.0, 3.0, 4.0]], requires_grad=True)
+    tgt_out = torch.tensor([[2.0, 3.0, 4.0]])
+    tempered_huber_loss(pred_out, tgt_out, ep_w, beta=1.0).backward()
+    tempered_mse_loss(pred_out_mse, tgt_out, ep_w).backward()
+    assert torch.isfinite(pred_out.grad).all()
+    assert abs(float(pred_out.grad[0, 0])) < abs(float(pred_out_mse.grad[0, 0])) * 0.2
+
+
+def test_ordinal_ladder_monotonicity_and_eval_determinism(tmp_path):
+    mv_cache_path, _, _ = _make_synthetic_bundle(tmp_path)
+    store = load_mv_cache(mv_cache_path)
+    counts = np.array([50.0] * len(TASKS))
+    model = build_mv_model(
+        "MV_BIOPGT_V2",
+        TASKS,
+        counts,
+        config={"hidden_dim": 32, "fp_hidden_dim": 64, "graph_layers": 2},
+    )
+    with torch.no_grad():
+        model.ord_step_ldlo.fill_(-5.0)
+        model.ord_step_tdlo.fill_(-5.0)
+    ladder = model.ordinal_threshold_ladder().detach()
+    assert ladder.shape == (3,)
+    assert float(ladder[0]) == pytest.approx(0.0)
+    assert float(ladder[1]) >= float(ladder[0])
+    assert float(ladder[2]) >= float(ladder[1])
+
+    offsets = np.arange(6, dtype=np.int64)
+    scaler = fit_descriptor_scaler(store.desc_raw, store.desc_missing, offsets)
+    desc = transform_descriptors(store.desc_raw, store.desc_missing, offsets, scaler)
+    needs = method_input_needs("MV_BIOPGT_V2")
+    payload = store.build_batch(offsets, desc_array=desc, device="cpu", **needs)
+
+    model.train()
+    pred_tr, train_aux = model(payload, return_train_aux=True)
+    assert pred_tr.shape == (6, len(TASKS))
+    assert "graph_pred" in train_aux
+    assert train_aux["graph_pred"].shape == (6, len(TASKS))
+
+    model.eval()
+    with torch.no_grad():
+        y1 = model(payload)
+        y2 = model(payload)
+    assert torch.equal(y1, y2)
+
+
+def test_v2_models_train_global_center_and_summarize_probe(tmp_path):
+    from pgt_v2.mv_prompt.probe_v2 import collect_probe_v2, summarize_probe_v2
+
+    mv_cache_path, view_dir, groups = _make_synthetic_bundle(tmp_path)
+    store = load_mv_cache(mv_cache_path)
+    groups_path = tmp_path / "groups.json"
+    write_json(groups_path, groups)
+
+    ref_runs = tmp_path / "ref_runs"
+    train_and_evaluate(
+        store=store,
+        view_root=view_dir,
+        endpoint_groups=groups,
+        method="TOX_AUTHOR",
+        seed=42,
+        config={"max_epochs": 1, "min_epochs": 1, "patience": 2, "batch_size": 8, "eval_batch": 8},
+        output_dir=ref_runs / "FULL_TOX_AUTHOR_s42",
+        device="cpu",
+        save_checkpoint_file=False,
+    )
+
+    work = tmp_path / "probe_work"
+    cfg_v2 = {
+        "max_epochs": 2,
+        "min_epochs": 1,
+        "patience": 2,
+        "batch_size": 8,
+        "eval_batch": 8,
+        "hidden_dim": 32,
+        "fp_hidden_dim": 64,
+        "graph_layers": 2,
+        "graph_heads": 4,
+        "gamma": 0.50,
+    }
+    for rid, method in [
+        ("FULL_MV_BIOPGT_V2_s42", "MV_BIOPGT_V2"),
+        ("FULL_MV_BIOPGT_V2_NOMDROP_s42", "MV_BIOPGT_V2_NOMDROP"),
+        ("FULL_MV_BIOPGT_V2_NOGRAPH_s42", "MV_BIOPGT_V2_NOGRAPH"),
+        ("FULL_MV_BIOPGT_V2_NOPROMPT_s42", "MV_BIOPGT_V2_NOPROMPT"),
+    ]:
+        s = train_and_evaluate(
+            store=store,
+            view_root=view_dir,
+            endpoint_groups=groups,
+            method=method,
+            seed=42,
+            config=cfg_v2,
+            output_dir=work / "runs" / rid,
+            device="cpu",
+            save_checkpoint_file=False,
+        )
+        assert s["status"] == "COMPLETE"
+        assert s["label_scaling"] == "global_center"
+        assert s["loss_type"] == "huber"
+        if method != "MV_BIOPGT_V2_NOPROMPT":
+            assert len(s["ordinal_ladder"]) == 3
+            assert s["ordinal_ladder"][0] == 0.0
+            assert s["ordinal_ladder"][1] >= 0.0
+            assert s["ordinal_ladder"][2] >= s["ordinal_ladder"][1]
+
+    report = summarize_probe_v2(work_dir=work, groups_path=groups_path, ref_runs_dir=ref_runs)
+    assert "FULL_vs_ToxACoL_ALL59_pct" in report["comparisons"]
+    assert (work / "probe_v2_report.md").is_file()
+    assert (work / "probe_v2_summary.csv").is_file()
+    archive = collect_probe_v2(work)
     assert archive.is_file()
     assert archive.with_suffix(archive.suffix + ".sha256").is_file()
 

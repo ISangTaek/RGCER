@@ -121,18 +121,19 @@ class BalancedChemEncoder(nn.Module):
         morgan_dim: int = 2048,
         desc_dim: int = 52,
         out_dim: int = 192,
+        fp_hidden_dim: int = 256,
         dropout: float = 0.2,
     ):
         super().__init__()
         self.avalon_branch = nn.Sequential(
-            nn.Linear(avalon_dim, 256),
-            nn.LayerNorm(256),
+            nn.Linear(avalon_dim, fp_hidden_dim),
+            nn.LayerNorm(fp_hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
         )
         self.morgan_branch = nn.Sequential(
-            nn.Linear(morgan_dim, 256),
-            nn.LayerNorm(256),
+            nn.Linear(morgan_dim, fp_hidden_dim),
+            nn.LayerNorm(fp_hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
         )
@@ -142,13 +143,14 @@ class BalancedChemEncoder(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout * 0.5),
         )
-        fused_in = 256 + 256 + 64
+        fused_in = fp_hidden_dim * 2 + 64
+        mid_dim = max(384, out_dim * 2) if fp_hidden_dim > 256 else 384
         self.fuse = nn.Sequential(
-            nn.Linear(fused_in, 384),
-            nn.LayerNorm(384),
+            nn.Linear(fused_in, mid_dim),
+            nn.LayerNorm(mid_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(384, out_dim),
+            nn.Linear(mid_dim, out_dim),
             nn.LayerNorm(out_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -290,6 +292,10 @@ class MVBioPGT(nn.Module):
         graph_type: str = "gine",
         use_chem: bool = True,
         use_prompt: bool = True,
+        ordinal_dose: bool = False,
+        chem_drop_prob: float = 0.0,
+        fp_hidden_dim: int = 256,
+        chem_dropout: float | None = None,
         hidden_dim: int = 192,
         graph_layers: int = 5,
         graph_heads: int = 4,
@@ -306,7 +312,10 @@ class MVBioPGT(nn.Module):
         self.graph_type = str(graph_type) if use_graph else "none"
         self.use_chem = bool(use_chem)
         self.use_prompt = bool(use_prompt)
+        self.ordinal_dose = bool(ordinal_dose) and self.use_prompt
+        self.chem_drop_prob = float(chem_drop_prob) if (self.use_graph and self.use_chem) else 0.0
         self.hidden_dim = int(hidden_dim)
+        c_drop = float(dropout if chem_dropout is None else chem_dropout)
 
         if self.use_graph:
             if self.graph_type == "gine":
@@ -323,12 +332,17 @@ class MVBioPGT(nn.Module):
                 )
             else:
                 raise ValueError(f"Unknown graph_type: {self.graph_type}")
+            self.graph_out_norm = nn.LayerNorm(hidden_dim)
         else:
             self.graph_encoder = None
+            self.graph_out_norm = None
 
         if self.use_chem:
             self.chem_encoder = BalancedChemEncoder(
-                desc_dim=desc_dim, out_dim=hidden_dim, dropout=dropout
+                desc_dim=desc_dim,
+                out_dim=hidden_dim,
+                fp_hidden_dim=int(fp_hidden_dim),
+                dropout=c_drop,
             )
         else:
             self.chem_encoder = None
@@ -375,6 +389,37 @@ class MVBioPGT(nn.Module):
             )
             self.endpoint_weight = nn.Parameter(torch.zeros(self.num_tasks, hidden_dim))
             self.endpoint_bias = nn.Parameter(torch.zeros(self.num_tasks))
+
+            if self.ordinal_dose:
+                meta = task_metadata(self.tasks)
+                meas_ranks = []
+                for t in self.tasks:
+                    m_name = meta[t]["measurement"]
+                    meas_ranks.append(2 if m_name == "TDLo" else (1 if m_name == "LDLo" else 0))
+                self.register_buffer("meas_rank", torch.tensor(meas_ranks, dtype=torch.long))
+                self.basal_prompt_norm = nn.LayerNorm(hidden_dim)
+                self.basal_film = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, hidden_dim * 2),
+                )
+                nn.init.zeros_(self.basal_film[-1].weight)
+                nn.init.zeros_(self.basal_film[-1].bias)
+                self.basal_norm = nn.LayerNorm(hidden_dim)
+                self.basal_decoder = nn.Sequential(
+                    nn.Linear(hidden_dim * 2, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_dim, 1),
+                )
+                # Monotone potency ladder in -log10(mol/kg): 0 = LD50 <= LDLo <= TDLo
+                # softplus(-2.48) ~= 0.080 (LDLo step), softplus(0.95) ~= 1.277 (TDLo step -> +1.36 total)
+                self.ord_step_ldlo = nn.Parameter(torch.tensor(-2.48, dtype=torch.float32))
+                self.ord_step_tdlo = nn.Parameter(torch.tensor(0.95, dtype=torch.float32))
+                # Zero-init molecule-specific threshold adjustment on top of monotone ladder
+                nn.init.zeros_(self.shared_decoder[-1].weight)
+                nn.init.zeros_(self.shared_decoder[-1].bias)
         else:
             # Clean vectorized multi-task head without biological prompts
             self.plain_head = nn.Sequential(
@@ -385,8 +430,16 @@ class MVBioPGT(nn.Module):
                 nn.Linear(hidden_dim, self.num_tasks),
             )
 
+    def ordinal_threshold_ladder(self) -> torch.Tensor:
+        """Return monotone 3-level potency offsets [tau_LD50, tau_LDLo, tau_TDLo] with 0 <= tau1 <= tau2."""
+        zero = self.ord_step_ldlo.new_zeros(1)
+        tau_ldlo = F.softplus(self.ord_step_ldlo).view(1)
+        tau_tdlo = tau_ldlo + F.softplus(self.ord_step_tdlo).view(1)
+        return torch.cat([zero, tau_ldlo, tau_tdlo], dim=0)
+
     def encode_molecule(self, payload):
         h_graph = None
+        h_graph_norm = None
         atoms = None
         atom_mask = None
         if self.use_graph:
@@ -397,6 +450,7 @@ class MVBioPGT(nn.Module):
                 h_graph = tokens.graph_token
                 atoms = tokens.atom_tokens
                 atom_mask = tokens.atom_mask
+            h_graph_norm = self.graph_out_norm(h_graph)
 
         h_chem = (
             self.chem_encoder(payload.avalon, payload.morgan, payload.desc)
@@ -408,53 +462,137 @@ class MVBioPGT(nn.Module):
             cat = torch.cat([h_graph, h_chem], dim=-1)
             g = self.modal_gate(cat)
             blended = g * h_graph + (1.0 - g) * h_chem
-            h_mol = self.modal_norm(blended + self.modal_proj(cat))
+            fused = self.modal_norm(blended + self.modal_proj(cat))
+            if self.training and self.chem_drop_prob > 0.0:
+                drop_mask = (
+                    torch.rand((h_graph.shape[0], 1), device=h_graph.device) < self.chem_drop_prob
+                )
+                h_mol = torch.where(drop_mask, h_graph_norm, fused)
+            else:
+                h_mol = fused
         elif self.use_graph:
             h_mol = h_graph
         else:
             h_mol = h_chem
-        return h_mol, atoms, atom_mask
+        return h_mol, h_graph_norm, atoms, atom_mask
 
-    def forward(
+    def _decode_from_repr(
         self,
-        payload,
+        h_mol: torch.Tensor,
+        atoms: torch.Tensor | None,
+        atom_mask: torch.Tensor | None,
         *,
-        return_aux: bool = False,
         prompt_override: torch.Tensor | None = None,
         factor_override: dict[str, torch.Tensor] | None = None,
-    ):
-        h_mol, atoms, atom_mask = self.encode_molecule(payload)
+        return_aux: bool = False,
+        detach_prompts: bool = False,
+    ) -> tuple[torch.Tensor, dict]:
         aux = {}
         if not self.use_prompt:
-            pred = self.plain_head(h_mol)
-            return (pred, aux) if return_aux else pred
+            return self.plain_head(h_mol), aux
 
         prompts = (
             prompt_override
             if prompt_override is not None
             else self.prompt_bank(factor_override=factor_override)
         )
-        film_params = self.film(prompts)  # [T, 2D]
-        gamma, beta = film_params.chunk(2, dim=-1)  # [T, D], [T, D]
-        z = (1.0 + gamma[None, :, :]) * h_mol[:, None, :] + beta[None, :, :]
-        if self.atom_cross_attn is not None:
+        if detach_prompts:
+            prompts = prompts.detach()
+
+        atom_ctx = None
+        if self.atom_cross_attn is not None and atoms is not None and atom_mask is not None:
             atom_ctx, attn = self.atom_cross_attn(
                 prompts, atoms, atom_mask, return_attention=return_aux
             )
-            z = z + atom_ctx
             if return_aux:
                 aux["atom_attention"] = attn
                 aux["atom_mask"] = atom_mask
+
+        film_params = self.film(prompts)  # [T, 2D]
+        gamma, beta = film_params.chunk(2, dim=-1)
+        z = (1.0 + gamma[None, :, :]) * h_mol[:, None, :] + beta[None, :, :]
+        if atom_ctx is not None:
+            z = z + atom_ctx
         z = self.task_norm(z)  # [B, T, D]
 
         p_exp = prompts[None, :, :].expand(z.shape[0], -1, -1)
-        shared_pred = self.shared_decoder(torch.cat([z, p_exp], dim=-1)).squeeze(-1)  # [B, T]
         shrink = self.prompt_bank.shrinkage[None, :]  # [1, T]
         residual_pred = shrink * torch.einsum("btd,td->bt", z, self.endpoint_weight)
-        pred = shared_pred + residual_pred + self.endpoint_bias[None, :]
+
+        if self.ordinal_dose:
+            org_idx = (
+                factor_override["organism"]
+                if (factor_override is not None and "organism" in factor_override)
+                else self.prompt_bank.organism_idx
+            )
+            route_idx = (
+                factor_override["route"]
+                if (factor_override is not None and "route" in factor_override)
+                else self.prompt_bank.route_idx
+            )
+            p_sr = self.basal_prompt_norm(
+                self.prompt_bank.embeddings["organism"](org_idx)
+                + self.prompt_bank.embeddings["route"](route_idx)
+            )
+            if detach_prompts:
+                p_sr = p_sr.detach()
+            sr_gamma, sr_beta = self.basal_film(p_sr).chunk(2, dim=-1)
+            z_sr = (1.0 + sr_gamma[None, :, :]) * h_mol[:, None, :] + sr_beta[None, :, :]
+            if atom_ctx is not None:
+                z_sr = z_sr + atom_ctx
+            z_sr = self.basal_norm(z_sr)
+            p_sr_exp = p_sr[None, :, :].expand(z_sr.shape[0], -1, -1)
+            basal_pred = self.basal_decoder(torch.cat([z_sr, p_sr_exp], dim=-1)).squeeze(-1)
+
+            ladder = self.ordinal_threshold_ladder()  # [3]
+            tau_offset = ladder[self.meas_rank][None, :]  # [1, T]
+            meas_adj = self.shared_decoder(torch.cat([z, p_exp - p_sr_exp], dim=-1)).squeeze(-1)
+            pred = basal_pred + tau_offset + meas_adj + residual_pred + self.endpoint_bias[None, :]
+            if return_aux:
+                aux["ordinal_ladder"] = ladder.detach()
+                aux["basal_pred"] = basal_pred.detach()
+        else:
+            shared_pred = self.shared_decoder(torch.cat([z, p_exp], dim=-1)).squeeze(-1)
+            pred = shared_pred + residual_pred + self.endpoint_bias[None, :]
+
         if return_aux:
             aux["prompts"] = prompts
             aux["h_mol"] = h_mol
+        return pred, aux
+
+    def forward(
+        self,
+        payload,
+        *,
+        return_aux: bool = False,
+        return_train_aux: bool = False,
+        prompt_override: torch.Tensor | None = None,
+        factor_override: dict[str, torch.Tensor] | None = None,
+    ):
+        h_mol, h_graph_norm, atoms, atom_mask = self.encode_molecule(payload)
+        pred, aux = self._decode_from_repr(
+            h_mol,
+            atoms,
+            atom_mask,
+            prompt_override=prompt_override,
+            factor_override=factor_override,
+            return_aux=return_aux,
+            detach_prompts=False,
+        )
+        if return_train_aux:
+            train_aux = {}
+            if self.use_graph and self.use_chem and h_graph_norm is not None:
+                graph_pred, _ = self._decode_from_repr(
+                    h_graph_norm,
+                    atoms,
+                    atom_mask,
+                    prompt_override=prompt_override,
+                    factor_override=factor_override,
+                    return_aux=False,
+                    detach_prompts=True,
+                )
+                train_aux["graph_pred"] = graph_pred
+            return pred, train_aux
         return (pred, aux) if return_aux else pred
 
 
@@ -504,11 +642,55 @@ def build_mv_model(
         "GRAPHORMER_ONLY": dict(
             use_graph=True, graph_type="graphormer", use_chem=False, use_prompt=False
         ),
+        "MV_BIOPGT_V2": dict(
+            use_graph=True,
+            graph_type="gine",
+            use_chem=True,
+            use_prompt=True,
+            ordinal_dose=True,
+            chem_drop_prob=0.25,
+            fp_hidden_dim=384,
+            chem_dropout=0.30,
+            default_dim=256,
+        ),
+        "MV_BIOPGT_V2_NOMDROP": dict(
+            use_graph=True,
+            graph_type="gine",
+            use_chem=True,
+            use_prompt=True,
+            ordinal_dose=True,
+            chem_drop_prob=0.0,
+            fp_hidden_dim=384,
+            chem_dropout=0.20,
+            default_dim=256,
+        ),
+        "MV_BIOPGT_V2_NOGRAPH": dict(
+            use_graph=False,
+            graph_type="none",
+            use_chem=True,
+            use_prompt=True,
+            ordinal_dose=True,
+            chem_drop_prob=0.0,
+            fp_hidden_dim=384,
+            chem_dropout=0.30,
+            default_dim=256,
+        ),
+        "MV_BIOPGT_V2_NOPROMPT": dict(
+            use_graph=True,
+            graph_type="gine",
+            use_chem=True,
+            use_prompt=False,
+            ordinal_dose=False,
+            chem_drop_prob=0.25,
+            fp_hidden_dim=384,
+            chem_dropout=0.30,
+            default_dim=256,
+        ),
     }
     if method not in specs:
         raise ValueError(f"Unknown MV method: {method}")
     flags = specs[method]
-    default_dim = 128 if flags["graph_type"] == "graphormer" else 192
+    default_dim = flags.get("default_dim", 128 if flags["graph_type"] == "graphormer" else 192)
     default_layers = 4 if flags["graph_type"] == "graphormer" else 5
     model = MVBioPGT(
         tasks=tuple(tasks),
@@ -518,6 +700,10 @@ def build_mv_model(
         graph_type=flags["graph_type"],
         use_chem=flags["use_chem"],
         use_prompt=flags["use_prompt"],
+        ordinal_dose=bool(cfg.get("ordinal_dose", flags.get("ordinal_dose", False))),
+        chem_drop_prob=float(cfg.get("chem_drop_prob", flags.get("chem_drop_prob", 0.0))),
+        fp_hidden_dim=int(cfg.get("fp_hidden_dim", flags.get("fp_hidden_dim", 256))),
+        chem_dropout=cfg.get("chem_dropout", flags.get("chem_dropout", None)),
         hidden_dim=int(cfg.get("hidden_dim", default_dim)),
         graph_layers=int(cfg.get("graph_layers", default_layers)),
         graph_heads=int(cfg.get("graph_heads", 4)),
@@ -533,13 +719,19 @@ def method_input_needs(method: str) -> dict:
         return dict(need_avalon=True, need_morgan=False, need_desc=False, graph_mode=None)
     if method == "RF":
         return dict(need_avalon=False, need_morgan=True, need_desc=True, graph_mode=None)
-    if method in ("MV_MLP", "MV_BIOPGT_NOGRAPH"):
+    if method in ("MV_MLP", "MV_BIOPGT_NOGRAPH", "MV_BIOPGT_V2_NOGRAPH"):
         return dict(need_avalon=True, need_morgan=True, need_desc=True, graph_mode=None)
     if method == "GINE_ONLY":
         return dict(need_avalon=False, need_morgan=False, need_desc=False, graph_mode="gine")
     if method == "GRAPHORMER_ONLY":
         return dict(need_avalon=False, need_morgan=False, need_desc=False, graph_mode="graphormer")
-    if method in ("MV_BIOPGT_GINE", "MV_BIOPGT_NOPROMPT_GINE"):
+    if method in (
+        "MV_BIOPGT_GINE",
+        "MV_BIOPGT_NOPROMPT_GINE",
+        "MV_BIOPGT_V2",
+        "MV_BIOPGT_V2_NOMDROP",
+        "MV_BIOPGT_V2_NOPROMPT",
+    ):
         return dict(need_avalon=True, need_morgan=True, need_desc=True, graph_mode="gine")
     if method in ("MV_BIOPGT_GRAPHORMER", "MV_BIOPGT_NOPROMPT_GRAPHORMER"):
         return dict(need_avalon=True, need_morgan=True, need_desc=True, graph_mode="graphormer")
