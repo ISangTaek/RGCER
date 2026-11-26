@@ -595,3 +595,210 @@ def test_formal_b1_reuse_mechanistic_and_summary(tmp_path):
     assert archive.is_file()
     assert archive.with_suffix(archive.suffix + ".sha256").is_file()
 
+
+def test_leo_zero_shot_strict_no_target_leakage(tmp_path):
+    """Verify held-out LEO tasks leak zero training/validation target statistics or weights."""
+    from pgt_v2.artifacts import load_arrays, load_manifest, seal_manifest
+    from pgt_v2.mv_prompt.formal_b2 import build_leo_view
+
+    mv_cache_path, view_a, groups = _make_synthetic_bundle(tmp_path / "bundle")
+    store = load_mv_cache(mv_cache_path)
+    held_out = ("rat_oral_LD50", "human_oral_TDLo")
+    held_idx = [TASKS.index(t) for t in held_out]
+
+    # Create perturbed view_b where held-out tasks' train & val labels are shifted by +500.0!
+    view_b = tmp_path / "view_b_perturbed"
+    view_b.mkdir(parents=True)
+    m_a = load_manifest(view_a)
+    files_b = []
+    for fname in m_a["files"]:
+        arr = load_arrays(view_a, fname, m_a)
+        if fname in ("train.npz", "validation.npz"):
+            arr["labels"] = arr["labels"].copy()
+            arr["labels"][:, held_idx] += 500.0
+        elif fname == "statistics.npz":
+            arr["mean"] = arr["mean"].copy()
+            arr["scale"] = arr["scale"].copy()
+            arr["mean"][held_idx] += 500.0
+            arr["scale"][held_idx] *= 50.0
+        np.savez_compressed(view_b / fname, **arr)
+        files_b.append(fname)
+    meta_b = {k: v for k, v in m_a.items() if k not in ("files", "manifest_sha256")}
+    seal_manifest(view_b, meta_b, files_b)
+
+    leo_a = tmp_path / "leo_a"
+    leo_b = tmp_path / "leo_b"
+    ma_leo = build_leo_view(view_a, leo_a, held_out_tasks=held_out)
+    mb_leo = build_leo_view(view_b, leo_b, held_out_tasks=held_out)
+
+    sa = load_arrays(leo_a, "statistics.npz", ma_leo)
+    sb = load_arrays(leo_b, "statistics.npz", mb_leo)
+    assert np.all(sa["count"][held_idx] == 0)
+    assert np.array_equal(sa["mean"], sb["mean"])
+    assert np.array_equal(sa["scale"], sb["scale"])
+    assert np.array_equal(sa["adjacency"], sb["adjacency"])
+
+    cfg = {
+        "max_epochs": 2,
+        "min_epochs": 1,
+        "patience": 2,
+        "batch_size": 8,
+        "eval_batch": 8,
+        "hidden_dim": 32,
+        "fp_hidden_dim": 64,
+        "graph_layers": 2,
+        "graph_heads": 4,
+        "gamma": 0.50,
+    }
+    train_and_evaluate(
+        store=store,
+        view_root=leo_a,
+        endpoint_groups=groups,
+        method="MV_BIOPGT_FINAL",
+        seed=42,
+        config=cfg,
+        output_dir=tmp_path / "run_leo_a",
+        device="cpu",
+        save_checkpoint_file=False,
+    )
+    train_and_evaluate(
+        store=store,
+        view_root=leo_b,
+        endpoint_groups=groups,
+        method="MV_BIOPGT_FINAL",
+        seed=42,
+        config=cfg,
+        output_dir=tmp_path / "run_leo_b",
+        device="cpu",
+        save_checkpoint_file=False,
+    )
+    pa = np.load(tmp_path / "run_leo_a" / "test_predictions.npz")["prediction"]
+    pb = np.load(tmp_path / "run_leo_b" / "test_predictions.npz")["prediction"]
+    assert np.array_equal(pa, pb)
+
+
+def test_formal_b2_end_to_end_pipeline(tmp_path):
+    from pgt_v2.mv_prompt.formal_b2 import (
+        collect_formal_b2,
+        export_leo_interventions,
+        prepare_unified_views_dir,
+        summarize_formal_b2,
+    )
+
+    mv_cache_path, view_dir, groups = _make_synthetic_bundle(tmp_path / "syn")
+    store = load_mv_cache(mv_cache_path)
+    groups_path = tmp_path / "groups.json"
+    write_json(groups_path, groups)
+
+    views_root = tmp_path / "views"
+    for fold in ("S0", "R0"):
+        d = views_root / fold / "FULL"
+        d.mkdir(parents=True)
+        for f in view_dir.iterdir():
+            (d / f.name).write_bytes(f.read_bytes())
+
+    work = tmp_path / "b2_work"
+    held = ("rat_oral_LD50", "human_oral_TDLo")
+    from pgt_v2.mv_prompt import formal_b2 as fb2
+
+    orig_leo = fb2.LEO6_TASKS
+    orig_leo5 = fb2.LEO5_ANIMAL_TASKS
+    try:
+        fb2.LEO6_TASKS = held
+        fb2.LEO5_ANIMAL_TASKS = ("rat_oral_LD50",)
+        unified = prepare_unified_views_dir(views_root, work, ("S0",))
+        cfg_small = {
+            "max_epochs": 2,
+            "min_epochs": 1,
+            "patience": 2,
+            "batch_size": 8,
+            "eval_batch": 8,
+            "hidden_dim": 32,
+            "fp_hidden_dim": 64,
+            "graph_layers": 2,
+            "graph_heads": 4,
+            "gamma": 0.50,
+        }
+        cfg_tox = {"max_epochs": 1, "min_epochs": 1, "patience": 2, "batch_size": 8, "eval_batch": 8}
+        for seed in (42, 43):
+            train_and_evaluate(
+                store=store,
+                view_root=unified / "S0" / "FULL",
+                endpoint_groups=groups,
+                method="MV_BIOPGT_FINAL",
+                seed=seed,
+                config=cfg_small,
+                output_dir=work / "runs" / f"S0_FULL_MV_BIOPGT_FINAL_s{seed}",
+                device="cpu",
+                save_checkpoint_file=False,
+            )
+            train_and_evaluate(
+                store=store,
+                view_root=unified / "S0" / "FULL",
+                endpoint_groups=groups,
+                method="TOX_AUTHOR",
+                seed=seed,
+                config=cfg_tox,
+                output_dir=work / "runs" / f"S0_FULL_TOX_AUTHOR_s{seed}",
+                device="cpu",
+                save_checkpoint_file=False,
+            )
+        for method, cfg in (
+            ("MV_BIOPGT_FINAL", cfg_small),
+            ("MV_BIOPGT_FINAL_NOPROMPT", cfg_small),
+            ("TOX_AUTHOR", cfg_tox),
+        ):
+            train_and_evaluate(
+                store=store,
+                view_root=unified / "S0" / "LEO6",
+                endpoint_groups=groups,
+                method=method,
+                seed=42,
+                config=cfg,
+                output_dir=work / "runs" / f"S0_LEO6_{method}_s42",
+                device="cpu",
+                save_checkpoint_file=(method == "MV_BIOPGT_FINAL"),
+            )
+        train_and_evaluate(
+            store=store,
+            view_root=unified / "R0" / "FULL",
+            endpoint_groups=groups,
+            method="MV_BIOPGT_FINAL",
+            seed=42,
+            config=cfg_small,
+            output_dir=work / "runs" / "R0_FULL_MV_BIOPGT_FINAL_s42",
+            device="cpu",
+            save_checkpoint_file=False,
+        )
+        mech = export_leo_interventions(
+            mv_cache_path=mv_cache_path,
+            unified_views_root=unified,
+            work_dir=work,
+            device="cpu",
+            seed=42,
+            folds=("S0",),
+            held_out_tasks=held,
+        )
+        assert len(mech["leo_interventions"]) == 4
+        # Verify shrinkage=0 prompt intervention shifts zero-shot predictions!
+        mads = {r["condition"]: r["LEO6_z_shift_mad"] for r in mech["leo_interventions"]}
+        assert mads["intact"] == pytest.approx(0.0)
+        assert mads["perm_all"] > 0.0
+
+        rep = summarize_formal_b2(
+            work_dir=work,
+            unified_views_root=unified,
+            groups_path=groups_path,
+            held_out_tasks=held,
+        )
+        assert len(rep["multiseed_summary"]) >= 4
+        assert len(rep["leo6_summary"]) >= 4
+        assert (work / "formal_b2_report.md").is_file()
+        archive = collect_formal_b2(work)
+        assert archive.is_file()
+        assert archive.with_suffix(archive.suffix + ".sha256").is_file()
+    finally:
+        fb2.LEO6_TASKS = orig_leo
+        fb2.LEO5_ANIMAL_TASKS = orig_leo5
+
+

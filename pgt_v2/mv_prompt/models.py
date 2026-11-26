@@ -204,7 +204,11 @@ class FactorizedBioPromptBank(nn.Module):
             emb = nn.Embedding(len(vocab), dim)
             nn.init.normal_(emb.weight, std=0.02)
             self.embeddings[field] = emb
-        count_t = torch.as_tensor(counts, dtype=torch.float32).clamp_min(1.0)
+        raw_counts = np.asarray(counts, dtype=np.float32)
+        count_t = torch.as_tensor(
+            np.where(raw_counts > 0.0, np.maximum(raw_counts, 1.0), 0.0),
+            dtype=torch.float32,
+        )
         self.register_buffer("shrinkage", (count_t / (count_t + float(shrinkage_tau))).sqrt())
         self.task_residual = nn.Parameter(torch.zeros(len(tasks), dim))
         self.base_norm = nn.LayerNorm(dim)

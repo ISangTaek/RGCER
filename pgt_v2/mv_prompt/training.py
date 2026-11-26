@@ -15,6 +15,7 @@ import torch
 from baselines.models.toxacol import toxacol_learning_rate
 from ..artifacts import load_arrays, load_manifest, write_json
 from ..cache import file_sha256
+from ..models import task_metadata
 from ..training import metrics as base_metrics
 from .features import MVDataStore, fit_descriptor_scaler, transform_descriptors
 from .models import build_mv_model, count_parameters, method_input_needs
@@ -66,14 +67,62 @@ def endpoint_weights_for_gamma(counts: np.ndarray, gamma: float) -> np.ndarray:
     - gamma = 0.0: exact observed-label equal weighting (all labels weight 1)
     - gamma = 1.0: exact equal-endpoint weighting (sum_i w_t = const per endpoint)
     - 0 < gamma < 1: smooth interpolation balancing stable encoder gradients and sparse tasks
-    Normalized so sum_t (n_t * w_t) = sum_t n_t, preserving loss scale across gammas.
+    - counts == 0 (unseen Leave-Endpoint-Out tasks): exact 0.0 weight
+    Normalized over positive-count tasks so sum_{t:n_t>0} (n_t * w_t) = sum_{t:n_t>0} n_t.
     """
     c = np.asarray(counts, dtype=np.float64)
-    if np.any(c <= 0):
-        raise ValueError("All endpoints must have positive visible training counts")
-    raw = c ** (-float(gamma))
-    norm = float(c.sum()) / float(np.sum(c * raw))
+    if np.any(c < 0) or not np.any(c > 0):
+        raise ValueError("Counts must be non-negative with at least one positive endpoint")
+    pos = c > 0
+    raw = np.zeros_like(c, dtype=np.float64)
+    raw[pos] = c[pos] ** (-float(gamma))
+    norm = float(c[pos].sum()) / float(np.sum(c[pos] * raw[pos]))
     return (raw * norm).astype(np.float32)
+
+
+def fit_factor_prior_stats(
+    tasks: list[str] | tuple[str, ...],
+    counts: np.ndarray,
+    obs_mean: np.ndarray,
+    obs_scale: np.ndarray,
+    *,
+    ridge: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Impute leak-free (mean, scale) for zero-count tasks strictly from observed tasks' factors."""
+    c = np.asarray(counts, dtype=np.float64)
+    mean_out = np.asarray(obs_mean, dtype=np.float64).copy()
+    scale_out = np.asarray(obs_scale, dtype=np.float64).copy()
+    pos = c > 0
+    if np.all(pos):
+        return mean_out, scale_out
+    if not np.any(pos):
+        raise ValueError("Cannot fit factor prior without observed endpoints")
+
+    t_tuple = tuple(tasks)
+    meta = task_metadata(t_tuple)
+    fields = ("organism", "route", "measurement", "population")
+    cols = [np.ones(len(t_tuple), dtype=np.float64)]
+    for field in fields:
+        vocab = sorted({meta[t][field] for t in t_tuple})
+        mat = np.zeros((len(t_tuple), len(vocab)), dtype=np.float64)
+        for i, t in enumerate(t_tuple):
+            mat[i, vocab.index(meta[t][field])] = 1.0
+        cols.append(mat)
+    x_mat = np.column_stack(cols)
+
+    w = np.sqrt(c[pos])
+    xw = x_mat[pos] * w[:, None]
+    reg = np.eye(x_mat.shape[1], dtype=np.float64) * float(ridge)
+    reg[0, 0] = 0.0  # unpenalized intercept
+    lhs = xw.T @ xw + reg
+    beta_m = np.linalg.solve(lhs, xw.T @ (w * mean_out[pos]))
+    log_s = np.log(np.clip(scale_out[pos], 1e-3, None))
+    beta_s = np.linalg.solve(lhs, xw.T @ (w * log_s))
+
+    unseen = ~pos
+    mean_out[unseen] = x_mat[unseen] @ beta_m
+    scale_out[unseen] = np.clip(np.exp(x_mat[unseen] @ beta_s), 0.25, 3.0)
+    return mean_out, scale_out
 
 
 def tempered_mse_loss(
@@ -118,7 +167,32 @@ def compute_group_metrics(
     endpoint_groups: dict,
     groups: np.ndarray | None = None,
 ) -> dict:
-    report = base_metrics(truth, prediction, tasks, groups=groups)
+    has_obs = np.isfinite(truth).any(axis=0)
+    if bool(np.all(has_obs)):
+        report = base_metrics(truth, prediction, tasks, groups=groups)
+    else:
+        obs_idx = [i for i, ok in enumerate(has_obs) if ok]
+        if not obs_idx:
+            raise ValueError("No observed labels in truth matrix")
+        obs_tasks = [tasks[i] for i in obs_idx]
+        sub_rep = base_metrics(
+            truth[:, obs_idx], prediction[:, obs_idx], obs_tasks, groups=groups
+        )
+        sub_by_task = {row["task"]: row for row in sub_rep["endpoints"]}
+        full_rows = []
+        for t in tasks:
+            if t in sub_by_task:
+                full_rows.append(sub_by_task[t])
+            else:
+                full_rows.append(
+                    {"task": t, "n": 0, "rmse": None, "mae": None, "r2": None, "groups": 0}
+                )
+        report = {
+            "macro_rmse": sub_rep["macro_rmse"],
+            "micro_mae": sub_rep["micro_mae"],
+            "endpoints": full_rows,
+            "measurements": sub_rep["measurements"],
+        }
     by_task = {row["task"]: row for row in report["endpoints"]}
     group_defs = {
         "ALL59": list(tasks),
@@ -130,12 +204,12 @@ def compute_group_metrics(
     }
     summary = {}
     for name, members in group_defs.items():
-        rows = [by_task[t] for t in members]
+        rows = [by_task[t] for t in members if by_task[t]["rmse"] is not None]
         r2_vals = [r["r2"] for r in rows if r["r2"] is not None]
         summary[name] = {
             "tasks": len(rows),
-            "macro_rmse": float(np.mean([r["rmse"] for r in rows])),
-            "macro_mae": float(np.mean([r["mae"] for r in rows])),
+            "macro_rmse": float(np.mean([r["rmse"] for r in rows])) if rows else None,
+            "macro_mae": float(np.mean([r["mae"] for r in rows])) if rows else None,
             "macro_r2": float(np.mean(r2_vals)) if r2_vals else None,
             "positive_r2_count": int(sum(v > 0 for v in r2_vals)),
         }
@@ -230,8 +304,16 @@ def _train_rf(
 
     val_pred = np.zeros((len(val_off), len(tasks)), dtype=np.float32)
     test_pred = np.zeros((len(test_off), len(tasks)), dtype=np.float32)
+    stats_arr = load_arrays(view_root, "statistics.npz", manifest)
+    prior_mean, _ = fit_factor_prior_stats(
+        tasks, stats_arr["count"], stats_arr["mean"], stats_arr["scale"]
+    )
     for j in range(len(tasks)):
         mask = np.isfinite(train_y[:, j])
+        if not bool(mask.any()):
+            val_pred[:, j] = np.float32(prior_mean[j])
+            test_pred[:, j] = np.float32(prior_mean[j])
+            continue
         rf = RandomForestRegressor(
             n_estimators=n_estimators,
             max_features=max_features,
@@ -352,8 +434,9 @@ def train_and_evaluate(
         mean = np.full_like(stats_arr["mean"], global_mean, dtype=np.float64)
         scale = np.ones_like(stats_arr["scale"], dtype=np.float64)
     elif label_scaling == "per_task":
-        mean = stats_arr["mean"].astype(np.float64)
-        scale = stats_arr["scale"].astype(np.float64)
+        mean, scale = fit_factor_prior_stats(
+            tasks, counts, stats_arr["mean"], stats_arr["scale"]
+        )
     else:
         raise ValueError(f"Unknown label_scaling: {label_scaling}")
     std_train_y = ((train_y - mean[None, :]) / scale[None, :]).astype(np.float32)
