@@ -483,3 +483,115 @@ def test_v2_models_train_global_center_and_summarize_probe(tmp_path):
     assert archive.is_file()
     assert archive.with_suffix(archive.suffix + ".sha256").is_file()
 
+
+def test_mv_biopgt_final_exact_parameter_parity_with_v2_zscore():
+    from baselines.constants import TOXACUTE_TASKS
+    from pgt_v2.mv_prompt.models import count_parameters
+
+    adj = np.eye(len(TOXACUTE_TASKS), dtype=np.float32)
+    counts = np.full(len(TOXACUTE_TASKS), 100.0, dtype=np.float32)
+    m_final = build_mv_model("MV_BIOPGT_FINAL", tuple(TOXACUTE_TASKS), counts, adjacency=adj)
+    m_zscore = build_mv_model(
+        "MV_BIOPGT_V2",
+        tuple(TOXACUTE_TASKS),
+        counts,
+        adjacency=adj,
+        config={"ordinal_dose": False},
+    )
+    assert count_parameters(m_final)["total"] == 4505347
+    assert count_parameters(m_final) == count_parameters(m_zscore)
+
+
+def test_formal_b1_reuse_mechanistic_and_summary(tmp_path):
+    from pgt_v2.mv_prompt.formal_b1 import (
+        _try_import_s0_run,
+        collect_formal_b1,
+        export_mechanistic,
+        summarize_formal_b1,
+    )
+
+    mv_cache_path, view_dir, groups = _make_synthetic_bundle(tmp_path)
+    store = load_mv_cache(mv_cache_path)
+    groups_path = tmp_path / "groups.json"
+    write_json(groups_path, groups)
+
+    views_root = tmp_path / "views"
+    for fold in ("S0", "S4"):
+        for sub in ("FULL", "S21_P10"):
+            d = views_root / fold / sub
+            d.mkdir(parents=True)
+            for f in view_dir.iterdir():
+                (d / f.name).write_bytes(f.read_bytes())
+
+    cfg_small = {
+        "max_epochs": 2,
+        "min_epochs": 1,
+        "patience": 2,
+        "batch_size": 8,
+        "eval_batch": 8,
+        "hidden_dim": 32,
+        "fp_hidden_dim": 64,
+        "graph_layers": 2,
+        "graph_heads": 4,
+        "gamma": 0.50,
+    }
+    probe_prev = tmp_path / "probe_prev_runs"
+    s0_prev = train_and_evaluate(
+        store=store,
+        view_root=views_root / "S0" / "FULL",
+        endpoint_groups=groups,
+        method="MV_BIOPGT_V2",
+        seed=42,
+        config={**cfg_small, "label_scaling": "per_task", "loss_type": "mse", "ordinal_dose": False},
+        output_dir=probe_prev / "FULL_MV_BIOPGT_V2_ZSCORE_s42",
+        device="cpu",
+        save_checkpoint_file=True,
+    )
+
+    work = tmp_path / "b1_work"
+    runs_dir = work / "runs"
+    reused = _try_import_s0_run(
+        src_dir=probe_prev / "FULL_MV_BIOPGT_V2_ZSCORE_s42",
+        dst_dir=runs_dir / "S0_FULL_MV_BIOPGT_FINAL_s42",
+        expected_view_sha=s0_prev["view_sha256"],
+        canonical_method="MV_BIOPGT_FINAL",
+    )
+    assert reused is True
+
+    s4_sum = train_and_evaluate(
+        store=store,
+        view_root=views_root / "S4" / "FULL",
+        endpoint_groups=groups,
+        method="MV_BIOPGT_FINAL",
+        seed=42,
+        config=cfg_small,
+        output_dir=runs_dir / "S4_FULL_MV_BIOPGT_FINAL_s42",
+        device="cpu",
+        save_checkpoint_file=True,
+    )
+    assert s4_sum["label_scaling"] == "per_task"
+    assert s4_sum["loss_type"] == "mse"
+    assert s4_sum["gamma"] == pytest.approx(0.50)
+
+    mech = export_mechanistic(
+        mv_cache_path=mv_cache_path,
+        views_root=views_root,
+        groups_path=groups_path,
+        work_dir=work,
+        device="cpu",
+        seed=42,
+        folds=("S0", "S4"),
+        probe_runs_dir=probe_prev,
+    )
+    assert len(mech["interventions"]) == 8  # 2 folds x 4 conditions
+    assert (work / "mechanistic" / "prompts_S0.npz").is_file()
+    assert (work / "mechanistic" / "prompts_S4.npz").is_file()
+
+    rep = summarize_formal_b1(work_dir=work, groups_path=groups_path)
+    assert rep["total_runs"] == 2
+    assert (work / "formal_b1_report.md").is_file()
+    assert (work / "formal_b1_5fold_summary.csv").is_file()
+    archive = collect_formal_b1(work)
+    assert archive.is_file()
+    assert archive.with_suffix(archive.suffix + ".sha256").is_file()
+

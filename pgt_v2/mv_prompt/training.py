@@ -340,6 +340,7 @@ def train_and_evaluate(
 
     author = method == "TOX_AUTHOR"
     is_v2 = method.startswith("MV_BIOPGT_V2")
+    is_final = method.startswith("MV_BIOPGT_FINAL")
     label_scaling = str(
         config.get("label_scaling", "raw" if author else ("global_center" if is_v2 else "per_task"))
     )
@@ -387,23 +388,42 @@ def train_and_evaluate(
             nesterov=True,
         )
     else:
-        max_epochs = int(config.get("max_epochs", 90 if is_v2 else 100))
+        max_epochs = int(config.get("max_epochs", 90 if (is_v2 or is_final) else 100))
         min_epochs = int(config.get("min_epochs", 25))
-        patience = int(config.get("patience", 18 if is_v2 else 20))
+        patience = int(config.get("patience", 18 if (is_v2 or is_final) else 20))
         default_bs = 64 if needs["graph_mode"] == "graphormer" else (128 if needs["graph_mode"] == "gine" else 256)
         batch_size = int(config.get("batch_size", default_bs))
         eval_batch = int(config.get("eval_batch", default_bs * 2))
         grad_clip = float(config.get("grad_clip", 5.0))
-        gamma = float(config.get("gamma", 0.50 if is_v2 else 0.25))
+        gamma = float(config.get("gamma", 0.50 if (is_v2 or is_final) else 0.25))
         loss_type = str(config.get("loss_type", "huber" if is_v2 else "mse"))
         huber_beta = float(config.get("huber_beta", 1.0))
-        default_aux_w = 0.25 if method in ("MV_BIOPGT_V2", "MV_BIOPGT_V2_NOPROMPT") else 0.0
+        default_aux_w = (
+            0.25
+            if method
+            in (
+                "MV_BIOPGT_V2",
+                "MV_BIOPGT_V2_NOPROMPT",
+                "MV_BIOPGT_FINAL",
+                "MV_BIOPGT_FINAL_NOPROMPT",
+            )
+            else 0.0
+        )
         aux_graph_weight = float(config.get("aux_graph_weight", default_aux_w))
         base_lr = float(
             config.get("lr", 5e-4 if needs["graph_mode"] == "graphormer" else 1e-3)
         )
         base_wd = float(config.get("weight_decay", 1e-3))
-        chem_wd = float(config.get("chem_weight_decay", 3e-3 if is_v2 else base_wd))
+        default_chem_wd = (
+            3e-3
+            if (
+                is_v2
+                or method
+                in ("MV_BIOPGT_FINAL", "MV_BIOPGT_FINAL_NOGRAPH", "MV_BIOPGT_FINAL_NOPROMPT")
+            )
+            else base_wd
+        )
+        chem_wd = float(config.get("chem_weight_decay", default_chem_wd))
         if abs(chem_wd - base_wd) > 1e-12 and getattr(model, "chem_encoder", None) is not None:
             chem_ids = {id(p) for p in model.chem_encoder.parameters()}
             param_groups = [

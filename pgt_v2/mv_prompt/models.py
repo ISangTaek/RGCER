@@ -686,6 +686,50 @@ def build_mv_model(
             chem_dropout=0.30,
             default_dim=256,
         ),
+        "MV_BIOPGT_FINAL": dict(
+            use_graph=True,
+            graph_type="gine",
+            use_chem=True,
+            use_prompt=True,
+            ordinal_dose=False,
+            chem_drop_prob=0.25,
+            fp_hidden_dim=384,
+            chem_dropout=0.30,
+            default_dim=256,
+        ),
+        "MV_BIOPGT_FINAL_NOGRAPH": dict(
+            use_graph=False,
+            graph_type="none",
+            use_chem=True,
+            use_prompt=True,
+            ordinal_dose=False,
+            chem_drop_prob=0.0,
+            fp_hidden_dim=384,
+            chem_dropout=0.30,
+            default_dim=256,
+        ),
+        "MV_BIOPGT_FINAL_NOPROMPT": dict(
+            use_graph=True,
+            graph_type="gine",
+            use_chem=True,
+            use_prompt=False,
+            ordinal_dose=False,
+            chem_drop_prob=0.25,
+            fp_hidden_dim=384,
+            chem_dropout=0.30,
+            default_dim=256,
+        ),
+        "MV_BIOPGT_FINAL_NOMDROP": dict(
+            use_graph=True,
+            graph_type="gine",
+            use_chem=True,
+            use_prompt=True,
+            ordinal_dose=False,
+            chem_drop_prob=0.0,
+            fp_hidden_dim=384,
+            chem_dropout=0.20,
+            default_dim=256,
+        ),
     }
     if method not in specs:
         raise ValueError(f"Unknown MV method: {method}")
@@ -719,7 +763,7 @@ def method_input_needs(method: str) -> dict:
         return dict(need_avalon=True, need_morgan=False, need_desc=False, graph_mode=None)
     if method == "RF":
         return dict(need_avalon=False, need_morgan=True, need_desc=True, graph_mode=None)
-    if method in ("MV_MLP", "MV_BIOPGT_NOGRAPH", "MV_BIOPGT_V2_NOGRAPH"):
+    if method in ("MV_MLP", "MV_BIOPGT_NOGRAPH", "MV_BIOPGT_V2_NOGRAPH", "MV_BIOPGT_FINAL_NOGRAPH"):
         return dict(need_avalon=True, need_morgan=True, need_desc=True, graph_mode=None)
     if method == "GINE_ONLY":
         return dict(need_avalon=False, need_morgan=False, need_desc=False, graph_mode="gine")
@@ -731,6 +775,9 @@ def method_input_needs(method: str) -> dict:
         "MV_BIOPGT_V2",
         "MV_BIOPGT_V2_NOMDROP",
         "MV_BIOPGT_V2_NOPROMPT",
+        "MV_BIOPGT_FINAL",
+        "MV_BIOPGT_FINAL_NOPROMPT",
+        "MV_BIOPGT_FINAL_NOMDROP",
     ):
         return dict(need_avalon=True, need_morgan=True, need_desc=True, graph_mode="gine")
     if method in ("MV_BIOPGT_GRAPHORMER", "MV_BIOPGT_NOPROMPT_GRAPHORMER"):
