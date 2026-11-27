@@ -407,8 +407,10 @@ def build_b3_jobs(
         add("59", fold, "LEO6", "LEO6", "MV_BIOPGT_FINAL_RDROP", {"gamma": 0.50, "residual_drop_prob": 0.5})
     if s0_rdrop_control:
         add("59", "S0", "FULL", "FULL", "MV_BIOPGT_FINAL_RDROP", {"gamma": 0.50, "residual_drop_prob": 0.5})
-    add("59", "S0", "FULL", "FULL", "MV_BIOPGT_FLAT_PROMPT", {"gamma": 0.50})
-    add("59", "S0", "LEO6", "LEO6", "MV_BIOPGT_FLAT_PROMPT", {"gamma": 0.50})
+    for fold in SCAFFOLD_FOLDS:
+        add("59", fold, "FULL", "FULL", "MV_BIOPGT_FLAT_PROMPT", {"gamma": 0.50})
+    for fold in SCAFFOLD_FOLDS:
+        add("59", fold, "LEO6", "LEO6", "MV_BIOPGT_FLAT_PROMPT", {"gamma": 0.50})
 
     for fold in ("R1", "R2", "R3", "R4"):
         add("59", fold, "FULL", "FULL", "MV_BIOPGT_FINAL", {"gamma": 0.50})
@@ -1556,6 +1558,7 @@ def summarize_formal_b3(*, work_dir: Path, groups59_path: Path, seed: int = 42) 
             "ATTENTIVEFP",
             "XGBOOST",
             "LIGHTGBM",
+            "MV_BIOPGT_FLAT_PROMPT",
             "MV_BIOPGT_FINAL_NOPROMPT",
             "MV_BIOPGT_FINAL_NOMDROP",
             "MV_BIOPGT_FINAL_NOGRAPH",

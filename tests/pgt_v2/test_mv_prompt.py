@@ -1089,11 +1089,18 @@ def test_pubchem115_cache_views_extended_toxacol_and_zeroshot(tmp_path):
 
 def test_formal_b3_interpretability_and_collect_end_to_end(tmp_path):
     from pgt_v2.mv_prompt.formal_b3 import (
+        build_b3_jobs,
         collect_formal_b3,
         prepare_b3_assets,
         run_prompt_interpretability_suite,
         summarize_formal_b3,
     )
+
+    all_jobs = build_b3_jobs(include_pub115=True, seed=42)
+    assert len(all_jobs) == 153
+    flat_full = [j for j in all_jobs if j["method"] == "MV_BIOPGT_FLAT_PROMPT" and j["budget"] == "FULL"]
+    flat_leo = [j for j in all_jobs if j["method"] == "MV_BIOPGT_FLAT_PROMPT" and j["budget"] == "LEO6"]
+    assert len(flat_full) == 5 and len(flat_leo) == 5
 
     mv_cache_path, view_dir, groups = _make_synthetic_bundle(tmp_path / "syn")
     store = load_mv_cache(mv_cache_path)
