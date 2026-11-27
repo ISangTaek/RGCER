@@ -45,10 +45,20 @@ def task_metadata(names):
             output[name] = registered[name]
             continue
         m = parse_toxacute_task_name(name)
-        # Preserve C01's unknown populations; Human3 are populations of one organism.
+        # Preserve C01's unknown populations; Human3 + child are populations of human.
         subject = name.rsplit('_', 2)[0]
-        population = {'man': 'male', 'women': 'female', 'human': 'unspecified'}.get(subject, 'not_population_stratified')
-        output[name] = dict(organism=m.organism, route=m.route, measurement=m.measurement, population=population)
+        organism = (
+            'human'
+            if subject in ('man', 'women', 'human', 'child')
+            else ('bird-wild' if subject == 'bird - wild' else m.organism)
+        )
+        population = {
+            'man': 'male_as_recorded',
+            'women': 'female_as_recorded',
+            'human': 'unspecified_human_population',
+            'child': 'child_as_recorded',
+        }.get(subject, 'not_population_stratified')
+        output[name] = dict(organism=organism, route=m.route, measurement=m.measurement, population=population)
     return output
 
 

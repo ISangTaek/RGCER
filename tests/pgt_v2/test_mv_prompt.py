@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from molecular_features import PGT_FEATURE_SPEC
-from pgt_v2.artifacts import save_view, write_json
+from pgt_v2.artifacts import read_json, save_view, write_json
 from pgt_v2.cache import CacheEntry, build_cache
 from pgt_v2.chemistry import graph_from_input, prepare_molecule
 from pgt_v2.data import make_training_view
@@ -800,5 +800,407 @@ def test_formal_b2_end_to_end_pipeline(tmp_path):
     finally:
         fb2.LEO6_TASKS = orig_leo
         fb2.LEO5_ANIMAL_TASKS = orig_leo5
+
+
+def test_dmpnn_and_attentivefp_train_and_predict_end_to_end(tmp_path):
+    mv_cache_path, view_dir, groups = _make_synthetic_bundle(tmp_path)
+    store = load_mv_cache(mv_cache_path)
+    for method in ("DMPNN", "ATTENTIVEFP"):
+        cfg = {
+            "max_epochs": 2,
+            "min_epochs": 1,
+            "patience": 2,
+            "batch_size": 8,
+            "eval_batch": 8,
+            "hidden_dim": 32,
+            "gamma": 0.50,
+        }
+        out_dir = tmp_path / f"run_{method}"
+        summary = train_and_evaluate(
+            store=store,
+            view_root=view_dir,
+            endpoint_groups=groups,
+            method=method,
+            seed=42,
+            config=cfg,
+            output_dir=out_dir,
+            device="cpu",
+            save_checkpoint_file=True,
+        )
+        assert summary["status"] == "COMPLETE"
+        assert np.isfinite(summary["test_groups"]["ALL59"]["macro_rmse"])
+        assert (out_dir / "best.pt").is_file()
+
+
+def test_toxacol_preload_avalon_bit_exact(tmp_path):
+    mv_cache_path, view_dir, groups = _make_synthetic_bundle(tmp_path)
+    store = load_mv_cache(mv_cache_path)
+    base_cfg = {"max_epochs": 2, "min_epochs": 2, "patience": 3, "batch_size": 8, "eval_batch": 8}
+    s_slow = train_and_evaluate(
+        store=store,
+        view_root=view_dir,
+        endpoint_groups=groups,
+        method="TOX_AUTHOR",
+        seed=42,
+        config={**base_cfg, "preload_avalon_gpu": False},
+        output_dir=tmp_path / "tox_slow",
+        device="cpu",
+        save_checkpoint_file=False,
+    )
+    s_fast = train_and_evaluate(
+        store=store,
+        view_root=view_dir,
+        endpoint_groups=groups,
+        method="TOX_AUTHOR",
+        seed=42,
+        config={**base_cfg, "preload_avalon_gpu": True},
+        output_dir=tmp_path / "tox_fast",
+        device="cpu",
+        save_checkpoint_file=False,
+    )
+    p_slow = np.load(tmp_path / "tox_slow" / "test_predictions.npz")["prediction"]
+    p_fast = np.load(tmp_path / "tox_fast" / "test_predictions.npz")["prediction"]
+    assert np.allclose(p_slow, p_fast, atol=1e-6)
+    assert s_slow["test_groups"]["ALL59"]["macro_rmse"] == pytest.approx(
+        s_fast["test_groups"]["ALL59"]["macro_rmse"], abs=1e-6
+    )
+
+
+def test_prompt_rdrop_flat_and_external_zero_shot_composition(tmp_path):
+    from pgt_v2.mv_prompt.formal_b3 import _integrated_gradients_atoms
+
+    mv_cache_path, view_dir, groups = _make_synthetic_bundle(tmp_path)
+    store = load_mv_cache(mv_cache_path)
+    cfg = {
+        "max_epochs": 2,
+        "min_epochs": 1,
+        "patience": 2,
+        "batch_size": 8,
+        "eval_batch": 8,
+        "hidden_dim": 32,
+        "fp_hidden_dim": 64,
+        "graph_layers": 2,
+        "graph_heads": 4,
+        "gamma": 0.50,
+    }
+    for method in ("MV_BIOPGT_FINAL_RDROP", "MV_BIOPGT_FLAT_PROMPT"):
+        s = train_and_evaluate(
+            store=store,
+            view_root=view_dir,
+            endpoint_groups=groups,
+            method=method,
+            seed=42,
+            config=cfg,
+            output_dir=tmp_path / f"run_{method}",
+            device="cpu",
+            save_checkpoint_file=True,
+        )
+        assert s["status"] == "COMPLETE"
+
+    # Load RDROP checkpoint and verify external zero-shot prompt composition + modal_gate + IG
+    blob = torch.load(tmp_path / "run_MV_BIOPGT_FINAL_RDROP" / "best.pt", map_location="cpu", weights_only=False)
+    model = build_mv_model(
+        "MV_BIOPGT_FINAL_RDROP",
+        tuple(blob["task_names"]),
+        blob["counts"],
+        adjacency=blob["adjacency"],
+        config=blob["config"],
+        device="cpu",
+    )
+    model.load_state_dict(blob["model_state"])
+    model.eval()
+    ft = model.prompt_bank.export_factor_tables()
+    assert set(ft.keys()) == {"organism", "route", "measurement", "population"}
+    ext_p = model.prompt_bank.compose_external_prompts(["human_oral_LDLo", "rat_oral_TDLo"])
+    assert ext_p.shape == (2, 32)
+
+    offs = np.array([0, 1], dtype=np.int64)
+    desc = transform_descriptors(store.desc_raw, store.desc_missing, offs, blob["desc_scaler"])
+    pay = store.build_batch(
+        offs, desc_array=desc, need_avalon=True, need_morgan=True, need_desc=True, graph_mode="gine", device="cpu"
+    )
+    with torch.no_grad():
+        pred, aux = model(pay, return_aux=True)
+        ext_pred = model(pay, prompt_override=ext_p, external_zero_shrink=True)
+    assert pred.shape == (2, len(TASKS))
+    assert ext_pred.shape == (2, 2)
+    assert "modal_gate" in aux and aux["modal_gate"].shape == (2, 32)
+
+    pay1 = store.build_batch(
+        offs[:1], desc_array=desc[:1], need_avalon=True, need_morgan=True, need_desc=True, graph_mode="gine", device="cpu"
+    )
+    ig = _integrated_gradients_atoms(model, pay1, target_fn=lambda o: o[0, 0], steps=4)
+    assert ig.shape == (int(pay1.num_nodes[0].item()),)
+    assert np.isfinite(ig).all()
+
+
+def test_nested_s21_views_strictly_nested(tmp_path):
+    from pgt_v2.mv_prompt.pubchem115 import build_nested_s21_view
+
+    _, view_dir, groups = _make_synthetic_bundle(tmp_path)
+    full_val = np.load(view_dir / "validation.npz")["labels"]
+    full_test = np.load(view_dir / "test.npz")["labels"]
+
+    prev_mask = None
+    for bname, frac in (("S21_P20", 0.2), ("S21_P40", 0.4), ("S21_P50", 0.5), ("S21_P80", 0.8)):
+        dst = tmp_path / bname
+        build_nested_s21_view(
+            view_dir, dst, target_tasks=groups["S21"], fraction=frac, budget_id=bname, subset_seed=1042
+        )
+        cur_mask = np.isfinite(np.load(dst / "train.npz")["labels"])
+        if prev_mask is not None:
+            assert np.all(cur_mask[prev_mask]), f"{bname} not nested superset of previous"
+        prev_mask = cur_mask
+        assert np.array_equal(np.isnan(np.load(dst / "validation.npz")["labels"]), np.isnan(full_val))
+        assert np.array_equal(np.isnan(np.load(dst / "test.npz")["labels"]), np.isnan(full_test))
+
+
+def test_pubchem115_cache_views_extended_toxacol_and_zeroshot(tmp_path):
+    import pandas as pd
+    from pgt_v2.mv_prompt.pubchem115 import (
+        build_pubchem115_mv_cache,
+        build_pubchem115_views,
+        find_external_zeroshot_subset,
+    )
+
+    pub_tasks = [
+        "mouse_oral_LD50",
+        "rat_oral_LD50",
+        "child_oral_LDLo",
+        "monkey_intracrebral_LD10",
+        "human_oral_LDLo",
+        "bird - wild_oral_LD50",
+    ]
+    rng = np.random.default_rng(77)
+    rows = []
+    for idx, smi in enumerate(SMILES_POOL):
+        row = {"cid": 1000 + idx, "smiles": smi}
+        for t in pub_tasks:
+            row[t] = float(rng.normal(3.0, 0.8)) if (idx % 2 == 0 or t == "mouse_oral_LD50") else np.nan
+        rows.append(row)
+    csv_path = tmp_path / "pub115_syn.csv"
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+
+    rdir = tmp_path / "random_split"
+    rdir.mkdir()
+    all_cids = [1000 + i for i in range(len(SMILES_POOL))]
+    pd.DataFrame({"cid": all_cids[:16]}).to_csv(rdir / "train_fold_0.csv", index=False)
+    pd.DataFrame({"cid": all_cids[16:]}).to_csv(rdir / "test_fold_0.csv", index=False)
+
+    cache_p = build_pubchem115_mv_cache(csv_path, tmp_path / "mv_cache_115.pt", max_workers=1)
+    vsum = build_pubchem115_views(
+        cache_path=cache_p,
+        csv_path=csv_path,
+        random_split_dir=rdir,
+        views_out_root=tmp_path / "views115",
+        groups_out_path=tmp_path / "groups115.json",
+    )
+    assert vsum["tasks"] == len(pub_tasks)
+    assert "PUB115_R0" in vsum["created"]["random"]
+    assert len(vsum["created"]["scaffold"]) == 5
+
+    # Verify both MV_BIOPGT_FINAL and TOX_AUTHOR (with extend_vocabulary=True) train cleanly on extended tasks
+    store115 = load_mv_cache(cache_p)
+    groups115 = read_json(tmp_path / "groups115.json")
+    for method, cfg in (
+        (
+            "MV_BIOPGT_FINAL",
+            {"max_epochs": 1, "min_epochs": 1, "patience": 2, "batch_size": 8, "eval_batch": 8, "hidden_dim": 32, "fp_hidden_dim": 64, "graph_layers": 2},
+        ),
+        (
+            "TOX_AUTHOR",
+            {"max_epochs": 1, "min_epochs": 1, "patience": 2, "batch_size": 8, "eval_batch": 8},
+        ),
+    ):
+        s = train_and_evaluate(
+            store=store115,
+            view_root=tmp_path / "views115" / "PUB115_R0" / "FULL",
+            endpoint_groups=groups115,
+            method=method,
+            seed=42,
+            config=cfg,
+            output_dir=tmp_path / f"pub_run_{method}",
+            device="cpu",
+            save_checkpoint_file=False,
+        )
+        assert s["status"] == "COMPLETE"
+        assert np.isfinite(s["test_groups"]["ALL115"]["macro_rmse"])
+
+    # Verify external double zero-shot deduplication finds human_oral_LDLo and excludes seen SMILES
+    seen = {"CCO", "c1ccccc1"}
+    sub = find_external_zeroshot_subset(
+        pub115_cache_path=cache_p,
+        pub115_csv_path=csv_path,
+        tasks_59=TASKS,
+        seen_noniso_smiles=seen,
+    )
+    assert "human_oral_LDLo" in sub["unseen_tasks"]
+    assert "monkey_intracrebral_LD10" not in sub["unseen_tasks"]
+    assert sub["n_overlap_removed"] >= 1
+
+    # Also exercise run_external_zeroshot_36 end-to-end against a frozen synthetic 10-task checkpoint!
+    from pgt_v2.mv_prompt.formal_b3 import run_external_zeroshot_36
+
+    syn_cache, syn_view, syn_groups = _make_synthetic_bundle(tmp_path / "syn59")
+    syn_store = load_mv_cache(syn_cache)
+    work = tmp_path / "zs_work"
+    d_s0 = work / "views_all_59" / "S0" / "FULL"
+    d_s0.mkdir(parents=True)
+    for f in syn_view.iterdir():
+        (d_s0 / f.name).write_bytes(f.read_bytes())
+    (work / "pubchem115").mkdir(parents=True)
+    for ext_suf in ("", ".meta.json", ".identities.json.gz"):
+        src_f = Path(str(cache_p).replace(".pt", ".pt" if not ext_suf else ext_suf))
+        if src_f.is_file():
+            dst_f = work / "pubchem115" / src_f.name
+            dst_f.write_bytes(src_f.read_bytes())
+    # Create an external pubchem csv containing fresh unseen smiles NOT in SMILES_POOL so novel > 0
+    fresh_smiles = ["CCCCCO", "CCCCCC(=O)O", "c1ccc(C)cc1", "c1ccc(CC)cc1", "CCOC(=O)C", "CCC(C)O"]
+    fresh_rows = [
+        {"cid": 9000 + i, "smiles": smi, "mouse_oral_LD50": 2.5 + 0.1 * i, "human_oral_LDLo": 3.0 + 0.2 * i}
+        for i, smi in enumerate(fresh_smiles)
+    ]
+    fresh_csv = tmp_path / "fresh_pub.csv"
+    pd.DataFrame(fresh_rows).to_csv(fresh_csv, index=False)
+    build_pubchem115_mv_cache(fresh_csv, work / "pubchem115" / "mv_cache_115.pt", max_workers=1)
+    train_and_evaluate(
+        store=syn_store,
+        view_root=d_s0,
+        endpoint_groups=syn_groups,
+        method="MV_BIOPGT_FINAL",
+        seed=42,
+        config={"max_epochs": 1, "min_epochs": 1, "patience": 2, "batch_size": 8, "eval_batch": 8, "hidden_dim": 32, "fp_hidden_dim": 64, "graph_layers": 2},
+        output_dir=work / "runs" / "S0_FULL_MV_BIOPGT_FINAL_s42",
+        device="cpu",
+        save_checkpoint_file=True,
+    )
+    zs = run_external_zeroshot_36(
+        graph_cache_59=tmp_path / "syn59" / "graph_cache",
+        pub115_csv=fresh_csv,
+        work_dir=work,
+        device="cpu",
+        seed=42,
+    )
+    assert zs["status"] == "EXT_ZEROSHOT_COMPLETE"
+    assert zs["n_unseen_endpoints"] == 1
+    assert zs["n_novel_molecules"] == len(fresh_smiles)
+    assert (work / "external_zeroshot_36" / "external_zeroshot_36_summary.csv").is_file()
+
+
+def test_formal_b3_interpretability_and_collect_end_to_end(tmp_path):
+    from pgt_v2.mv_prompt.formal_b3 import (
+        collect_formal_b3,
+        prepare_b3_assets,
+        run_prompt_interpretability_suite,
+        summarize_formal_b3,
+    )
+
+    mv_cache_path, view_dir, groups = _make_synthetic_bundle(tmp_path / "syn")
+    store = load_mv_cache(mv_cache_path)
+    groups_path = tmp_path / "groups.json"
+    write_json(groups_path, groups)
+
+    views_root = tmp_path / "views"
+    d = views_root / "S0" / "FULL"
+    d.mkdir(parents=True)
+    for f in view_dir.iterdir():
+        (d / f.name).write_bytes(f.read_bytes())
+
+    work = tmp_path / "b3_work"
+    from pgt_v2.mv_prompt import formal_b2 as fb2
+    from pgt_v2.mv_prompt import formal_b3 as fb3
+
+    orig_leo, orig_leo5 = fb2.LEO6_TASKS, fb2.LEO5_ANIMAL_TASKS
+    orig_b3_leo, orig_b3_leo5 = fb3.LEO6_TASKS, fb3.LEO5_ANIMAL_TASKS
+    try:
+        held = ("rat_oral_LD50", "human_oral_TDLo")
+        fb2.LEO6_TASKS = fb3.LEO6_TASKS = held
+        fb2.LEO5_ANIMAL_TASKS = fb3.LEO5_ANIMAL_TASKS = ("rat_oral_LD50",)
+
+        prepare_b3_assets(
+            views59_root=views_root,
+            groups59_path=groups_path,
+            pub115_csv=None,
+            pub115_random_dir=None,
+            work_dir=work,
+        )
+        cfg_small = {
+            "max_epochs": 2,
+            "min_epochs": 1,
+            "patience": 2,
+            "batch_size": 8,
+            "eval_batch": 8,
+            "hidden_dim": 32,
+            "fp_hidden_dim": 64,
+            "graph_layers": 2,
+            "graph_heads": 4,
+            "gamma": 0.50,
+        }
+        for rid, budget, method in (
+            ("S0_FULL_MV_BIOPGT_FINAL_s42", "FULL", "MV_BIOPGT_FINAL"),
+            ("S0_FULL_MV_BIOPGT_FINAL_RDROP_s42", "FULL", "MV_BIOPGT_FINAL_RDROP"),
+            ("S0_FULL_MV_BIOPGT_FLAT_PROMPT_s42", "FULL", "MV_BIOPGT_FLAT_PROMPT"),
+            ("S0_LEO6_MV_BIOPGT_FINAL_RDROP_s42", "LEO6", "MV_BIOPGT_FINAL_RDROP"),
+        ):
+            train_and_evaluate(
+                store=store,
+                view_root=work / "views_all_59" / "S0" / budget,
+                endpoint_groups=groups,
+                method=method,
+                seed=42,
+                config=cfg_small,
+                output_dir=work / "runs" / rid,
+                device="cpu",
+                save_checkpoint_file=True,
+            )
+
+        interp = run_prompt_interpretability_suite(
+            mv_cache_59=mv_cache_path,
+            graph_cache_59=tmp_path / "syn" / "graph_cache",
+            work_dir=work,
+            groups59_path=groups_path,
+            device="cpu",
+            seed=42,
+        )
+        assert interp["status"] == "INTERPRET_B3_COMPLETE"
+        assert "S0_FULL_MV_BIOPGT_FINAL_RDROP" in interp["prompt_geometry"]
+        assert (work / "interpretability_b3" / "s0_test_embeddings_and_gates.npz").is_file()
+        assert (work / "interpretability_b3" / "prompt_counterfactual_b3.csv").is_file()
+        assert (work / "interpretability_b3" / "leo_rdrop_prompt_interventions.csv").is_file()
+
+        rep = summarize_formal_b3(work_dir=work, groups59_path=groups_path, seed=42)
+        assert (work / "formal_b3_report.md").is_file()
+        assert len(rep["s0_prompt_ablation"]) >= 3
+        archive = collect_formal_b3(work)
+        assert archive.is_file()
+        assert archive.with_suffix(archive.suffix + ".sha256").is_file()
+    finally:
+        fb2.LEO6_TASKS, fb2.LEO5_ANIMAL_TASKS = orig_leo, orig_leo5
+        fb3.LEO6_TASKS, fb3.LEO5_ANIMAL_TASKS = orig_b3_leo, orig_b3_leo5
+
+
+def test_gbdt_if_installed(tmp_path):
+    """Run XGBoost and LightGBM end-to-end when installed (required on server, optional on WSL)."""
+    mv_cache_path, view_dir, groups = _make_synthetic_bundle(tmp_path)
+    store = load_mv_cache(mv_cache_path)
+    for mod, method in (("xgboost", "XGBOOST"), ("lightgbm", "LIGHTGBM")):
+        try:
+            __import__(mod)
+        except ImportError:
+            continue
+        s = train_and_evaluate(
+            store=store,
+            view_root=view_dir,
+            endpoint_groups=groups,
+            method=method,
+            seed=42,
+            config={"n_estimators": 10, "early_stopping_rounds": 3, "n_jobs": 1},
+            output_dir=tmp_path / f"run_{method}",
+            device="cpu",
+            save_checkpoint_file=False,
+        )
+        assert s["status"] == "COMPLETE"
+        assert np.isfinite(s["test_groups"]["ALL59"]["macro_rmse"])
+
 
 

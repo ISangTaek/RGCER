@@ -196,12 +196,15 @@ def compute_group_metrics(
     by_task = {row["task"]: row for row in report["endpoints"]}
     group_defs = {
         "ALL59": list(tasks),
-        "L11": list(endpoint_groups["L11"]),
-        "M27": list(endpoint_groups["M27"]),
-        "S21": list(endpoint_groups["S21"]),
+        "L11": [t for t in endpoint_groups.get("L11", []) if t in by_task],
+        "M27": [t for t in endpoint_groups.get("M27", []) if t in by_task],
+        "S21": [t for t in endpoint_groups.get("S21", []) if t in by_task],
         "Human3": [t for t in HUMAN3_TASKS if t in by_task],
         "Original6": [t for t in ORIGINAL6_TASKS if t in by_task],
     }
+    for extra_key in ("ALL115", "Small68", "Human11", "Large115", "Medium115"):
+        if extra_key in endpoint_groups:
+            group_defs[extra_key] = [t for t in endpoint_groups[extra_key] if t in by_task]
     summary = {}
     for name, members in group_defs.items():
         rows = [by_task[t] for t in members if by_task[t]["rmse"] is not None]
@@ -364,6 +367,188 @@ def _train_rf(
     return summary
 
 
+def _train_gbdt(
+    store: MVDataStore,
+    view_root: Path,
+    endpoint_groups: dict,
+    output_dir: Path,
+    *,
+    method: str,
+    seed: int,
+    config: dict,
+    device: str | torch.device = "cpu",
+) -> dict:
+    """Train official per-endpoint XGBoost or LightGBM regressors on leak-free Morgan+Desc features."""
+    started = time.perf_counter()
+    if method == "XGBOOST":
+        import xgboost as xgb
+    elif method == "LIGHTGBM":
+        import lightgbm as lgb
+    else:
+        raise ValueError(f"Unsupported GBDT method: {method}")
+
+    manifest = load_manifest(view_root)
+    tasks = list(manifest["task_names"])
+    train_arr = load_arrays(view_root, "train.npz", manifest)
+    val_arr = load_arrays(view_root, "validation.npz", manifest)
+    test_arr = load_arrays(view_root, "test.npz", manifest)
+    for arr in (train_arr, val_arr, test_arr):
+        store.verify_partition(arr, manifest)
+
+    train_off = train_arr["cache_offset"].astype(np.int64)
+    val_off = val_arr["cache_offset"].astype(np.int64)
+    test_off = test_arr["cache_offset"].astype(np.int64)
+    train_y = train_arr["labels"].astype(np.float64)
+    val_y = val_arr["labels"].astype(np.float64)
+    active_mask = np.isfinite(train_y).any(axis=1)
+    scaler = fit_descriptor_scaler(store.desc_raw, store.desc_missing, train_off[active_mask])
+
+    x_train = np.concatenate(
+        [store.unpack_morgan(train_off), transform_descriptors(store.desc_raw, store.desc_missing, train_off, scaler)],
+        axis=1,
+    )
+    x_val = np.concatenate(
+        [store.unpack_morgan(val_off), transform_descriptors(store.desc_raw, store.desc_missing, val_off, scaler)],
+        axis=1,
+    )
+    x_test = np.concatenate(
+        [store.unpack_morgan(test_off), transform_descriptors(store.desc_raw, store.desc_missing, test_off, scaler)],
+        axis=1,
+    )
+
+    n_estimators = int(config.get("n_estimators", 600))
+    learning_rate = float(config.get("learning_rate", 0.05))
+    early_stop = int(config.get("early_stopping_rounds", 30))
+    n_jobs = int(config.get("n_jobs", 8))
+    dev_str = str(device)
+    use_cuda_xgb = method == "XGBOOST" and dev_str.startswith("cuda") and torch.cuda.is_available()
+
+    val_pred = np.zeros((len(val_off), len(tasks)), dtype=np.float32)
+    test_pred = np.zeros((len(test_off), len(tasks)), dtype=np.float32)
+    stats_arr = load_arrays(view_root, "statistics.npz", manifest)
+    prior_mean, _ = fit_factor_prior_stats(
+        tasks, stats_arr["count"], stats_arr["mean"], stats_arr["scale"]
+    )
+    best_iters: list[int] = []
+    for j in range(len(tasks)):
+        tr_m = np.isfinite(train_y[:, j])
+        n_tr = int(tr_m.sum())
+        if n_tr == 0:
+            val_pred[:, j] = np.float32(prior_mean[j])
+            test_pred[:, j] = np.float32(prior_mean[j])
+            best_iters.append(0)
+            continue
+        if n_tr < 3:
+            cval = float(np.mean(train_y[tr_m, j]))
+            val_pred[:, j] = np.float32(cval)
+            test_pred[:, j] = np.float32(cval)
+            best_iters.append(0)
+            continue
+
+        va_m = np.isfinite(val_y[:, j])
+        use_es = int(va_m.sum()) >= 5 and early_stop > 0
+        if method == "XGBOOST":
+            xgb_kwargs = dict(
+                n_estimators=n_estimators if use_es else min(200, n_estimators),
+                max_depth=int(config.get("max_depth", 6)),
+                learning_rate=learning_rate,
+                subsample=float(config.get("subsample", 0.8)),
+                colsample_bytree=float(config.get("colsample_bytree", 0.5)),
+                reg_lambda=float(config.get("reg_lambda", 2.0)),
+                tree_method="hist",
+                device="cuda" if use_cuda_xgb else "cpu",
+                random_state=seed + j,
+                n_jobs=1 if use_cuda_xgb else n_jobs,
+                verbosity=0,
+            )
+            if use_es:
+                xgb_kwargs["early_stopping_rounds"] = early_stop
+            reg = xgb.XGBRegressor(**xgb_kwargs)
+            if use_es:
+                reg.fit(
+                    x_train[tr_m],
+                    train_y[tr_m, j],
+                    eval_set=[(x_val[va_m], val_y[va_m, j])],
+                    verbose=False,
+                )
+                best_iters.append(int(getattr(reg, "best_iteration", n_estimators - 1)) + 1)
+            else:
+                reg.fit(x_train[tr_m], train_y[tr_m, j], verbose=False)
+                best_iters.append(int(xgb_kwargs["n_estimators"]))
+            val_pred[:, j] = reg.predict(x_val).astype(np.float32)
+            test_pred[:, j] = reg.predict(x_test).astype(np.float32)
+        else:
+            reg = lgb.LGBMRegressor(
+                n_estimators=n_estimators if use_es else min(200, n_estimators),
+                learning_rate=learning_rate,
+                num_leaves=int(config.get("num_leaves", 31)),
+                subsample=float(config.get("subsample", 0.8)),
+                subsample_freq=1,
+                colsample_bytree=float(config.get("colsample_bytree", 0.5)),
+                min_child_samples=min(int(config.get("min_child_samples", 10)), max(2, n_tr // 3)),
+                reg_lambda=float(config.get("reg_lambda", 2.0)),
+                random_state=seed + j,
+                n_jobs=n_jobs,
+                verbosity=-1,
+            )
+            if use_es:
+                reg.fit(
+                    x_train[tr_m],
+                    train_y[tr_m, j],
+                    eval_set=[(x_val[va_m], val_y[va_m, j])],
+                    callbacks=[lgb.early_stopping(early_stop, verbose=False)],
+                )
+                best_iters.append(int(getattr(reg, "best_iteration_", n_estimators) or n_estimators))
+            else:
+                reg.fit(x_train[tr_m], train_y[tr_m, j])
+                best_iters.append(int(reg.n_estimators))
+            val_pred[:, j] = reg.predict(x_val).astype(np.float32)
+            test_pred[:, j] = reg.predict(x_test).astype(np.float32)
+
+    elapsed = time.perf_counter() - started
+    output_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output_dir / "validation_predictions.npz",
+        record_id=val_arr["record_id"],
+        prediction=val_pred,
+    )
+    np.savez_compressed(
+        output_dir / "test_predictions.npz",
+        record_id=test_arr["record_id"],
+        prediction=test_pred,
+    )
+    val_report = compute_group_metrics(
+        val_arr["labels"], val_pred, tasks, endpoint_groups, groups=val_arr["group_id"]
+    )
+    test_report = compute_group_metrics(
+        test_arr["labels"], test_pred, tasks, endpoint_groups, groups=test_arr["group_id"]
+    )
+    write_json(output_dir / "validation_metrics.json", val_report)
+    write_json(output_dir / "test_metrics.json", test_report)
+    summary = {
+        "status": "COMPLETE",
+        "method": method,
+        "seed": seed,
+        "fold": manifest["fold"],
+        "view_id": manifest["view_id"],
+        "view_sha256": manifest["manifest_sha256"],
+        "config": config,
+        "parameters": {
+            "total": None,
+            "trainable": None,
+            "kind": f"per_endpoint_{method.lower()}",
+            "mean_best_trees": round(float(np.mean(best_iters)), 1) if best_iters else 0.0,
+        },
+        "best_epoch": int(round(float(np.mean(best_iters)))) if best_iters else 1,
+        "epochs_run": n_estimators,
+        "elapsed_seconds": round(elapsed, 2),
+        "validation_groups": val_report["groups"],
+        "test_groups": test_report["groups"],
+    }
+    write_json(output_dir / "summary.json", summary)
+    return summary
+
+
 def train_and_evaluate(
     *,
     store: MVDataStore,
@@ -387,6 +572,17 @@ def train_and_evaluate(
     if method == "RF":
         return _train_rf(
             store, view_root, endpoint_groups, output_dir, seed=seed, config=config
+        )
+    if method in ("XGBOOST", "LIGHTGBM"):
+        return _train_gbdt(
+            store,
+            view_root,
+            endpoint_groups,
+            output_dir,
+            method=method,
+            seed=seed,
+            config=config,
+            device=device,
         )
 
     seed_all(seed)
@@ -422,7 +618,8 @@ def train_and_evaluate(
 
     author = method == "TOX_AUTHOR"
     is_v2 = method.startswith("MV_BIOPGT_V2")
-    is_final = method.startswith("MV_BIOPGT_FINAL")
+    is_final = method.startswith("MV_BIOPGT_FINAL") or method == "MV_BIOPGT_FLAT_PROMPT"
+    is_ext_gnn = method in ("DMPNN", "ATTENTIVEFP")
     label_scaling = str(
         config.get("label_scaling", "raw" if author else ("global_center" if is_v2 else "per_task"))
     )
@@ -471,14 +668,14 @@ def train_and_evaluate(
             nesterov=True,
         )
     else:
-        max_epochs = int(config.get("max_epochs", 90 if (is_v2 or is_final) else 100))
+        max_epochs = int(config.get("max_epochs", 90 if (is_v2 or is_final or is_ext_gnn) else 100))
         min_epochs = int(config.get("min_epochs", 25))
-        patience = int(config.get("patience", 18 if (is_v2 or is_final) else 20))
+        patience = int(config.get("patience", 18 if (is_v2 or is_final or is_ext_gnn) else 20))
         default_bs = 64 if needs["graph_mode"] == "graphormer" else (128 if needs["graph_mode"] == "gine" else 256)
         batch_size = int(config.get("batch_size", default_bs))
         eval_batch = int(config.get("eval_batch", default_bs * 2))
         grad_clip = float(config.get("grad_clip", 5.0))
-        gamma = float(config.get("gamma", 0.50 if (is_v2 or is_final) else 0.25))
+        gamma = float(config.get("gamma", 0.50 if (is_v2 or is_final or is_ext_gnn) else 0.25))
         loss_type = str(config.get("loss_type", "huber" if is_v2 else "mse"))
         huber_beta = float(config.get("huber_beta", 1.0))
         default_aux_w = (
@@ -489,6 +686,8 @@ def train_and_evaluate(
                 "MV_BIOPGT_V2_NOPROMPT",
                 "MV_BIOPGT_FINAL",
                 "MV_BIOPGT_FINAL_NOPROMPT",
+                "MV_BIOPGT_FINAL_RDROP",
+                "MV_BIOPGT_FLAT_PROMPT",
             )
             else 0.0
         )
@@ -502,7 +701,13 @@ def train_and_evaluate(
             if (
                 is_v2
                 or method
-                in ("MV_BIOPGT_FINAL", "MV_BIOPGT_FINAL_NOGRAPH", "MV_BIOPGT_FINAL_NOPROMPT")
+                in (
+                    "MV_BIOPGT_FINAL",
+                    "MV_BIOPGT_FINAL_NOGRAPH",
+                    "MV_BIOPGT_FINAL_NOPROMPT",
+                    "MV_BIOPGT_FINAL_RDROP",
+                    "MV_BIOPGT_FLAT_PROMPT",
+                )
             )
             else base_wd
         )
@@ -532,6 +737,15 @@ def train_and_evaluate(
             )
 
     ep_weights = torch.from_numpy(endpoint_weights_for_gamma(counts, gamma)).to(dev)
+
+    # Bit-exact device preload for TOX_AUTHOR Avalon matrix (~220 MB -> eliminates 200k CPU unpacks)
+    preload_avalon = bool(config.get("preload_avalon_gpu", True)) and author
+    train_avalon_dev = val_avalon_dev = test_avalon_dev = train_y_dev = None
+    if preload_avalon:
+        train_avalon_dev = torch.from_numpy(store.unpack_avalon(train_off)).to(dev)
+        val_avalon_dev = torch.from_numpy(store.unpack_avalon(val_off)).to(dev)
+        test_avalon_dev = torch.from_numpy(store.unpack_avalon(test_off)).to(dev)
+        train_y_dev = torch.from_numpy(std_train_y).to(dev)
 
     best_score = float("inf")
     best_epoch = 0
@@ -569,23 +783,29 @@ def train_and_evaluate(
 
         for idx_batch in batches:
             optimizer.zero_grad(set_to_none=True)
-            b_off = train_off[idx_batch]
-            b_desc = train_desc[idx_batch] if train_desc is not None else None
-            payload = store.build_batch(
-                b_off,
-                desc_array=b_desc,
-                need_avalon=needs["need_avalon"],
-                need_morgan=needs["need_morgan"],
-                need_desc=needs["need_desc"],
-                graph_mode=needs["graph_mode"],
-                device=dev,
-            )
-            if aux_graph_weight > 0.0:
-                pred, train_aux = model(payload, return_train_aux=True)
-            else:
-                pred = model(payload)
+            if preload_avalon:
+                idx_t = torch.tensor(idx_batch, dtype=torch.long, device=dev)
+                pred = model.forward_avalon(train_avalon_dev.index_select(0, idx_t))
                 train_aux = {}
-            target = torch.from_numpy(std_train_y[idx_batch]).to(dev, non_blocking=True)
+                target = train_y_dev.index_select(0, idx_t)
+            else:
+                b_off = train_off[idx_batch]
+                b_desc = train_desc[idx_batch] if train_desc is not None else None
+                payload = store.build_batch(
+                    b_off,
+                    desc_array=b_desc,
+                    need_avalon=needs["need_avalon"],
+                    need_morgan=needs["need_morgan"],
+                    need_desc=needs["need_desc"],
+                    graph_mode=needs["graph_mode"],
+                    device=dev,
+                )
+                if aux_graph_weight > 0.0:
+                    pred, train_aux = model(payload, return_train_aux=True)
+                else:
+                    pred = model(payload)
+                    train_aux = {}
+                target = torch.from_numpy(std_train_y[idx_batch]).to(dev, non_blocking=True)
             if loss_type == "huber":
                 loss = tempered_huber_loss(pred, target, ep_weights, beta=huber_beta)
                 if aux_graph_weight > 0.0 and "graph_pred" in train_aux:
@@ -607,17 +827,29 @@ def train_and_evaluate(
             running_loss += float(loss.detach()) * len(idx_batch)
             seen_rows += len(idx_batch)
 
-        val_pred = predict_neural(
-            model,
-            store,
-            val_off,
-            desc_array=val_desc,
-            needs=needs,
-            mean=mean,
-            scale=scale,
-            batch_size=eval_batch,
-            device=dev,
-        )
+        if preload_avalon:
+            model.eval()
+            val_pieces = []
+            with torch.no_grad():
+                for st in range(0, len(val_off), eval_batch):
+                    en = min(st + eval_batch, len(val_off))
+                    out = model.forward_avalon(val_avalon_dev[st:en]).detach().cpu().numpy()
+                    val_pieces.append((out * scale[None, :] + mean[None, :]).astype(np.float32))
+            val_pred = np.concatenate(val_pieces, axis=0)
+            if not np.isfinite(val_pred).all():
+                raise FloatingPointError("Nonfinite prediction encountered")
+        else:
+            val_pred = predict_neural(
+                model,
+                store,
+                val_off,
+                desc_array=val_desc,
+                needs=needs,
+                mean=mean,
+                scale=scale,
+                batch_size=eval_batch,
+                device=dev,
+            )
         val_report = compute_group_metrics(
             val_arr["labels"], val_pred, tasks, endpoint_groups, groups=val_arr["group_id"]
         )
@@ -651,17 +883,29 @@ def train_and_evaluate(
         raise RuntimeError("No valid checkpoint selected during training")
 
     model.load_state_dict(best_state)
-    test_pred = predict_neural(
-        model,
-        store,
-        test_off,
-        desc_array=test_desc,
-        needs=needs,
-        mean=mean,
-        scale=scale,
-        batch_size=eval_batch,
-        device=dev,
-    )
+    if preload_avalon:
+        model.eval()
+        test_pieces = []
+        with torch.no_grad():
+            for st in range(0, len(test_off), eval_batch):
+                en = min(st + eval_batch, len(test_off))
+                out = model.forward_avalon(test_avalon_dev[st:en]).detach().cpu().numpy()
+                test_pieces.append((out * scale[None, :] + mean[None, :]).astype(np.float32))
+        test_pred = np.concatenate(test_pieces, axis=0)
+        if not np.isfinite(test_pred).all():
+            raise FloatingPointError("Nonfinite prediction encountered")
+    else:
+        test_pred = predict_neural(
+            model,
+            store,
+            test_off,
+            desc_array=test_desc,
+            needs=needs,
+            mean=mean,
+            scale=scale,
+            batch_size=eval_batch,
+            device=dev,
+        )
     test_report = compute_group_metrics(
         test_arr["labels"], test_pred, tasks, endpoint_groups, groups=test_arr["group_id"]
     )

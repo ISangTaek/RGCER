@@ -84,14 +84,22 @@ class GINEBackbone(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, payload) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        h = sum(emb(payload.x_flat[:, j]) for j, emb in enumerate(self.atom_embeddings))
-        h = self.input_drop(h)
+    def encode_atom_inputs(self, payload) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute initial continuous atom and bond input embeddings (for IG & deletion faithfulness)."""
+        h0 = sum(emb(payload.x_flat[:, j]) for j, emb in enumerate(self.atom_embeddings))
         if payload.edge_src.numel() > 0:
             e = sum(emb(payload.edge_attr[:, j]) for j, emb in enumerate(self.bond_embeddings))
         else:
-            e = h.new_zeros((0, self.hidden_dim))
+            e = h0.new_zeros((0, self.hidden_dim))
+        return h0, e
 
+    def forward_from_atom_inputs(
+        self,
+        h0: torch.Tensor,
+        e: torch.Tensor,
+        payload,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        h = self.input_drop(h0)
         for layer in self.layers:
             h = layer(h, payload.edge_src, payload.edge_dst, e)
         h = self.final_norm(h)
@@ -109,6 +117,189 @@ class GINEBackbone(nn.Module):
         max_pool = atoms.masked_fill(~mask.unsqueeze(-1), -1e9).max(dim=1).values
         graph_repr = self.pool_proj(torch.cat([mean_pool, max_pool], dim=-1))
         return graph_repr, atoms, mask
+
+    def forward(self, payload) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        h0, e = self.encode_atom_inputs(payload)
+        return self.forward_from_atom_inputs(h0, e, payload)
+
+
+class DMPNNModel(nn.Module):
+    """Pure-PyTorch Directed Message Passing Neural Network (Yang et al., JCIM 2019).
+
+    Operates directly on the shared PGT_FEATURE_SPEC graph tensors in MVDataStore with
+    exact reverse-edge subtraction to prevent immediate backtracking.
+    """
+
+    def __init__(
+        self,
+        num_tasks: int,
+        *,
+        hidden_dim: int = 300,
+        depth: int = 3,
+        dropout: float = 0.1,
+        spec=PGT_FEATURE_SPEC,
+    ):
+        super().__init__()
+        self.num_tasks = int(num_tasks)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.atom_embeddings = nn.ModuleList(
+            [nn.Embedding(c + 1, hidden_dim, padding_idx=0) for c in spec.atom_cardinalities]
+        )
+        self.bond_embeddings = nn.ModuleList(
+            [nn.Embedding(c + 1, hidden_dim, padding_idx=0) for c in spec.bond_cardinalities]
+        )
+        self.w_i = nn.Linear(hidden_dim * 2, hidden_dim, bias=False)
+        self.w_h = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.w_o = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.drop = nn.Dropout(dropout)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, self.num_tasks),
+        )
+
+    @staticmethod
+    def _reverse_edge_indices(
+        edge_src: torch.Tensor, edge_dst: torch.Tensor, num_total_nodes: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Vectorized exact lookup of reverse directed edge (dst -> src) for each (src -> dst)."""
+        stride = max(1, int(num_total_nodes))
+        fwd_key = edge_src * stride + edge_dst
+        rev_key = edge_dst * stride + edge_src
+        sorted_key, perm = torch.sort(fwd_key)
+        pos = torch.searchsorted(sorted_key, rev_key).clamp(max=sorted_key.numel() - 1)
+        has_rev = sorted_key[pos] == rev_key
+        rev_idx = perm[pos]
+        return rev_idx, has_rev
+
+    def forward(self, payload) -> torch.Tensor:
+        x = sum(emb(payload.x_flat[:, j]) for j, emb in enumerate(self.atom_embeddings))
+        total_n = x.shape[0]
+        if payload.edge_src.numel() > 0:
+            e = sum(emb(payload.edge_attr[:, j]) for j, emb in enumerate(self.bond_embeddings))
+            src = payload.edge_src
+            dst = payload.edge_dst
+            rev_idx, has_rev = self._reverse_edge_indices(src, dst, total_n)
+
+            h0 = F.relu(self.w_i(torch.cat([x[src], e], dim=-1)))
+            h_e = h0
+            for _ in range(max(0, self.depth - 1)):
+                in_sum = x.new_zeros((total_n, self.hidden_dim))
+                in_sum.index_add_(0, dst, h_e)
+                rev_msg = torch.where(has_rev[:, None], h_e[rev_idx], torch.zeros_like(h_e))
+                nei_msg = in_sum[src] - rev_msg
+                h_e = self.drop(F.relu(h0 + self.w_h(nei_msg)))
+
+            agg_in = x.new_zeros((total_n, self.hidden_dim))
+            agg_in.index_add_(0, dst, h_e)
+        else:
+            agg_in = x.new_zeros((total_n, self.hidden_dim))
+
+        atom_h = self.drop(F.relu(self.w_o(torch.cat([x, agg_in], dim=-1))))
+        mol_sum = atom_h.new_zeros((payload.batch_size, self.hidden_dim))
+        mol_sum.index_add_(0, payload.graph_idx, atom_h)
+        mol_repr = mol_sum / payload.num_nodes.clamp_min(1).to(atom_h.dtype).unsqueeze(-1)
+        return self.head(mol_repr)
+
+
+def _segment_softmax(logits: torch.Tensor, segment_ids: torch.Tensor, num_segments: int) -> torch.Tensor:
+    """Numerically stable segmented softmax over sparse edges grouped by destination node."""
+    max_per = torch.full((num_segments,), -1e9, dtype=logits.dtype, device=logits.device)
+    max_per.scatter_reduce_(0, segment_ids, logits, reduce="amax", include_self=True)
+    shifted = torch.exp((logits - max_per[segment_ids]).clamp(min=-40.0, max=40.0))
+    denom = torch.zeros((num_segments,), dtype=logits.dtype, device=logits.device)
+    denom.index_add_(0, segment_ids, shifted)
+    return shifted / denom[segment_ids].clamp_min(1e-12)
+
+
+class AttentiveFPModel(nn.Module):
+    """Pure-PyTorch AttentiveFP (Xiong et al., J. Med. Chem. 2020) on PGT_FEATURE_SPEC graphs."""
+
+    def __init__(
+        self,
+        num_tasks: int,
+        *,
+        hidden_dim: int = 200,
+        num_layers: int = 3,
+        num_timesteps: int = 2,
+        dropout: float = 0.1,
+        spec=PGT_FEATURE_SPEC,
+    ):
+        super().__init__()
+        self.num_tasks = int(num_tasks)
+        self.hidden_dim = int(hidden_dim)
+        self.num_layers = int(num_layers)
+        self.num_timesteps = int(num_timesteps)
+        self.atom_embeddings = nn.ModuleList(
+            [nn.Embedding(c + 1, hidden_dim, padding_idx=0) for c in spec.atom_cardinalities]
+        )
+        self.bond_embeddings = nn.ModuleList(
+            [nn.Embedding(c + 1, hidden_dim, padding_idx=0) for c in spec.bond_cardinalities]
+        )
+        self.atom_init = nn.Linear(hidden_dim, hidden_dim)
+        self.edge_init = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.attn0 = nn.Linear(hidden_dim * 2, 1)
+        self.val0 = nn.Linear(hidden_dim, hidden_dim)
+        self.gru0 = nn.GRUCell(hidden_dim, hidden_dim)
+
+        self.attn_layers = nn.ModuleList(
+            [nn.Linear(hidden_dim * 2, 1) for _ in range(max(0, num_layers - 1))]
+        )
+        self.val_layers = nn.ModuleList(
+            [nn.Linear(hidden_dim, hidden_dim) for _ in range(max(0, num_layers - 1))]
+        )
+        self.gru_layers = nn.ModuleList(
+            [nn.GRUCell(hidden_dim, hidden_dim) for _ in range(max(0, num_layers - 1))]
+        )
+
+        self.mol_attn = nn.Linear(hidden_dim * 2, 1)
+        self.mol_val = nn.Linear(hidden_dim, hidden_dim)
+        self.mol_gru = nn.GRUCell(hidden_dim, hidden_dim)
+        self.drop = nn.Dropout(dropout)
+        self.head = nn.Linear(hidden_dim, self.num_tasks)
+
+    def forward(self, payload) -> torch.Tensor:
+        x = sum(emb(payload.x_flat[:, j]) for j, emb in enumerate(self.atom_embeddings))
+        h = F.leaky_relu(self.atom_init(x), negative_slope=0.2)
+        total_n = h.shape[0]
+        src = payload.edge_src
+        dst = payload.edge_dst
+
+        if src.numel() > 0:
+            e = sum(emb(payload.edge_attr[:, j]) for j, emb in enumerate(self.bond_embeddings))
+            nei0 = F.leaky_relu(self.edge_init(torch.cat([x[src], e], dim=-1)), negative_slope=0.2)
+            scores0 = F.leaky_relu(self.attn0(torch.cat([h[dst], nei0], dim=-1)).squeeze(-1), negative_slope=0.2)
+            alpha0 = self.drop(_segment_softmax(scores0, dst, total_n))
+            ctx0 = h.new_zeros((total_n, self.hidden_dim))
+            ctx0.index_add_(0, dst, alpha0[:, None] * self.val0(nei0))
+            h = self.gru0(F.elu(ctx0), h)
+
+            for attn_l, val_l, gru_l in zip(self.attn_layers, self.val_layers, self.gru_layers):
+                scores = F.leaky_relu(attn_l(torch.cat([h[dst], h[src]], dim=-1)).squeeze(-1), negative_slope=0.2)
+                alpha = self.drop(_segment_softmax(scores, dst, total_n))
+                ctx = h.new_zeros((total_n, self.hidden_dim))
+                ctx.index_add_(0, dst, alpha[:, None] * val_l(self.drop(h[src])))
+                h = gru_l(F.elu(ctx), h)
+
+        # Molecular supernode attentive readout over valid atoms
+        b = payload.batch_size
+        max_n = payload.max_nodes
+        atoms = h.new_zeros((b, max_n, self.hidden_dim))
+        mask = torch.zeros((b, max_n), dtype=torch.bool, device=h.device)
+        atoms[payload.graph_idx, payload.node_pos] = h
+        mask[payload.graph_idx, payload.node_pos] = True
+
+        super_h = atoms.sum(dim=1)
+        for _ in range(self.num_timesteps):
+            s_exp = super_h[:, None, :].expand(-1, max_n, -1)
+            logits = F.leaky_relu(self.mol_attn(torch.cat([s_exp, atoms], dim=-1)).squeeze(-1), negative_slope=0.2)
+            logits = logits.masked_fill(~mask, -1e9)
+            w = self.drop(torch.softmax(logits, dim=-1))
+            ctx_m = torch.einsum("bn,bnd->bd", w, self.mol_val(self.drop(atoms)))
+            super_h = self.mol_gru(F.elu(ctx_m), super_h)
+        return self.head(self.drop(super_h))
 
 
 class BalancedChemEncoder(nn.Module):
@@ -190,20 +381,31 @@ class FactorizedBioPromptBank(nn.Module):
         *,
         adjacency: np.ndarray | None = None,
         shrinkage_tau: float = 32.0,
+        prompt_mode: str = "factorized",
     ):
         super().__init__()
         self.tasks = tuple(tasks)
         self.dim = dim
-        meta = task_metadata(tasks)
+        self.prompt_mode = str(prompt_mode)
+        if self.prompt_mode not in ("factorized", "flat"):
+            raise ValueError(f"Unsupported prompt_mode: {self.prompt_mode}")
         self.fields = ("organism", "route", "measurement", "population")
+        self.vocabs: dict[str, list[str]] = {}
         self.embeddings = nn.ModuleDict()
-        for field in self.fields:
-            vocab = sorted({meta[t][field] for t in tasks})
-            indices = [vocab.index(meta[t][field]) for t in tasks]
-            self.register_buffer(f"{field}_idx", torch.tensor(indices, dtype=torch.long))
-            emb = nn.Embedding(len(vocab), dim)
-            nn.init.normal_(emb.weight, std=0.02)
-            self.embeddings[field] = emb
+        if self.prompt_mode == "factorized":
+            meta = task_metadata(tasks)
+            for field in self.fields:
+                vocab = sorted({meta[t][field] for t in tasks})
+                self.vocabs[field] = vocab
+                indices = [vocab.index(meta[t][field]) for t in tasks]
+                self.register_buffer(f"{field}_idx", torch.tensor(indices, dtype=torch.long))
+                emb = nn.Embedding(len(vocab), dim)
+                nn.init.normal_(emb.weight, std=0.02)
+                self.embeddings[field] = emb
+            self.flat_embedding = None
+        else:
+            self.flat_embedding = nn.Embedding(len(tasks), dim)
+            nn.init.normal_(self.flat_embedding.weight, std=0.02)
         raw_counts = np.asarray(counts, dtype=np.float32)
         count_t = torch.as_tensor(
             np.where(raw_counts > 0.0, np.maximum(raw_counts, 1.0), 0.0),
@@ -225,20 +427,62 @@ class FactorizedBioPromptBank(nn.Module):
             self.rel_gate = None
         self.norm = nn.LayerNorm(dim)
 
-    def forward(self, *, factor_override: dict[str, torch.Tensor] | None = None) -> torch.Tensor:
+    def compose_external_prompts(self, external_tasks: tuple[str, ...] | list[str]) -> torch.Tensor:
+        """Synthesize zero-shot biological prompts for unseen external endpoints in-vocabulary."""
+        if self.prompt_mode != "factorized":
+            raise ValueError("compose_external_prompts requires prompt_mode='factorized'")
+        meta = task_metadata(tuple(external_tasks))
+        dev = self.task_residual.device
         total = 0.0
         for field in self.fields:
-            idx = (
-                factor_override[field]
-                if (factor_override is not None and field in factor_override)
-                else getattr(self, f"{field}_idx")
-            )
+            vocab = self.vocabs[field]
+            idx = torch.tensor([vocab.index(meta[t][field]) for t in external_tasks], dtype=torch.long, device=dev)
             total = total + self.embeddings[field](idx)
+        base = self.base_norm(total)
+        return self.norm(base)
+
+    def export_factor_tables(self) -> dict[str, dict]:
+        """Return biological factor vocabularies and embedding tables for geometry analysis."""
+        if self.prompt_mode != "factorized":
+            return {
+                "flat": {
+                    "vocab": list(self.tasks),
+                    "weight": self.flat_embedding.weight.detach().cpu().numpy(),
+                }
+            }
+        return {
+            field: {
+                "vocab": list(self.vocabs[field]),
+                "weight": self.embeddings[field].weight.detach().cpu().numpy(),
+            }
+            for field in self.fields
+        }
+
+    def forward(
+        self,
+        *,
+        factor_override: dict[str, torch.Tensor] | None = None,
+        return_pre_graph: bool = False,
+    ):
+        if self.prompt_mode == "factorized":
+            total = 0.0
+            for field in self.fields:
+                idx = (
+                    factor_override[field]
+                    if (factor_override is not None and field in factor_override)
+                    else getattr(self, f"{field}_idx")
+                )
+                total = total + self.embeddings[field](idx)
+        else:
+            idx = torch.arange(len(self.tasks), dtype=torch.long, device=self.task_residual.device)
+            total = self.flat_embedding(idx)
         base = self.base_norm(total + self.shrinkage[:, None] * self.task_residual)
         if self.adjacency is not None and self.rel_proj is not None:
             propagated = F.gelu(self.adjacency @ self.rel_proj(base))
-            return self.norm(base + torch.tanh(self.rel_gate) * propagated)
-        return self.norm(base)
+            out = self.norm(base + torch.tanh(self.rel_gate) * propagated)
+        else:
+            out = self.norm(base)
+        return (out, base) if return_pre_graph else out
 
 
 class TaskAtomCrossAttention(nn.Module):
@@ -296,6 +540,8 @@ class MVBioPGT(nn.Module):
         graph_type: str = "gine",
         use_chem: bool = True,
         use_prompt: bool = True,
+        prompt_mode: str = "factorized",
+        residual_drop_prob: float = 0.0,
         ordinal_dose: bool = False,
         chem_drop_prob: float = 0.0,
         fp_hidden_dim: int = 256,
@@ -316,6 +562,8 @@ class MVBioPGT(nn.Module):
         self.graph_type = str(graph_type) if use_graph else "none"
         self.use_chem = bool(use_chem)
         self.use_prompt = bool(use_prompt)
+        self.prompt_mode = str(prompt_mode)
+        self.residual_drop_prob = float(residual_drop_prob)
         self.ordinal_dose = bool(ordinal_dose) and self.use_prompt
         self.chem_drop_prob = float(chem_drop_prob) if (self.use_graph and self.use_chem) else 0.0
         self.hidden_dim = int(hidden_dim)
@@ -366,7 +614,12 @@ class MVBioPGT(nn.Module):
 
         if self.use_prompt:
             self.prompt_bank = FactorizedBioPromptBank(
-                self.tasks, hidden_dim, counts, adjacency=adjacency, shrinkage_tau=shrinkage_tau
+                self.tasks,
+                hidden_dim,
+                counts,
+                adjacency=adjacency,
+                shrinkage_tau=shrinkage_tau,
+                prompt_mode=self.prompt_mode,
             )
             if self.use_graph:
                 self.atom_cross_attn = TaskAtomCrossAttention(
@@ -441,14 +694,23 @@ class MVBioPGT(nn.Module):
         tau_tdlo = tau_ldlo + F.softplus(self.ord_step_tdlo).view(1)
         return torch.cat([zero, tau_ldlo, tau_tdlo], dim=0)
 
-    def encode_molecule(self, payload):
+    def encode_molecule(self, payload, *, atom_h0_override: torch.Tensor | None = None, edge_emb_override: torch.Tensor | None = None):
         h_graph = None
         h_graph_norm = None
         atoms = None
         atom_mask = None
+        gate_val = None
         if self.use_graph:
             if self.graph_type == "gine":
-                h_graph, atoms, atom_mask = self.graph_encoder(payload)
+                if atom_h0_override is not None:
+                    e_emb = edge_emb_override
+                    if e_emb is None:
+                        _, e_emb = self.graph_encoder.encode_atom_inputs(payload)
+                    h_graph, atoms, atom_mask = self.graph_encoder.forward_from_atom_inputs(
+                        atom_h0_override, e_emb, payload
+                    )
+                else:
+                    h_graph, atoms, atom_mask = self.graph_encoder(payload)
             else:
                 tokens = self.graph_encoder.encode_tokens(payload.graphormer_batch)
                 h_graph = tokens.graph_token
@@ -465,6 +727,7 @@ class MVBioPGT(nn.Module):
         if self.use_graph and self.use_chem:
             cat = torch.cat([h_graph, h_chem], dim=-1)
             g = self.modal_gate(cat)
+            gate_val = g
             blended = g * h_graph + (1.0 - g) * h_chem
             fused = self.modal_norm(blended + self.modal_proj(cat))
             if self.training and self.chem_drop_prob > 0.0:
@@ -478,7 +741,7 @@ class MVBioPGT(nn.Module):
             h_mol = h_graph
         else:
             h_mol = h_chem
-        return h_mol, h_graph_norm, atoms, atom_mask
+        return h_mol, h_graph_norm, atoms, atom_mask, gate_val
 
     def _decode_from_repr(
         self,
@@ -488,6 +751,7 @@ class MVBioPGT(nn.Module):
         *,
         prompt_override: torch.Tensor | None = None,
         factor_override: dict[str, torch.Tensor] | None = None,
+        external_zero_shrink: bool = False,
         return_aux: bool = False,
         detach_prompts: bool = False,
     ) -> tuple[torch.Tensor, dict]:
@@ -520,8 +784,19 @@ class MVBioPGT(nn.Module):
         z = self.task_norm(z)  # [B, T, D]
 
         p_exp = prompts[None, :, :].expand(z.shape[0], -1, -1)
-        shrink = self.prompt_bank.shrinkage[None, :]  # [1, T]
-        residual_pred = shrink * torch.einsum("btd,td->bt", z, self.endpoint_weight)
+        if external_zero_shrink:
+            residual_pred = z.new_zeros((z.shape[0], prompts.shape[0]))
+            bias_term = z.new_zeros((1, prompts.shape[0]))
+        else:
+            shrink = self.prompt_bank.shrinkage[None, :]  # [1, T]
+            residual_pred = shrink * torch.einsum("btd,td->bt", z, self.endpoint_weight)
+            if self.training and self.residual_drop_prob > 0.0:
+                keep = (
+                    torch.rand(residual_pred.shape, device=residual_pred.device)
+                    >= self.residual_drop_prob
+                ).to(residual_pred.dtype)
+                residual_pred = residual_pred * keep
+            bias_term = self.endpoint_bias[None, :]
 
         if self.ordinal_dose:
             org_idx = (
@@ -551,13 +826,16 @@ class MVBioPGT(nn.Module):
             ladder = self.ordinal_threshold_ladder()  # [3]
             tau_offset = ladder[self.meas_rank][None, :]  # [1, T]
             meas_adj = self.shared_decoder(torch.cat([z, p_exp - p_sr_exp], dim=-1)).squeeze(-1)
-            pred = basal_pred + tau_offset + meas_adj + residual_pred + self.endpoint_bias[None, :]
+            pred = basal_pred + tau_offset + meas_adj + residual_pred + bias_term
             if return_aux:
                 aux["ordinal_ladder"] = ladder.detach()
                 aux["basal_pred"] = basal_pred.detach()
         else:
             shared_pred = self.shared_decoder(torch.cat([z, p_exp], dim=-1)).squeeze(-1)
-            pred = shared_pred + residual_pred + self.endpoint_bias[None, :]
+            pred = shared_pred + residual_pred + bias_term
+            if return_aux:
+                aux["shared_pred"] = shared_pred.detach()
+                aux["residual_pred"] = residual_pred.detach()
 
         if return_aux:
             aux["prompts"] = prompts
@@ -572,17 +850,27 @@ class MVBioPGT(nn.Module):
         return_train_aux: bool = False,
         prompt_override: torch.Tensor | None = None,
         factor_override: dict[str, torch.Tensor] | None = None,
+        external_zero_shrink: bool = False,
+        atom_h0_override: torch.Tensor | None = None,
+        edge_emb_override: torch.Tensor | None = None,
     ):
-        h_mol, h_graph_norm, atoms, atom_mask = self.encode_molecule(payload)
+        h_mol, h_graph_norm, atoms, atom_mask, gate_val = self.encode_molecule(
+            payload,
+            atom_h0_override=atom_h0_override,
+            edge_emb_override=edge_emb_override,
+        )
         pred, aux = self._decode_from_repr(
             h_mol,
             atoms,
             atom_mask,
             prompt_override=prompt_override,
             factor_override=factor_override,
+            external_zero_shrink=external_zero_shrink,
             return_aux=return_aux,
             detach_prompts=False,
         )
+        if return_aux and gate_val is not None:
+            aux["modal_gate"] = gate_val.detach()
         if return_train_aux:
             train_aux = {}
             if self.use_graph and self.use_chem and h_graph_norm is not None:
@@ -592,6 +880,7 @@ class MVBioPGT(nn.Module):
                     atom_mask,
                     prompt_override=prompt_override,
                     factor_override=factor_override,
+                    external_zero_shrink=external_zero_shrink,
                     return_aux=False,
                     detach_prompts=True,
                 )
@@ -601,13 +890,20 @@ class MVBioPGT(nn.Module):
 
 
 class FastToxACoLWrapper(nn.Module):
-    """Wraps locked ToxACoLNet to accept BatchPayload directly from RAM."""
+    """Wraps locked ToxACoLNet to accept BatchPayload or GPU-preloaded Avalon tensors."""
 
     def __init__(self, tasks: tuple[str, ...], adjacency: np.ndarray, dropout: float = 0.1):
         super().__init__()
-        features, _ = endpoint_feature_matrix(tasks)
+        from baselines.constants import TOXACUTE_TASKS
+
+        legacy_set = set(TOXACUTE_TASKS)
+        need_ext = any(t not in legacy_set for t in tasks)
+        features, _ = endpoint_feature_matrix(tasks, extend_vocabulary=need_ext)
         self.net = ToxACoLNet(adjacency, features, dropout=dropout)
         self.tasks = tuple(tasks)
+
+    def forward_avalon(self, avalon: torch.Tensor) -> torch.Tensor:
+        return self.net(avalon)
 
     def forward(self, payload):
         return self.net(payload.avalon)
@@ -627,6 +923,23 @@ def build_mv_model(
         if adjacency is None:
             raise ValueError("TOX_AUTHOR requires visible training-view adjacency")
         model = FastToxACoLWrapper(tasks, adjacency, dropout=float(cfg.get("dropout", 0.1)))
+        return model.to(device)
+    if method == "DMPNN":
+        model = DMPNNModel(
+            num_tasks=len(tasks),
+            hidden_dim=int(cfg.get("hidden_dim", 300)),
+            depth=int(cfg.get("depth", 3)),
+            dropout=float(cfg.get("dropout", 0.1)),
+        )
+        return model.to(device)
+    if method == "ATTENTIVEFP":
+        model = AttentiveFPModel(
+            num_tasks=len(tasks),
+            hidden_dim=int(cfg.get("hidden_dim", 200)),
+            num_layers=int(cfg.get("num_layers", 3)),
+            num_timesteps=int(cfg.get("num_timesteps", 2)),
+            dropout=float(cfg.get("dropout", 0.1)),
+        )
         return model.to(device)
 
     specs = {
@@ -734,6 +1047,32 @@ def build_mv_model(
             chem_dropout=0.20,
             default_dim=256,
         ),
+        "MV_BIOPGT_FINAL_RDROP": dict(
+            use_graph=True,
+            graph_type="gine",
+            use_chem=True,
+            use_prompt=True,
+            prompt_mode="factorized",
+            residual_drop_prob=0.5,
+            ordinal_dose=False,
+            chem_drop_prob=0.25,
+            fp_hidden_dim=384,
+            chem_dropout=0.30,
+            default_dim=256,
+        ),
+        "MV_BIOPGT_FLAT_PROMPT": dict(
+            use_graph=True,
+            graph_type="gine",
+            use_chem=True,
+            use_prompt=True,
+            prompt_mode="flat",
+            residual_drop_prob=0.0,
+            ordinal_dose=False,
+            chem_drop_prob=0.25,
+            fp_hidden_dim=384,
+            chem_dropout=0.30,
+            default_dim=256,
+        ),
     }
     if method not in specs:
         raise ValueError(f"Unknown MV method: {method}")
@@ -748,6 +1087,8 @@ def build_mv_model(
         graph_type=flags["graph_type"],
         use_chem=flags["use_chem"],
         use_prompt=flags["use_prompt"],
+        prompt_mode=str(cfg.get("prompt_mode", flags.get("prompt_mode", "factorized"))),
+        residual_drop_prob=float(cfg.get("residual_drop_prob", flags.get("residual_drop_prob", 0.0))),
         ordinal_dose=bool(cfg.get("ordinal_dose", flags.get("ordinal_dose", False))),
         chem_drop_prob=float(cfg.get("chem_drop_prob", flags.get("chem_drop_prob", 0.0))),
         fp_hidden_dim=int(cfg.get("fp_hidden_dim", flags.get("fp_hidden_dim", 256))),
@@ -765,11 +1106,11 @@ def build_mv_model(
 def method_input_needs(method: str) -> dict:
     if method == "TOX_AUTHOR":
         return dict(need_avalon=True, need_morgan=False, need_desc=False, graph_mode=None)
-    if method == "RF":
+    if method in ("RF", "XGBOOST", "LIGHTGBM"):
         return dict(need_avalon=False, need_morgan=True, need_desc=True, graph_mode=None)
     if method in ("MV_MLP", "MV_BIOPGT_NOGRAPH", "MV_BIOPGT_V2_NOGRAPH", "MV_BIOPGT_FINAL_NOGRAPH"):
         return dict(need_avalon=True, need_morgan=True, need_desc=True, graph_mode=None)
-    if method == "GINE_ONLY":
+    if method in ("GINE_ONLY", "DMPNN", "ATTENTIVEFP"):
         return dict(need_avalon=False, need_morgan=False, need_desc=False, graph_mode="gine")
     if method == "GRAPHORMER_ONLY":
         return dict(need_avalon=False, need_morgan=False, need_desc=False, graph_mode="graphormer")
@@ -782,6 +1123,8 @@ def method_input_needs(method: str) -> dict:
         "MV_BIOPGT_FINAL",
         "MV_BIOPGT_FINAL_NOPROMPT",
         "MV_BIOPGT_FINAL_NOMDROP",
+        "MV_BIOPGT_FINAL_RDROP",
+        "MV_BIOPGT_FLAT_PROMPT",
     ):
         return dict(need_avalon=True, need_morgan=True, need_desc=True, graph_mode="gine")
     if method in ("MV_BIOPGT_GRAPHORMER", "MV_BIOPGT_NOPROMPT_GRAPHORMER"):
